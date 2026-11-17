@@ -13,9 +13,12 @@
     "format": {
       "dependsOn": ["^format"]
     },
+    "test": { "cache": false },
     "typecheck": {
       "dependsOn": ["^typecheck"]
     },
+    "db:generate": { "cache": false },
+    "db:migrate": { "cache": false, "passThroughEnv": ["DATABASE_URL_DIRECT"] },
     "dev": {
       "cache": false,
       "persistent": true
