@@ -22,6 +22,7 @@ export const STARTER_PERMISSIONS = [
   "attendance.read",
   "attendance.mark",
   "fees.manage",
+  "fees.override",
   "invoices.read",
   "invoices.adjust",
   "payments.verify",
@@ -29,6 +30,7 @@ export const STARTER_PERMISSIONS = [
   "receipts.void",
   "content.manage",
   "notices.manage",
+  "notifications.manage",
 ] as const;
 
 /** Built-in roles. Custom roles can be added later as data. root_admin gets every permission. */
@@ -105,6 +107,14 @@ export async function seedDefaults(db: AnyPgDatabase, opts: SeedOptions) {
       .returning();
     if (!branch) throw new Error("branch insert failed");
     await tx.insert(s.receiptCounter).values({ branchId: branch.id });
+
+    // J1: in-app is always on. Email, SMS and push stay off until the buyer needs them (module flags and keys).
+    await tx.insert(s.notificationChannel).values([
+      { organizationId: org.id, channel: "in_app", provider: "internal", isEnabled: true },
+      { organizationId: org.id, channel: "email", isEnabled: false },
+      { organizationId: org.id, channel: "sms", provider: "text.lk", isEnabled: false },
+      { organizationId: org.id, channel: "push", provider: "web push", isEnabled: false },
+    ]);
 
     await tx.insert(s.paymentMethod).values([
       { organizationId: org.id, type: "bank_transfer", label: "Bank transfer", isDefault: true },

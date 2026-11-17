@@ -6,6 +6,7 @@ import {
   index,
   integer,
   jsonb,
+  numeric,
   pgTable,
   text,
   unique,
@@ -25,6 +26,9 @@ export const INVOICE_ITEM_KINDS = ["recurring_fee", "package_fee", "content", "a
 export const PAYMENT_METHOD_TYPES = ["bank_transfer", "cash", "gateway"] as const;
 export const PAYMENT_STATUSES = ["pending_verification", "verified", "rejected", "voided"] as const;
 export const RECEIPT_STATUSES = ["issued", "void"] as const;
+export const INSTALLMENT_STATUSES = ["pending", "partial", "paid", "overdue"] as const;
+export const FEE_EXCEPTION_KINDS = ["alternate_option", "discount"] as const;
+export const DISCOUNT_TYPES = ["percent", "fixed"] as const;
 
 /**
  * Fees are set on the class (invariant D1). A class has at most one default, active structure,
@@ -148,10 +152,98 @@ export const bankAccount = pgTable(
   ],
 );
 
+/** Installment plans offered on a one-time package (D10, D11). Chosen when the invoice is issued. */
+export const installmentOption = pgTable(
+  "installment_option",
+  {
+    id: pk(),
+    feeStructureId: uuid("fee_structure_id")
+      .notNull()
+      .references((): AnyPgColumn => feeStructure.id),
+    name: text("name").notNull(),
+    installmentCount: integer("installment_count").notNull(),
+    /** Share of the total due at issue, 0 to under 100. */
+    downPaymentPercent: numeric("down_payment_percent", { precision: 5, scale: 2 }).notNull().default("0"),
+    /** Days between installments. */
+    intervalDays: integer("interval_days").notNull(),
+    surchargePercent: numeric("surcharge_percent", { precision: 5, scale: 2 }).notNull().default("0"),
+    isActive: boolean("is_active").notNull().default(true),
+  },
+  (t) => [
+    unique("installment_option_structure_name_uq").on(t.feeStructureId, t.name),
+    check("installment_option_count_check", sql`${t.installmentCount} >= 2`),
+    check(
+      "installment_option_down_payment_check",
+      sql`${t.downPaymentPercent} >= 0 AND ${t.downPaymentPercent} < 100`,
+    ),
+    check("installment_option_interval_check", sql`${t.intervalDays} > 0`),
+    check("installment_option_surcharge_check", sql`${t.surchargePercent} >= 0`),
+    index("installment_option_structure_idx").on(t.feeStructureId),
+  ],
+);
+
+/**
+ * Optional fee exception (D15 to D22): another fee option of the same class, or a discount, for one enrolment.
+ * Ended (effective_to, ended_by), never deleted. Overlap per (enrolment, kind) is blocked by an exclusion constraint (D18).
+ * course_id repeats the enrolment's course so composite foreign keys can keep the alternate option in the same class (D20).
+ */
+export const feeException = pgTable(
+  "fee_exception",
+  {
+    id: pk(),
+    enrollmentId: uuid("enrollment_id").notNull(),
+    courseId: uuid("course_id").notNull(),
+    kind: text("kind").notNull(),
+    alternateFeeStructureId: uuid("alternate_fee_structure_id"),
+    discountType: text("discount_type"),
+    /** Percent 0 to 100 (100 = free place) or a fixed amount. */
+    discountValue: numeric("discount_value", { precision: 12, scale: 2 }),
+    effectiveFrom: day("effective_from").notNull(),
+    /** Exclusive end. null = until ended. */
+    effectiveTo: day("effective_to"),
+    reason: text("reason").notNull(),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references((): AnyPgColumn => user.id),
+    endedBy: uuid("ended_by").references((): AnyPgColumn => user.id),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique("fee_exception_id_enrollment_uq").on(t.id, t.enrollmentId),
+    foreignKey({
+      name: "fee_exception_enrollment_course_fk",
+      columns: [t.enrollmentId, t.courseId],
+      foreignColumns: [enrollment.id, enrollment.courseId],
+    }),
+    // D20: the alternate option belongs to the same class.
+    foreignKey({
+      name: "fee_exception_alternate_course_fk",
+      columns: [t.alternateFeeStructureId, t.courseId],
+      foreignColumns: [feeStructure.id, feeStructure.courseId],
+    }),
+    oneOf("fee_exception_kind_check", t.kind, FEE_EXCEPTION_KINDS),
+    // D16: columns required or empty by kind.
+    check(
+      "fee_exception_kind_columns_check",
+      sql`(${t.kind} = 'alternate_option' AND ${t.alternateFeeStructureId} IS NOT NULL AND ${t.discountType} IS NULL AND ${t.discountValue} IS NULL) OR (${t.kind} = 'discount' AND ${t.alternateFeeStructureId} IS NULL AND ${t.discountType} IS NOT NULL AND ${t.discountType} IN ('percent', 'fixed') AND ${t.discountValue} IS NOT NULL)`,
+    ),
+    // D19: percent is 0 to 100, fixed is at least 0.
+    check(
+      "fee_exception_discount_value_check",
+      sql`${t.discountType} IS NULL OR (${t.discountValue} IS NOT NULL AND ${t.discountValue} >= 0 AND (${t.discountType} <> 'percent' OR ${t.discountValue} <= 100))`,
+    ),
+    // D17
+    check("fee_exception_reason_check", sql`length(btrim(${t.reason})) > 0`),
+    check("fee_exception_dates_check", sql`${t.effectiveTo} IS NULL OR ${t.effectiveTo} > ${t.effectiveFrom}`),
+    // D21: an exception that was ended by someone has an end date.
+    check("fee_exception_ended_check", sql`${t.endedBy} IS NULL OR ${t.effectiveTo} IS NOT NULL`),
+    index("fee_exception_enrollment_idx").on(t.enrollmentId),
+  ],
+);
+
 /**
  * Invoice header. Totals are caches of the items and are inserted with their final values (D8, D9):
  * total = subtotal - discount_total, where items are signed amounts. Issued invoices are append-only (D26).
- * Phase 2 adds installment_option_id.
  */
 export const invoice = pgTable(
   "invoice",
@@ -163,6 +255,8 @@ export const invoice = pgTable(
     branchId: uuid("branch_id")
       .notNull()
       .references((): AnyPgColumn => branch.id),
+    /** null = pay in full. Fixed at issue time (D11). */
+    installmentOptionId: uuid("installment_option_id").references((): AnyPgColumn => installmentOption.id),
     issuedOn: day("issued_on").notNull().default(sql`CURRENT_DATE`),
     dueDate: day("due_date").notNull(),
     /** Total before discounts. */
@@ -190,9 +284,36 @@ export const invoice = pgTable(
 );
 
 /**
+ * Installments follow the invoice (D10, D25). Amounts sum to the invoice total (checked in the transaction).
+ * amount_paid and status are caches derived by the waterfall over the invoice's allocations (E16).
+ */
+export const invoiceInstallment = pgTable(
+  "invoice_installment",
+  {
+    id: pk(),
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references((): AnyPgColumn => invoice.id),
+    seq: integer("seq").notNull(),
+    dueDate: day("due_date").notNull(),
+    amount: money("amount").notNull(),
+    amountPaid: money("amount_paid").notNull().default("0"),
+    status: text("status").notNull().default("pending"),
+  },
+  (t) => [
+    unique("invoice_installment_seq_uq").on(t.invoiceId, t.seq),
+    oneOf("invoice_installment_status_check", t.status, INSTALLMENT_STATUSES),
+    check("invoice_installment_seq_check", sql`${t.seq} >= 1`),
+    check("invoice_installment_amount_check", sql`${t.amount} > 0`),
+    check("invoice_installment_paid_check", sql`${t.amountPaid} >= 0 AND ${t.amountPaid} <= ${t.amount}`),
+    index("invoice_installment_due_idx").on(t.status, t.dueDate),
+  ],
+);
+
+/**
  * Signed invoice lines (D8, D23): fee and content items are positive, discount items negative,
  * adjustments either. Discounts and negative adjustments point at the payable item they reduce.
- * Phase 2 adds fee_exception_id, phase 4 adds content_purchase_id.
+ * Phase 4 adds content_purchase_id.
  */
 export const invoiceItem = pgTable(
   "invoice_item",
@@ -209,6 +330,8 @@ export const invoiceItem = pgTable(
     /** The grade used for the rate. */
     gradeLevelId: uuid("grade_level_id").references((): AnyPgColumn => gradeLevel.id),
     appliesToItemId: uuid("applies_to_item_id"),
+    /** Discount items created by a fee exception (D19). */
+    feeExceptionId: uuid("fee_exception_id").references((): AnyPgColumn => feeException.id),
     /** Set on every item when the invoice is cancelled (D26). */
     cancelledAt: tstz("cancelled_at"),
     periodStart: day("period_start"),
@@ -228,6 +351,7 @@ export const invoiceItem = pgTable(
       "invoice_item_sign_check",
       sql`(${t.kind} IN ('recurring_fee', 'package_fee', 'content') AND ${t.amount} > 0) OR (${t.kind} = 'discount' AND ${t.amount} < 0) OR (${t.kind} = 'adjustment' AND ${t.amount} <> 0)`,
     ),
+    check("invoice_item_exception_kind_check", sql`${t.feeExceptionId} IS NULL OR ${t.kind} = 'discount'`),
     check("invoice_item_discount_applies_check", sql`${t.kind} <> 'discount' OR ${t.appliesToItemId} IS NOT NULL`),
     check(
       "invoice_item_negative_adjustment_check",

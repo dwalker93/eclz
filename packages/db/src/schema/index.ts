@@ -7,3 +7,4 @@ export * from "./promotion";
 export * from "./billing";
 export * from "./content";
 export * from "./notices";
+export * from "./messaging";

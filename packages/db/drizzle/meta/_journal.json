@@ -15,6 +15,20 @@
       "when": 1794310159995,
       "tag": "0001_phase1_constraints",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794332828599,
+      "tag": "0002_phase2_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794332833973,
+      "tag": "0003_phase2_constraints",
+      "breakpoints": true
     }
   ]
 }
