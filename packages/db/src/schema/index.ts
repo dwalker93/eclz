@@ -8,3 +8,6 @@ export * from "./billing";
 export * from "./content";
 export * from "./notices";
 export * from "./messaging";
+export * from "./exams";
+export * from "./commissions";
+export * from "./gateway";

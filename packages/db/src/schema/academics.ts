@@ -217,6 +217,8 @@ export const enrollment = pgTable(
   (t) => [
     // Phase 2: fee exceptions tie an enrolment to its course (D20).
     unique("enrollment_id_course_uq").on(t.id, t.courseId),
+    // Phase 3: exam attempts and results tie an enrolment to its student and course (G3).
+    unique("enrollment_id_student_course_uq").on(t.id, t.studentId, t.courseId),
     // C3: the intake must belong to the enrolment's course.
     foreignKey({
       name: "enrollment_intake_course_fk",
