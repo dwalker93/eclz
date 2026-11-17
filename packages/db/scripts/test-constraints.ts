@@ -642,6 +642,444 @@ await rejects("a user joins a thread only once", /thread_participant_pk/, () =>
   q(`INSERT INTO thread_participant (thread_id, user_id) VALUES ($1, $2)`, [thread, u2]),
 );
 
+// ---- phase 3: exams
+const mkOnline = (title = "Unit test 1", extra = "") =>
+  id(
+    `INSERT INTO exam (lecturer_id, title, mode, opens_at, closes_at, max_attempts${extra ? ", " + extra.split("=")[0] : ""}) VALUES ($1, $2, 'online_mcq', now() - interval '1 hour', now() + interval '1 day', 2${extra ? ", " + extra.split("=")[1] : ""})`,
+    [lec, title],
+  );
+const qA = await id(`INSERT INTO question (lecturer_id, body) VALUES ($1, 'What is H2O?')`, [lec]);
+const qB = await id(`INSERT INTO question (lecturer_id, body, default_marks) VALUES ($1, 'Boiling point of water?', 2)`, [lec]);
+await rejects("a question body cannot be blank", /question_body_check/, () =>
+  q(`INSERT INTO question (lecturer_id, body) VALUES ($1, '  ')`, [lec]),
+);
+await rejects("question marks must be positive", /question_marks_check/, () =>
+  q(`INSERT INTO question (lecturer_id, body, default_marks) VALUES ($1, 'x', 0)`, [lec]),
+);
+await ok("question options", () =>
+  q(`INSERT INTO question_option (question_id, body, is_correct, position) VALUES ($1, 'Water', true, 1), ($1, 'Salt', false, 2)`, [qA]),
+);
+await rejects("option positions are unique per question", /question_option_position_uq/, () =>
+  q(`INSERT INTO question_option (question_id, body, position) VALUES ($1, 'Dup', 1)`, [qA]),
+);
+
+const examA = await mkOnline();
+await rejects("an online exam needs a window and attempt limit", /exam_mode_fields_check/, () =>
+  q(`INSERT INTO exam (lecturer_id, title, mode) VALUES ($1, 'No window', 'online_mcq')`, [lec]),
+);
+await rejects("a paper exam cannot carry online settings", /exam_mode_fields_check/, () =>
+  q(`INSERT INTO exam (lecturer_id, title, mode, exam_date, max_marks, max_attempts) VALUES ($1, 'Paper', 'paper', '2027-03-01', 100, 3)`, [lec]),
+);
+await rejects("a paper exam needs a date and total marks (NULL-safe)", /exam_mode_fields_check/, () =>
+  q(`INSERT INTO exam (lecturer_id, title, mode) VALUES ($1, 'Paper', 'paper')`, [lec]),
+);
+await rejects("an exam closes after it opens", /exam_window_check/, () =>
+  q(`INSERT INTO exam (lecturer_id, title, mode, opens_at, closes_at, max_attempts) VALUES ($1, 'Bad', 'online_mcq', now(), now() - interval '1 day', 1)`, [lec]),
+);
+await rejects("an exam allows at least one attempt", /exam_attempts_check/, () =>
+  q(`INSERT INTO exam (lecturer_id, title, mode, opens_at, closes_at, max_attempts) VALUES ($1, 'Bad', 'online_mcq', now(), now() + interval '1 day', 0)`, [lec]),
+);
+const paperExam = await id(
+  `INSERT INTO exam (lecturer_id, title, mode, exam_date, max_marks) VALUES ($1, 'Term test', 'paper', '2027-03-01', 100)`,
+  [lec],
+);
+await q(`INSERT INTO exam_course (exam_id, course_id) VALUES ($1, $2), ($3, $2)`, [examA, cls, paperExam]);
+await rejects("G4: an online exam cannot publish with no questions", /needs at least one question/, async () => {
+  const empty = await mkOnline("Empty");
+  await q(`UPDATE exam SET status = 'published' WHERE id = $1`, [empty]);
+});
+const eqA = await id(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 1)`, [examA, qA]);
+await ok("a second question in the exam", () =>
+  q(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 2, 2)`, [examA, qB]),
+);
+await rejects("exam question positions are unique", /exam_question_position_uq/, () =>
+  q(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 2)`, [examA, qA]),
+);
+await rejects("a question is used once per exam", /exam_question_question_uq/, () =>
+  q(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 3)`, [examA, qA]),
+);
+await rejects("G4: publishing needs every snapshot", /needs its snapshot/, () =>
+  q(`UPDATE exam SET status = 'published' WHERE id = $1`, [examA]),
+);
+await q(`UPDATE exam_question SET snapshot = '{"body":"What is H2O?","options":[{"key":"o1","body":"Water","correct":true}]}'::jsonb WHERE exam_id = $1`, [examA]);
+await ok("G4: publish once every question has its snapshot", () =>
+  q(`UPDATE exam SET status = 'published' WHERE id = $1`, [examA]),
+);
+await rejects("G4: a published exam cannot gain a question", /exam_question_frozen/, async () => {
+  const q3 = await id(`INSERT INTO question (lecturer_id, body) VALUES ($1, 'Late question')`, [lec]);
+  await q(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 9)`, [examA, q3]);
+});
+await rejects("G4: a published exam's question cannot change", /exam_question_frozen/, () =>
+  q(`UPDATE exam_question SET marks = 5 WHERE id = $1`, [eqA]),
+);
+await rejects("G4: a published exam's question cannot be removed", /exam_question_frozen/, () =>
+  q(`DELETE FROM exam_question WHERE id = $1`, [eqA]),
+);
+await rejects("an exam cannot go back to draft", /cannot move an exam from published to draft/, () =>
+  q(`UPDATE exam SET status = 'draft' WHERE id = $1`, [examA]),
+);
+await rejects("a draft exam cannot jump to closed", /cannot move an exam from draft to closed/, async () => {
+  const d = await mkOnline("Draft only");
+  await q(`UPDATE exam SET status = 'closed' WHERE id = $1`, [d]);
+});
+await rejects("the mode of a published exam cannot change", /mode of a published exam/, () =>
+  q(`UPDATE exam SET mode = 'paper' WHERE id = $1`, [examA]),
+);
+
+const attempt1 = await id(
+  `INSERT INTO exam_attempt (exam_id, student_id, enrollment_id, course_id, attempt_no) VALUES ($1, $2, $3, $4, 1)`,
+  [examA, st1, enr, cls],
+);
+await rejects("G2: one running attempt per student and exam", /exam_attempt_one_running_uq/, () =>
+  q(`INSERT INTO exam_attempt (exam_id, student_id, enrollment_id, course_id, attempt_no) VALUES ($1, $2, $3, $4, 2)`, [examA, st1, enr, cls]),
+);
+await rejects("G2: attempt numbers are unique per exam and student", /exam_attempt_no_uq/, () =>
+  q(`INSERT INTO exam_attempt (exam_id, student_id, enrollment_id, course_id, attempt_no, status, submitted_at) VALUES ($1, $2, $3, $4, 1, 'expired', now())`, [examA, st1, enr, cls]),
+);
+await rejects("G3: the enrolment must belong to the student", /exam_attempt_enrollment_fk/, async () => {
+  const attached = await mkOnline("Attached");
+  await q(`INSERT INTO exam_course (exam_id, course_id) VALUES ($1, $2)`, [attached, cls]);
+  await q(`INSERT INTO exam_attempt (exam_id, student_id, enrollment_id, course_id, attempt_no) VALUES ($1, $2, $3, $4, 1)`, [attached, st1, enrFresh, cls]);
+});
+await rejects("G3: the exam must be attached to the enrolment's course", /exam_attempt_exam_course_fk/, async () => {
+  const unattached = await mkOnline("Unattached");
+  await q(`INSERT INTO exam_attempt (exam_id, student_id, enrollment_id, course_id, attempt_no) VALUES ($1, $2, $3, $4, 1)`, [unattached, st1, enr, cls]);
+});
+await rejects("a submitted attempt needs its submission time", /exam_attempt_submitted_check/, () =>
+  q(`UPDATE exam_attempt SET status = 'submitted' WHERE id = $1`, [attempt1]),
+);
+await rejects("a graded attempt needs a score", /exam_attempt_graded_check|exam_attempt_submitted_check/, () =>
+  q(`UPDATE exam_attempt SET status = 'graded', submitted_at = now() WHERE id = $1`, [attempt1]),
+);
+await ok("an answer stores the selected option key", () =>
+  q(`INSERT INTO attempt_answer (attempt_id, exam_id, exam_question_id, selected_option_key, is_correct, marks_awarded) VALUES ($1, $2, $3, 'o1', true, 1)`, [attempt1, examA, eqA]),
+);
+await rejects("one answer per question in an attempt", /attempt_answer_uq/, () =>
+  q(`INSERT INTO attempt_answer (attempt_id, exam_id, exam_question_id) VALUES ($1, $2, $3)`, [attempt1, examA, eqA]),
+);
+await rejects("an answer's question must belong to the attempt's exam", /attempt_answer_question_exam_fk/, async () => {
+  const other = await mkOnline("Other exam");
+  const q4 = await id(`INSERT INTO question (lecturer_id, body) VALUES ($1, 'Other')`, [lec]);
+  const eqOther = await id(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 1)`, [other, q4]);
+  await q(`INSERT INTO attempt_answer (attempt_id, exam_id, exam_question_id) VALUES ($1, $2, $3)`, [attempt1, examA, eqOther]);
+});
+await q(`UPDATE exam_attempt SET status = 'graded', submitted_at = now(), score = 3 WHERE id = $1`, [attempt1]);
+
+await rejects("G7: an online exam result cannot be entered manually", /comes from an attempt/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, marks, source) VALUES ($1, $2, 3, 'manual')`, [examA, st1]),
+);
+await rejects("G7: an attempt result needs its attempt (NULL-safe)", /exam_result_source_attempt_check/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, marks, source) VALUES ($1, $2, 3, 'attempt')`, [examA, st1]),
+);
+await rejects("an attempt result must use that student's attempt", /exam_result_attempt_fk/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, attempt_id, marks, source) VALUES ($1, $2, $3, 3, 'attempt')`, [examA, st2, attempt1]),
+);
+const resA = await id(
+  `INSERT INTO exam_result (exam_id, student_id, enrollment_id, course_id, attempt_id, marks, source) VALUES ($1, $2, $3, $4, $5, 3, 'attempt')`,
+  [examA, st1, enr, cls, attempt1],
+);
+await rejects("G7: one result per exam and student", /exam_result_uq/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, attempt_id, marks, source) VALUES ($1, $2, $3, 3, 'attempt')`, [examA, st1, attempt1]),
+);
+await rejects("a result's enrolment needs its course (pair)", /exam_result_enrollment_pair_check/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, enrollment_id, marks, source) VALUES ($1, $2, $3, 50, 'manual')`, [paperExam, st1, enr]),
+);
+await rejects("G7: a paper exam result cannot come from an attempt", /paper exam result is entered manually/, () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, attempt_id, marks, source) VALUES ($1, $2, $3, 50, 'attempt')`, [paperExam, st1, attempt1]),
+);
+await ok("G7: a paper result is entered manually", () =>
+  q(`INSERT INTO exam_result (exam_id, student_id, enrollment_id, course_id, marks, grade, source) VALUES ($1, $2, $3, $4, 78, 'B', 'manual')`, [paperExam, st1, enr, cls]),
+);
+await rejects("G8: a result cannot be released before the exam closes", /released only after the exam is closed/, () =>
+  q(`UPDATE exam_result SET released_at = now() WHERE id = $1`, [resA]),
+);
+await q(`UPDATE exam SET status = 'closed' WHERE id = $1`, [examA]);
+await ok("G8: a result can be released once the exam is closed", () =>
+  q(`UPDATE exam_result SET released_at = now() WHERE id = $1`, [resA]),
+);
+await ok("G8: a released online result can become a manual override", () =>
+  q(`UPDATE exam_result SET source = 'manual_override', marks = 4 WHERE id = $1`, [resA]),
+);
+
+// ---- phase 4: content purchases, commissions, payouts
+const cPaid = await id(
+  `INSERT INTO content_item (lecturer_id, kind, title, external_url, access_type, price) VALUES ($1, 'recording', 'Paid lesson', 'https://youtu.be/p', 'paid', 500)`,
+  [lec],
+);
+const cPaid2 = await id(
+  `INSERT INTO content_item (lecturer_id, kind, title, external_url, access_type, price) VALUES ($1, 'recording', 'Paid lesson 2', 'https://youtu.be/p2', 'paid', 700)`,
+  [lec],
+);
+const cBook = await id(
+  `INSERT INTO content_item (lecturer_id, kind, title, access_type, price) VALUES ($1, 'physical_book', 'Science workbook', 'paid', 1500)`,
+  [lec],
+);
+const cFree = await id(`INSERT INTO content_item (lecturer_id, kind, title, external_url, access_type) VALUES ($1, 'recording', 'Free lesson', 'https://youtu.be/f', 'free_registered')`, [lec]);
+await q(`INSERT INTO content_branch (content_id, branch_id) VALUES ($1, $5), ($2, $5), ($2, $6), ($3, $5), ($4, $5)`, [cPaid, cPaid2, cBook, cFree, b1, b2]);
+const invC = await mkInvoice(st1, 500);
+const purch = await id(
+  `INSERT INTO content_purchase (content_id, student_id, invoice_id, branch_id, channel, price) VALUES ($1, $2, $3, $4, 'online', 500)`,
+  [cPaid, st1, invC, b1],
+);
+await rejects("F5: no second pending purchase of the same item", /content_purchase_active_uq/, () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 500)`, [cPaid, st1, b1]),
+);
+await rejects("only a paid content item can be purchased", /only a paid content item/, () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 100)`, [cFree, st2, b1]),
+);
+await rejects("D13: the branch must be one the item is listed in", /content_purchase_listed_branch_fk/, () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 500)`, [cPaid, st2, b2]),
+);
+await rejects("a purchase's invoice must belong to the same student", /content_purchase_invoice_student_fk/, () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, invoice_id, branch_id, channel, price) VALUES ($1, $2, $3, $4, 'online', 700)`, [cPaid2, st2, invC, b1]),
+);
+await rejects("D24: a purchase's invoice must be in the purchase's branch", /content_purchase_invoice_branch_fk/, async () => {
+  const invB2 = await mkInvoice(st1, 700, b2);
+  await q(`INSERT INTO content_purchase (content_id, student_id, invoice_id, branch_id, channel, price) VALUES ($1, $2, $3, $4, 'online', 700)`, [cPaid2, st1, invB2, b1]);
+});
+await rejects("a purchase price must be positive", /content_purchase_price_check/, () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 0)`, [cPaid2, st2, b1]),
+);
+await ok("an invoice line charges the purchase", () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount, content_purchase_id) VALUES ($1, 'content', 500, $2)`, [invC, purch]),
+);
+await rejects("a content line needs its purchase (NULL-safe)", /invoice_item_content_fields_check/, () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount) VALUES ($1, 'content', 500)`, [invC]),
+);
+await rejects("only content lines carry a purchase", /invoice_item_content_fields_check/, () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount, content_purchase_id) VALUES ($1, 'adjustment', 5, $2)`, [invC, purch]),
+);
+await rejects("a purchase has one active content line", /invoice_item_content_purchase_uq/, () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount, content_purchase_id) VALUES ($1, 'content', 500, $2)`, [invC, purch]),
+);
+await rejects("a content line must use the purchase's own invoice", /invoice_item_purchase_invoice_fk/, async () => {
+  const invOwn = await mkInvoice(st1, 700);
+  const purch2 = await id(
+    `INSERT INTO content_purchase (content_id, student_id, invoice_id, branch_id, channel, price) VALUES ($1, $2, $3, $4, 'online', 700)`,
+    [cPaid2, st1, invOwn, b1],
+  );
+  const other = await mkInvoice(st1, 700);
+  await q(`INSERT INTO invoice_item (invoice_id, kind, amount, content_purchase_id) VALUES ($1, 'content', 700, $2)`, [other, purch2]);
+});
+await rejects("F6: a pending purchase cannot be handed over", /content_purchase_handover_check/, () =>
+  q(`UPDATE content_purchase SET handed_over_at = now(), handed_over_by = $2 WHERE id = $1`, [purch, u1]),
+);
+const invBook = await mkInvoice(st1, 1500);
+const bookPurchase = await id(
+  `INSERT INTO content_purchase (content_id, student_id, invoice_id, branch_id, channel, price) VALUES ($1, $2, $3, $4, 'physical', 1500)`,
+  [cBook, st1, invBook, b1],
+);
+await q(`UPDATE content_purchase SET status = 'paid' WHERE id = $1`, [bookPurchase]);
+await rejects("F6: handover records who handed it over", /content_purchase_handover_check/, () =>
+  q(`UPDATE content_purchase SET handed_over_at = now() WHERE id = $1`, [bookPurchase]),
+);
+await ok("F6: a paid physical purchase can be handed over", () =>
+  q(`UPDATE content_purchase SET handed_over_at = now(), handed_over_by = $2 WHERE id = $1`, [bookPurchase, u1]),
+);
+await rejects("F6: an online purchase has no handover", /content_purchase_handover_check/, async () => {
+  await q(`UPDATE content_purchase SET status = 'paid' WHERE id = $1`, [purch]);
+  await q(`UPDATE content_purchase SET handed_over_at = now(), handed_over_by = $2 WHERE id = $1`, [purch, u1]);
+});
+await q(`UPDATE content_purchase SET status = 'cancelled' WHERE id = $1`, [purch]);
+await ok("F5: a cancelled purchase can be bought again", () =>
+  q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 500)`, [cPaid, st1, b1]),
+);
+
+const lec3 = await id(`INSERT INTO lecturer (full_name) VALUES ('Ms Perera')`);
+const ruleDefault = await id(
+  `INSERT INTO commission_rule (lecturer_id, calc_type, commission_rate, effective_from) VALUES ($1, 'percent', 20, '2027-01-01')`,
+  [lec],
+);
+await rejects("H4: overlapping rules of the same scope are rejected", /commission_rule_no_overlap/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, calc_type, commission_rate, effective_from) VALUES ($1, 'percent', 25, '2028-01-01')`, [lec]),
+);
+await ok("H4: a rule for a different scope can overlap in dates", () =>
+  q(`INSERT INTO commission_rule (lecturer_id, course_id, calc_type, commission_rate, effective_from) VALUES ($1, $2, 'fixed_per_student_month', 150, '2027-01-01')`, [lec, cls]),
+);
+await ok("H4: another lecturer's default rule is independent", () =>
+  q(`INSERT INTO commission_rule (lecturer_id, calc_type, commission_rate, effective_from) VALUES ($1, 'percent', 10, '2027-01-01')`, [lec3]),
+);
+await rejects("H12: a percent rate is at most 100", /commission_rule_rate_check/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, subject_id, calc_type, commission_rate, effective_from) VALUES ($1, $2, 'percent', 150, '2027-01-01')`, [lec, subj]),
+);
+await rejects("H12: a rate cannot be negative", /commission_rule_rate_check/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, subject_id, calc_type, commission_rate, effective_from) VALUES ($1, $2, 'fixed_per_student_month', -1, '2027-01-01')`, [lec, subj]),
+);
+await rejects("H4: a grade needs a subject", /commission_rule_scope_check/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, grade_level_id, calc_type, commission_rate, effective_from) VALUES ($1, $2, 'percent', 10, '2027-01-01')`, [lec, g6]),
+);
+await rejects("H4: a course rule is a course alone", /commission_rule_scope_check/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, course_id, subject_id, calc_type, commission_rate, effective_from) VALUES ($1, $2, $3, 'percent', 10, '2027-01-01')`, [lec, cls, subj]),
+);
+await rejects("a rule ends after it starts", /commission_rule_dates_check/, () =>
+  q(`INSERT INTO commission_rule (lecturer_id, subject_id, calc_type, commission_rate, effective_from, effective_to) VALUES ($1, $2, 'percent', 10, '2027-01-01', '2027-01-01')`, [lec, subj]),
+);
+
+const invFee = await mkInvoice(st1, 1000);
+const itemFee = await id(
+  `INSERT INTO invoice_item (invoice_id, kind, amount, enrollment_id, fee_structure_id, period_start, period_end) VALUES ($1, 'recurring_fee', 1000, $2, $3, '2027-05-01', '2027-06-01')`,
+  [invFee, enr, fee1],
+);
+const payFee = await mkPayment(1000, "REF-FEE");
+await pg.transaction(async (tx) => {
+  await tx.query(verify(payFee));
+  await tx.query(alloc(payFee, invFee, itemFee, 1000));
+});
+const feeAlloc = String((await q(`SELECT id FROM payment_allocation WHERE payment_id = $1`, [payFee]))[0]!.id);
+const invAdj = await mkInvoice(st1, 300);
+const itemAdj = await id(`INSERT INTO invoice_item (invoice_id, kind, amount) VALUES ($1, 'adjustment', 300)`, [invAdj]);
+const payAdj = await mkPayment(300, "REF-ADJ");
+await pg.transaction(async (tx) => {
+  await tx.query(verify(payAdj));
+  await tx.query(alloc(payAdj, invAdj, itemAdj, 300));
+});
+const adjAlloc = String((await q(`SELECT id FROM payment_allocation WHERE payment_id = $1`, [payAdj]))[0]!.id);
+const mkEntry = (opts: { type?: string; alloc?: string; rule?: string; lecturer?: string; base?: number; comm?: number; teacher?: number; reverses?: string | null; share?: number; status?: string; payout?: string | null } = {}) =>
+  id(
+    `INSERT INTO commission_entry (payment_allocation_id, rule_id, lecturer_id, payout_id, reverses_entry_id, entry_type, calc_type_applied, rate_applied, share_percent_applied, basis_applied, base_amount, commission_amount, teacher_amount, status) VALUES ($1, $2, $3, $4, $5, $6, 'percent', 20, $7, 'paid', $8, $9, $10, $11)`,
+    [opts.alloc ?? feeAlloc, opts.rule ?? ruleDefault, opts.lecturer ?? lec, opts.payout ?? null, opts.reverses ?? null, opts.type ?? "accrual", opts.share ?? 60, opts.base ?? 100, opts.comm ?? 20, opts.teacher ?? 80, opts.status ?? "accrued"],
+  );
+const lecB = await id(`INSERT INTO lecturer (full_name) VALUES ('Mr Fernando')`);
+await q(`INSERT INTO course_lecturer (course_id, lecturer_id, share_percent) VALUES ($1, $2, 40)`, [cls, lecB]);
+const entry1 = await mkEntry();
+await rejects("H2: one accrual per allocation and lecturer", /commission_entry_accrual_uq/, () => mkEntry());
+await rejects("H1: teacher amount is base minus commission", /commission_entry_split_check/, () => mkEntry({ lecturer: lecB, rule: ruleDefault, teacher: 70 }));
+await rejects("H12: an accrual's commission cannot exceed its base", /commission_entry_type_amounts_check/, () =>
+  mkEntry({ comm: 120, teacher: -20 }),
+);
+await rejects("H12: an accrual cannot be negative", /commission_entry_type_amounts_check/, () =>
+  mkEntry({ base: -100, comm: -20, teacher: -80 }),
+);
+await rejects("share applied is 0 to 100", /commission_entry_share_check/, () => mkEntry({ share: 120 }));
+await rejects("the entry's rule must belong to its lecturer", /commission_entry_rule_lecturer_fk/, () =>
+  mkEntry({ lecturer: lecB, rule: ruleDefault }),
+);
+await rejects("H11: the lecturer must teach the fee item's course", /does not teach the course/, async () => {
+  const ruleLec3 = String((await q(`SELECT id FROM commission_rule WHERE lecturer_id = $1`, [lec3]))[0]!.id);
+  await mkEntry({ lecturer: lec3, rule: ruleLec3 });
+});
+await rejects("H11: only fee items accrue commission", /only fee items accrue commission/, () => mkEntry({ alloc: adjAlloc, lecturer: lec, rule: ruleDefault }));
+await rejects("a settled entry needs a payout", /commission_entry_payout_check/, () =>
+  q(`UPDATE commission_entry SET status = 'settled' WHERE id = $1`, [entry1]),
+);
+await rejects("H7: a reversal must reverse something", /must reverse an accrual|commission_entry_type_amounts_check/, () =>
+  mkEntry({ type: "reversal", base: -100, comm: -20, teacher: -80 }),
+);
+await rejects("H12: a reversal must be the exact negative", /exact negative/, () =>
+  mkEntry({ type: "reversal", reverses: entry1, base: -100, comm: -10, teacher: -90 }),
+);
+const rev1 = await mkEntry({ type: "reversal", reverses: entry1, base: -100, comm: -20, teacher: -80 });
+await ok("H7: an exact reversal entry", async () => {
+  if (!rev1) throw new Error("no reversal");
+});
+await rejects("H7: an entry is reversed once", /commission_entry_reversal_uq/, () =>
+  mkEntry({ type: "reversal", reverses: entry1, base: -100, comm: -20, teacher: -80 }),
+);
+await rejects("H7: a reversal cannot be reversed", /must reverse an accrual/, () =>
+  mkEntry({ type: "reversal", reverses: rev1, base: 100, comm: 20, teacher: 80 }),
+);
+await rejects("H6: entry amounts cannot be edited", /only status and payout can change/, () =>
+  q(`UPDATE commission_entry SET base_amount = 200, commission_amount = 40, teacher_amount = 160 WHERE id = $1`, [entry1]),
+);
+await rejects("commission entries are never deleted", /never deleted/, () => q(`DELETE FROM commission_entry WHERE id = $1`, [entry1]));
+
+const payout = await id(
+  `INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-01-01', '2027-02-01', 100, 20, 80)`,
+  [lec],
+);
+await rejects("a payout's net is gross minus commission", /teacher_payout_amounts_check/, () =>
+  q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-02-01', '2027-03-01', 100, 20, 90)`, [lec]),
+);
+await rejects("H8: a payout cannot be negative", /teacher_payout_amounts_check/, () =>
+  q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-02-01', '2027-03-01', 0, 20, -20)`, [lec]),
+);
+await rejects("a payout period ends after it starts", /teacher_payout_period_check/, () =>
+  q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-02-01', '2027-02-01', 0, 0, 0)`, [lec]),
+);
+await rejects("an entry cannot join another lecturer's payout", /commission_entry_payout_lecturer_fk/, async () => {
+  const otherPayout = await id(
+    `INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-01-01', '2027-02-01', 0, 0, 0)`,
+    [lec3],
+  );
+  await q(`UPDATE commission_entry SET status = 'settled', payout_id = $2 WHERE id = $1`, [entry1, otherPayout]);
+});
+await ok("H8: an entry is settled in the payout", () =>
+  q(`UPDATE commission_entry SET status = 'settled', payout_id = $2 WHERE id = $1`, [entry1, payout]),
+);
+await rejects("an approved payout needs an approver (NULL-safe)", /teacher_payout_approved_check/, () =>
+  q(`UPDATE teacher_payout SET status = 'approved' WHERE id = $1`, [payout]),
+);
+await rejects("a payout cannot skip approval", /cannot move a payout from draft to paid/, () =>
+  q(`UPDATE teacher_payout SET status = 'paid', approved_by = $2, paid_on = '2027-02-05', payment_reference = 'TRX-1' WHERE id = $1`, [payout, u1]),
+);
+await q(`UPDATE teacher_payout SET status = 'approved', approved_by = $2 WHERE id = $1`, [payout, u1]);
+await rejects("an approved payout cannot be deleted", /only a draft payout can be deleted/, () => q(`DELETE FROM teacher_payout WHERE id = $1`, [payout]));
+await rejects("a paid payout needs its date and reference", /teacher_payout_paid_check/, () =>
+  q(`UPDATE teacher_payout SET status = 'paid' WHERE id = $1`, [payout]),
+);
+await ok("a payout is marked paid", () =>
+  q(`UPDATE teacher_payout SET status = 'paid', paid_on = '2027-02-05', payment_reference = 'TRX-1' WHERE id = $1`, [payout]),
+);
+await rejects("H8: a paid payout is immutable", /paid payout is immutable/, () =>
+  q(`UPDATE teacher_payout SET payment_reference = 'edited' WHERE id = $1`, [payout]),
+);
+await rejects("H8: an entry in a paid payout cannot change", /entry in a paid payout cannot change/, () =>
+  q(`UPDATE commission_entry SET status = 'void', payout_id = NULL WHERE id = $1`, [entry1]),
+);
+await ok("a draft payout can be deleted", async () => {
+  const d = await id(
+    `INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2028-01-01', '2028-02-01', 0, 0, 0)`,
+    [lec],
+  );
+  await q(`DELETE FROM teacher_payout WHERE id = $1`, [d]);
+});
+
+// ---- phase 5: gateway
+const gwMethod = await id(
+  `INSERT INTO payment_method (organization_id, type, label) VALUES ((SELECT id FROM organization), 'gateway', 'Card payment')`,
+);
+const gwPayment = await id(
+  `INSERT INTO payment (student_id, branch_id, payment_method_id, amount, submitted_by) VALUES ($1, $2, $3, 1200, $4)`,
+  [st1, b1, gwMethod, u1],
+);
+const gwTx = await id(`INSERT INTO gateway_transaction (payment_id, provider) VALUES ($1, 'payhere')`, [gwPayment]);
+await ok("a gateway transaction starts initiated with no reference", async () => {
+  const r = await q(`SELECT status, provider_ref FROM gateway_transaction WHERE id = $1`, [gwTx]);
+  if (r[0]!.status !== "initiated" || r[0]!.provider_ref !== null) throw new Error("unexpected defaults");
+});
+await rejects("a gateway transaction needs a gateway payment", /must use a gateway payment method/, () =>
+  q(`INSERT INTO gateway_transaction (payment_id, provider) VALUES ($1, 'payhere')`, [payA]),
+);
+await rejects("a succeeded transaction needs its provider reference (NULL-safe)", /gateway_transaction_succeeded_check/, () =>
+  q(`UPDATE gateway_transaction SET status = 'succeeded' WHERE id = $1`, [gwTx]),
+);
+await rejects("a transaction status must be known", /gateway_transaction_status_check/, () =>
+  q(`UPDATE gateway_transaction SET status = 'refunded' WHERE id = $1`, [gwTx]),
+);
+await rejects("a blank provider reference is rejected", /gateway_transaction_ref_check/, () =>
+  q(`UPDATE gateway_transaction SET provider_ref = '  ' WHERE id = $1`, [gwTx]),
+);
+await ok("a callback records the provider reference and payload", () =>
+  q(`UPDATE gateway_transaction SET status = 'succeeded', provider_ref = 'PH-1001', raw_payload = '{"status_code":2}'::jsonb WHERE id = $1`, [gwTx]),
+);
+await rejects("E14: a provider reference is unique per provider", /gateway_transaction_provider_ref_uq/, async () => {
+  const pay2 = await id(
+    `INSERT INTO payment (student_id, branch_id, payment_method_id, amount, submitted_by) VALUES ($1, $2, $3, 500, $4)`,
+    [st1, b1, gwMethod, u1],
+  );
+  await q(`INSERT INTO gateway_transaction (payment_id, provider, provider_ref) VALUES ($1, 'payhere', 'PH-1001')`, [pay2]);
+});
+await ok("E14: the same reference at another provider is allowed", async () => {
+  const pay3 = await id(
+    `INSERT INTO payment (student_id, branch_id, payment_method_id, amount, submitted_by) VALUES ($1, $2, $3, 500, $4)`,
+    [st1, b1, gwMethod, u1],
+  );
+  await q(`INSERT INTO gateway_transaction (payment_id, provider, provider_ref) VALUES ($1, 'stripe', 'PH-1001')`, [pay3]);
+});
+await ok("transactions without a reference yet can coexist", () =>
+  q(`INSERT INTO gateway_transaction (payment_id, provider) VALUES ($1, 'payhere')`, [gwPayment]),
+);
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {
   console.log(failures.map((f) => ` - ${f}`).join("\n"));

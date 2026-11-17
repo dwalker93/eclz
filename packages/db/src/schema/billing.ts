@@ -17,6 +17,7 @@ import {
 import { course, enrollment, intake } from "./academics";
 import { branch, file, OVERDUE_ACTIONS, organization, user } from "./core";
 import { createdAt, day, money, oneOf, pk, tstz } from "./helpers";
+import { contentPurchase } from "./content";
 import { gradeLevel, student } from "./people";
 
 export const FEE_BILLING_TYPES = ["recurring", "one_time_package"] as const;
@@ -272,6 +273,8 @@ export const invoice = pgTable(
   },
   (t) => [
     unique("invoice_id_student_uq").on(t.id, t.studentId),
+    // Phase 4: a content purchase and its invoice share the branch (D13, D24).
+    unique("invoice_id_branch_uq").on(t.id, t.branchId),
     oneOf("invoice_status_check", t.status, INVOICE_STATUSES),
     check("invoice_discount_range_check", sql`${t.discountTotal} >= 0 AND ${t.discountTotal} <= ${t.subtotal}`),
     check("invoice_total_formula_check", sql`${t.total} = ${t.subtotal} - ${t.discountTotal}`),
@@ -313,8 +316,7 @@ export const invoiceInstallment = pgTable(
 /**
  * Signed invoice lines (D8, D23): fee and content items are positive, discount items negative,
  * adjustments either. Discounts and negative adjustments point at the payable item they reduce.
- * Phase 4 adds content_purchase_id.
- */
+ *  */
 export const invoiceItem = pgTable(
   "invoice_item",
   {
@@ -330,6 +332,8 @@ export const invoiceItem = pgTable(
     /** The grade used for the rate. */
     gradeLevelId: uuid("grade_level_id").references((): AnyPgColumn => gradeLevel.id),
     appliesToItemId: uuid("applies_to_item_id"),
+    /** Content items: the purchase this line charges. The purchase must point at the same invoice. */
+    contentPurchaseId: uuid("content_purchase_id"),
     /** Discount items created by a fee exception (D19). */
     feeExceptionId: uuid("fee_exception_id").references((): AnyPgColumn => feeException.id),
     /** Set on every item when the invoice is cancelled (D26). */
@@ -346,7 +350,20 @@ export const invoiceItem = pgTable(
       columns: [t.appliesToItemId, t.invoiceId],
       foreignColumns: [t.id, t.invoiceId],
     }),
+    foreignKey({
+      name: "invoice_item_purchase_invoice_fk",
+      columns: [t.contentPurchaseId, t.invoiceId],
+      foreignColumns: [contentPurchase.id, contentPurchase.invoiceId],
+    }),
     oneOf("invoice_item_kind_check", t.kind, INVOICE_ITEM_KINDS),
+    check(
+      "invoice_item_content_fields_check",
+      sql`(${t.kind} = 'content' AND ${t.contentPurchaseId} IS NOT NULL) OR (${t.kind} <> 'content' AND ${t.contentPurchaseId} IS NULL)`,
+    ),
+    // One active content line per purchase.
+    uniqueIndex("invoice_item_content_purchase_uq")
+      .on(t.contentPurchaseId)
+      .where(sql`${t.kind} = 'content' AND ${t.cancelledAt} IS NULL`),
     check(
       "invoice_item_sign_check",
       sql`(${t.kind} IN ('recurring_fee', 'package_fee', 'content') AND ${t.amount} > 0) OR (${t.kind} = 'discount' AND ${t.amount} < 0) OR (${t.kind} = 'adjustment' AND ${t.amount} <> 0)`,
