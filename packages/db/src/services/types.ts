@@ -33,7 +33,15 @@ export type ServiceErrorCode =
   | "invoice_not_adjustable"
   | "total_below_paid"
   | "invoice_has_payments"
-  | "exception_invalid";
+  | "exception_invalid"
+  | "promotion_not_draft"
+  | "promotion_unresolved"
+  | "promotion_date_invalid"
+  | "promotion_stale"
+  | "payout_not_draft"
+  | "payout_not_approved"
+  | "payout_period_invalid"
+  | "payout_nothing_to_pay";
 
 /** A rule of the business was broken. The message is safe to show to staff. */
 export class ServiceError extends Error {
