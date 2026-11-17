@@ -19,3 +19,4 @@ export function createDb(databaseUrl: string) {
 export type Database = ReturnType<typeof createDb>["db"];
 
 export { seedDefaults, STARTER_PERMISSIONS, STARTER_ROLES, type SeedOptions } from "./seed";
+export * from "./services";

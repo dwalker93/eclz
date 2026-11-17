@@ -14,7 +14,9 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:test": "tsx scripts/test-constraints.ts",
-    "db:seed": "tsx scripts/seed.ts"
+    "db:seed": "tsx scripts/seed.ts",
+    "db:test:services": "tsx scripts/test-services.ts",
+    "db:test:enrolment": "tsx scripts/test-enrolment.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.44.0",

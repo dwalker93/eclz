@@ -58,6 +58,80 @@ for what Drizzle cannot express (constraints and triggers per phase). `0002`, `0
 hand-written SQL in `--custom` migrations. Write changes backward-compatible (add first, remove later) and
 add a dated entry to the changelog in `docs/student-management-invariants.md`.
 
+## Services (payments, enrolment, invoicing)
+
+`src/services` holds the business logic that the database cannot enforce, as typed functions over Drizzle. They work with the production
+`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions.
+
+```ts
+import { createDb, createPaymentService, hmacSigner, verifyReceipt } from "@workspace/db";
+
+const { db } = createDb(process.env.DATABASE_URL!);
+const payments = createPaymentService(db, {
+  signer: hmacSigner(process.env.RECEIPT_SIGNING_SECRET!),   // key stays out of the database
+  hooks: { afterVerify, afterVoid },                          // later services join the same transaction
+});
+
+const p = await payments.submitPayment({ studentId, branchId, paymentMethodId, bankAccountId, slipFileId, amount: "1500.00", referenceNo, submittedBy });
+const done = await payments.verifyPayment({ paymentId: p.id, verifiedBy, invoiceIds: [invoiceId] });  // allocate, caches, receipt
+await payments.rejectPayment({ paymentId, rejectedBy, reason });
+await payments.voidPayment({ paymentId, voidedBy, reason });
+await payments.recordCashPayment({ studentId, branchId, amount, recordedBy, invoiceIds });
+const check = await verifyReceipt(db, verificationCode, signer);   // for the public verify page
+```
+
+What they do, by rule: E3 and E4 (verification and allocation in one transaction, no advance payments), E5 (never more than an item's net outstanding,
+with invoice rows locked in id order), E7 (default split: oldest due date first, pro rata across payable items with largest-remainder rounding, or explicit
+item lines), E1 and E16 (invoice and installment caches re-derived in the same transaction), E8, E9 (void reverses allocations, voids the receipt),
+E11 (cash), E12 and E13 (one signed receipt per payment, number from the branch counter), J3 (audit rows). Domain errors are `ServiceError` with a `code`.
+Pure arithmetic (`splitProRata`, `planAllocation`, `waterfall`, status derivation, money in cents) is exported and unit tested.
+
+Receipts: the hash is SHA-256 of a fixed-order text of the receipt number, branch, payment, student, amount, verification time and active allocations.
+The signature is `signer.sign(hash)`. `verifyReceipt` rebuilds the data from the database, so any later change to the data, or a forged hash or signature, shows as invalid,
+and a voided receipt shows as void. The default signer is HMAC-SHA256 with a shared secret. Use a public-key signer (same interface) if third parties must verify offline.
+
+The row locks (`FOR UPDATE` on the payment and the invoices) cannot be exercised by PGlite, which has one connection. Before going live, run two simultaneous verifications of the same payment, and two payments on the same invoice, against a real PostgreSQL database. Both should leave consistent totals, and the second verification of one payment should fail with `payment_not_pending`.
+
+### Enrolment, invoicing and fee exceptions
+
+```ts
+import { createEnrollmentService, createInvoicingService, createFeeExceptionService } from "@workspace/db";
+
+const enrolment = createEnrollmentService(db);
+const invoicing = createInvoicingService(db);
+const exceptions = createFeeExceptionService(db);
+
+const { enrollment, invoiceId } = await enrolment.enrollStudent({ studentId, courseId, intakeId, feeStructureId, installmentOptionId });
+await enrolment.dropEnrollment({ enrollmentId, actorUserId, reason });
+
+const report = await invoicing.generateRecurringInvoices({ branchId });   // run daily from a scheduled job; safe to run twice
+await invoicing.addInvoiceLine({ invoiceId, kind: "discount", amount: "-500", appliesToItemId, description, createdBy, reason });
+await invoicing.cancelInvoice({ invoiceId, cancelledBy, reason });
+
+await exceptions.createFeeException({ enrollmentId, kind: "discount", discountType: "percent", discountValue: "25", effectiveFrom, reason, createdBy });
+await exceptions.endFeeException({ exceptionId, endedBy });
+```
+
+By rule: C1 to C6 and C10 (course open, student active, intake rules, one active place, capacity counted under a lock on the course row, grade list with an audited override),
+D1 (fee option: the one given, else the default, else the only active one, else `fee_structure_required`), D6 (rate by billing grade, then grade on the period start, then the all-grades rate;
+a missing rate is reported and nothing is billed, never zero), D7 (one recurring line per enrolment and period, so generation is idempotent), D8 and D23 (signed lines, totals re-derived from them),
+D9 and D19 (a 100% discount gives a zero `waived` invoice), D10 and D25 (installment schedule, surcharge as an adjustment line, unpaid installments re-spread after an adjustment),
+D12 (package invoice at enrolment, access end = start + months), D17 to D22 (fee exceptions, module check only when creating), D24 (one invoice per student, branch and due date),
+D26 (invoices are append-only: cancel only without payments), C7 (drop), B5 and B7 (grade on a date, student_branch).
+
+Implementation choices to review:
+- Monthly fees bill calendar months, starting with the month of `access_starts_on`, with no proration for a mid-month start.
+- A per-term fee bills the course's academic term once (`term.starts_on` to `ends_on`). A course without a term is reported as a failure.
+- Generation bills every missing period whose start is on or before today (plus `leadDays`) and before `access_ends_on`, oldest first, at most `maxPeriodsPerEnrollment` (12) per run.
+- Due date is the period start plus `dueAfterDays` (7), but never before today. Periods with different due dates become separate invoices.
+- A discount exception becomes a negative `discount` line linked to the fee line and the exception. An alternate option replaces the fee structure for its dates only, and the enrolment is never rewritten.
+- Dates such as `enrolled_on`, `paid_on` and invoice issue dates use the organization's time zone, not UTC.
+- Dropping an enrolment sets access to end today (or the next day if it started today).
+- Not done yet: proration, promotion confirm (it will call `enrollStudent` with `promotedFromEnrollmentId`), and the overdue job.
+
+Not yet in services: commission accrual (hook it into `afterVerify` and `afterVoid`), access re-evaluation and the overdue job,
+promotion confirm, exam grading. Run the service tests with `bun run db:test:services` and `bun run db:test:enrolment`.
+
 ## What the database enforces
 
 In the Drizzle schema (checks, unique and partial unique indexes, composite foreign keys):
@@ -166,6 +240,8 @@ and the audit log writes (J3). Use `receipt_counter` like this inside the issuin
 - User emails should be lower-cased by the app before saving.
 
 ## Tests
+
+`bun run db:test:services` runs 47 scenario and unit tests for the payment services, and `bun run db:test:enrolment` runs 42 for enrolment, invoicing and fee exceptions (see Services above).
 
 `bun run db:test` applies all migrations to an in-process PostgreSQL (PGlite), seeds through the Drizzle schema,
 and checks 228 rules: the constraints above, the payment verification and void flows, multi-invoice payments,
