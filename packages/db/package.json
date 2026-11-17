@@ -16,7 +16,9 @@
     "db:test": "tsx scripts/test-constraints.ts",
     "db:seed": "tsx scripts/seed.ts",
     "db:test:services": "tsx scripts/test-services.ts",
-    "db:test:enrolment": "tsx scripts/test-enrolment.ts"
+    "db:test:enrolment": "tsx scripts/test-enrolment.ts",
+    "db:test:commissions": "tsx scripts/test-commissions.ts",
+    "db:test:promotion": "tsx scripts/test-promotion.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.44.0",

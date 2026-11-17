@@ -1,4 +1,5 @@
 export * from "./allocation";
+export * from "./commissions";
 export * from "./dates";
 export * from "./enrollment";
 export * from "./fee-exceptions";
@@ -6,5 +7,6 @@ export * from "./invoices";
 export * from "./invoicing";
 export * from "./money";
 export * from "./payments";
+export * from "./promotion";
 export * from "./receipts";
 export * from "./types";

@@ -61,7 +61,7 @@ add a dated entry to the changelog in `docs/student-management-invariants.md`.
 ## Services (payments, enrolment, invoicing)
 
 `src/services` holds the business logic that the database cannot enforce, as typed functions over Drizzle. They work with the production
-`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions.
+`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions, commission accrual, yearly promotion.
 
 ```ts
 import { createDb, createPaymentService, hmacSigner, verifyReceipt } from "@workspace/db";
@@ -129,8 +129,62 @@ Implementation choices to review:
 - Dropping an enrolment sets access to end today (or the next day if it started today).
 - Not done yet: proration, promotion confirm (it will call `enrollStudent` with `promotedFromEnrollmentId`), and the overdue job.
 
-Not yet in services: commission accrual (hook it into `afterVerify` and `afterVoid`), access re-evaluation and the overdue job,
-promotion confirm, exam grading. Run the service tests with `bun run db:test:services` and `bun run db:test:enrolment`.
+### Commission accrual
+
+```ts
+import { createCommissionService, createPaymentService, combineHooks } from "@workspace/db";
+
+const commissions = createCommissionService();
+const payments = createPaymentService(db, { signer, hooks: commissions.hooks });   // or combineHooks(commissions.hooks, otherHooks)
+```
+
+Accrual runs inside the verification transaction (`afterVerify`), and reversal inside the void transaction (`afterVoid`), so a failure in either rolls the whole payment step back.
+`commissions.accrue(tx, event)` returns what it created and what it skipped (with a reason such as `no_rule`), so gaps can be reported.
+
+By rule: H1 and H2 (base = basis-adjusted allocation x the lecturer's share, one entry per allocation and lecturer, split with largest-remainder rounding),
+H4 (most specific rule in effect: course, subject plus grade, subject, lecturer default; `pickRule` is exported), H5 (percent of the base; fixed per student month split by share,
+accrued in proportion to what is paid, and the last payment of an item takes the remainder so the total is exact), H6 (rule, rate, share and basis snapshotted on the entry),
+H7 (void: unsettled entries become `void`, settled ones get one negative reversal entry), H9 (module off: nothing accrues, but voids still unwind earlier entries),
+H10 (`paid` basis uses the money allocated, `list` scales it to the list price), H11 (fee items only), H12 (commission capped at the base, `capped = true`).
+
+Things to know:
+- A lecturer with no matching rule accrues nothing (the institute keeps no commission on that fee). It shows in `skipped`.
+- Course shares are not validated to sum to 100 here (H3 is checked when the course is saved), so a course whose shares sum to less than 100 simply accrues less.
+- Rule dates are compared with the day of verification in the organization's time zone, not the invoice period.
+- If a payment is voided after its entries joined a draft payout, a reversal is added (as for settled entries) but the draft payout's totals are not recalculated. The payout service should rebuild draft totals.
+- Not done yet: teacher payouts (create, approve, pay, carry-forward of a negative net).
+
+### Yearly promotion
+
+```ts
+import { createPromotionService } from "@workspace/db";
+const promotion = createPromotionService(db);
+
+const draft = await promotion.createDraft({ performedBy });                    // effective date defaults to the 1st of next month
+await promotion.updateItem({ runId, itemId, decision: "move", toCourseId });    // review: move, stay, skip
+await promotion.setEffectiveDate({ runId, effectiveDate });
+const result = await promotion.confirm({ runId, confirmedBy });                 // { status: "confirmed", ... } or { status: "blocked", flagged }
+await promotion.discardDraft({ runId, discardedBy });
+await promotion.clearBillingGrade({ enrollmentId, clearedBy, reason });
+```
+
+By rule: B6 and B8 (draft, review, confirm once; nothing changes before confirm; students whose items are all `skip` do not advance), C12 (target = class in the same
+course group that serves the next grade, otherwise same subject, branch, primary lecturer and batch label; exactly one match proposes a move, otherwise `needs_review`),
+C13 (a move completes the old enrolment with `end_reason = promoted` and `access_ends_on` = the effective date, and opens a new one with `promoted_from_enrollment_id`,
+the target's default fee option, and access from the effective date), C14 (the effective date is refused if it is not after the old enrolment started, or if a period past it is
+already invoiced for a class being left), C15 (capacity under a lock on the target course; a full target, a duplicate or a class with no fee option is not applied),
+B5 (the old grade row ends on the effective date and the new one starts on it), B7 (`student_branch`), B8 stay (billing grade pinned to the grade before promotion)
+and the rule for clearing a pin (needs a reason and a fee rate for the current grade), J3 (audit on confirm and discard).
+
+Behaviour to know:
+- A draft covers every active student who has a current grade. Students with no grade (for example adults in programs) are not included. Only class enrolments are promoted, not programs.
+- Confirm refuses while any item is `needs_review`. If a move cannot be placed, confirm changes nothing, flags those items `needs_review` with a note, and returns `status: "blocked"` with the list. Fix them and confirm again.
+- Seats freed by students moving up in the same run count for the class behind them.
+- A student with no class enrolment gets a `stay` item (grade only), and a student already at the highest grade gets `skip`.
+- A draft goes stale if an enrolment in it ends before confirm (`promotion_stale`). Discard it and build a new one.
+- Nothing stops two drafts existing at once. Confirm the one you want and discard the other.
+
+Not yet in services: teacher payouts, access re-evaluation and the overdue job, exam grading. Run the service tests with `bun run db:test:services` and `bun run db:test:enrolment`.
 
 ## What the database enforces
 
@@ -241,7 +295,7 @@ and the audit log writes (J3). Use `receipt_counter` like this inside the issuin
 
 ## Tests
 
-`bun run db:test:services` runs 47 scenario and unit tests for the payment services, and `bun run db:test:enrolment` runs 42 for enrolment, invoicing and fee exceptions (see Services above).
+`bun run db:test:services` runs 47 scenario and unit tests for the payment services, `bun run db:test:enrolment` runs 42 for enrolment, invoicing and fee exceptions, `bun run db:test:commissions` runs 17 for commission accrual and reversal, and `bun run db:test:promotion` runs 12 for promotion (see Services above).
 
 `bun run db:test` applies all migrations to an in-process PostgreSQL (PGlite), seeds through the Drizzle schema,
 and checks 228 rules: the constraints above, the payment verification and void flows, multi-invoice payments,

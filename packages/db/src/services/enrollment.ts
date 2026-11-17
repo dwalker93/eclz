@@ -25,26 +25,37 @@ export interface EnrollInput {
   actorUserId?: string;
 }
 
+/** D1: the fee option for a new enrolment: the one given, else the default (an intake default first), else the only active one. */
+export async function resolveFeeStructure(
+  tx: Tx,
+  c: { id: string },
+  input: { feeStructureId?: string | null; intakeId?: string | null },
+) {
+  const forCourse = and(eq(feeStructure.courseId, c.id), eq(feeStructure.isActive, true));
+  const usable = (s: typeof feeStructure.$inferSelect) => !s.intakeId || s.intakeId === (input.intakeId ?? null);
+  if (input.feeStructureId) {
+    const [s] = await tx.select().from(feeStructure).where(eq(feeStructure.id, input.feeStructureId));
+    if (!s || s.courseId !== c.id || !s.isActive || !usable(s)) {
+      throw new ServiceError("fee_structure_invalid", "That fee option does not belong to this course or intake, or is not active.");
+    }
+    return s;
+  }
+  const all = (await tx.select().from(feeStructure).where(forCourse).orderBy(asc(feeStructure.createdAt))).filter(usable);
+  const defaults = all.filter((s) => s.isDefault);
+  // An intake-specific default wins over the course-wide one.
+  const pick = defaults.find((s) => s.intakeId) ?? defaults[0] ?? (all.length === 1 ? all[0] : undefined);
+  if (!pick) throw new ServiceError("fee_structure_required", "Choose a fee option: this course has no default.");
+  return pick;
+}
+
+/** B7: the student belongs to the course's branch. The first branch they get is the primary one. */
+export async function ensureStudentBranch(tx: Tx, studentId: string, branchId: string, joinedOn: string) {
+  const [anyBranch] = await tx.select({ b: studentBranch.branchId }).from(studentBranch).where(eq(studentBranch.studentId, studentId));
+  await tx.insert(studentBranch).values({ studentId, branchId, isPrimary: !anyBranch, joinedOn }).onConflictDoNothing();
+}
+
 export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
-
-  async function resolveStructure(tx: Tx, c: typeof course.$inferSelect, input: EnrollInput) {
-    const forCourse = and(eq(feeStructure.courseId, c.id), eq(feeStructure.isActive, true));
-    const usable = (s: typeof feeStructure.$inferSelect) => !s.intakeId || s.intakeId === (input.intakeId ?? null);
-    if (input.feeStructureId) {
-      const [s] = await tx.select().from(feeStructure).where(eq(feeStructure.id, input.feeStructureId));
-      if (!s || s.courseId !== c.id || !s.isActive || !usable(s)) {
-        throw new ServiceError("fee_structure_invalid", "That fee option does not belong to this course or intake, or is not active.");
-      }
-      return s;
-    }
-    const all = (await tx.select().from(feeStructure).where(forCourse).orderBy(asc(feeStructure.createdAt))).filter(usable);
-    const defaults = all.filter((s) => s.isDefault);
-    // An intake-specific default wins over the course-wide one.
-    const pick = defaults.find((s) => s.intakeId) ?? defaults[0] ?? (all.length === 1 ? all[0] : undefined);
-    if (!pick) throw new ServiceError("fee_structure_required", "Choose a fee option: this course has no default.");
-    return pick;
-  }
 
   return {
     /**
@@ -113,7 +124,7 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
           });
         }
 
-        const structure = await resolveStructure(tx, c, input);
+        const structure = await resolveFeeStructure(tx, c, input);
         const isPackage = structure.billingType === "one_time_package";
         if (input.installmentOptionId && !isPackage) {
           throw new ServiceError("invalid_input", "Installments are only for one-time packages.");
@@ -142,12 +153,7 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
             throw err;
           });
 
-        // B7: the student belongs to the course's branch; the first branch is the primary one.
-        const [anyBranch] = await tx.select({ b: studentBranch.branchId }).from(studentBranch).where(eq(studentBranch.studentId, s.id));
-        await tx
-          .insert(studentBranch)
-          .values({ studentId: s.id, branchId: c.branchId, isPrimary: !anyBranch, joinedOn: today })
-          .onConflictDoNothing();
+        await ensureStudentBranch(tx, s.id, c.branchId, today);
 
         let invoiceId: string | null = null;
         if (isPackage) {
