@@ -3,34 +3,35 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Student management system database package (Drizzle ORM, PostgreSQL). Design v1.0, phase 1.",
+  "description": "Student management system database package (Drizzle ORM schema, migrations and seed for PostgreSQL). Design v1.0.",
   "exports": {
     ".": "./src/index.ts",
-    "./schema": "./src/schema/index.ts"
+    "./client": {
+      "browser": "./src/browser-blocked.ts",
+      "default": "./src/client.ts"
+    },
+    "./schema": "./src/schema/index.ts",
+    "./money": "./src/money.ts",
+    "./seed": "./src/seed.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
-    "db:test": "tsx scripts/test-constraints.ts",
-    "db:seed": "tsx scripts/seed.ts",
-    "db:test:services": "tsx scripts/test-services.ts",
-    "db:test:enrolment": "tsx scripts/test-enrolment.ts",
-    "db:test:commissions": "tsx scripts/test-commissions.ts",
-    "db:test:promotion": "tsx scripts/test-promotion.ts",
-    "db:test:payouts": "tsx scripts/test-payouts.ts",
-    "db:test:access": "tsx scripts/test-access.ts"
+    "db:seed": "bun run scripts/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --timeout 60000"
   },
   "dependencies": {
     "drizzle-orm": "^0.44.0",
-    "postgres": "^3.4.5"
+    "postgres": "^3.4.5",
+    "server-only": "^0.0.1"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.3.0",
+    "@types/bun": "^1.4.2",
     "@types/node": "^22.0.0",
     "drizzle-kit": "^0.31.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
 }

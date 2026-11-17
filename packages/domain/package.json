@@ -1,0 +1,28 @@
+{
+  "name": "@workspace/domain",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Student management system service layer: the business rules the database cannot enforce, as typed services over @workspace/db.",
+  "exports": {
+    ".": {
+      "browser": "./src/browser-blocked.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --timeout 60000"
+  },
+  "dependencies": {
+    "@workspace/db": "workspace:*",
+    "drizzle-orm": "^0.44.0",
+    "server-only": "^0.0.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.0",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

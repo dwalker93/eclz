@@ -6,7 +6,8 @@
  * ORG_TYPE is "individual" (solo teacher) or "institution". Module switches can be set afterwards
  * in organization.enabled_modules.
  */
-import { createDb, seedDefaults } from "../src/index";
+import { createDb } from "../src/client";
+import { seedDefaults } from "../src/seed";
 
 const url = process.env.DATABASE_URL;
 const name = process.env.ORG_NAME;

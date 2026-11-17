@@ -1,0 +1,228 @@
+# @workspace/domain
+
+Service layer of the student management system: the business rules the database cannot enforce (see "What is still the application's job" in the
+[`@workspace/db` README](../db/README.md)), written as typed services over Drizzle. They run against the production `createDb` object and against PGlite in tests.
+
+Server-only. The entry point is guarded with the `browser` export condition, so importing it into a browser bundle fails the build.
+It depends on `@workspace/db` for the schema (`@workspace/db/schema`) and money helpers (`@workspace/db/money`).
+
+## Layout
+
+| File | What it holds |
+| --- | --- |
+| `src/types.ts`, `src/errors.ts` | `Db` and `Tx` types, `ServiceError` with its `code` |
+| `src/payments.ts`, `src/allocation.ts`, `src/receipts.ts` | submit, verify, reject, void, cash, allocation, signed receipts |
+| `src/enrollment.ts`, `src/invoicing.ts`, `src/invoices.ts`, `src/fee-exceptions.ts` | enrolment, recurring and package invoices, adjustments, fee exceptions |
+| `src/commissions.ts`, `src/payouts.ts` | commission accrual and reversal, teacher payouts |
+| `src/promotion.ts` | yearly promotion |
+| `src/access.ts` | effective access (C8) and the overdue job (C9) |
+| `src/dates.ts`, `src/lookups.ts`, `src/audit.ts` | date helpers, organization and rate lookups, audit rows |
+
+Import everything from the package root: `import { createPaymentService, ServiceError } from "@workspace/domain"`.
+Database client: `@workspace/db/client`. Money helpers (`toCents`, `fromCents`): `@workspace/db/money`.
+
+## Services
+
+This package holds the business logic that the database cannot enforce, as typed functions over Drizzle. They work with the production
+`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions, commission accrual, yearly promotion, teacher payouts, effective access and the overdue job.
+
+```ts
+import { createDb } from "@workspace/db/client";
+import { createPaymentService, hmacSigner, verifyReceipt } from "@workspace/domain";
+
+const { db } = createDb(process.env.DATABASE_URL!);
+const payments = createPaymentService(db, {
+  signer: hmacSigner(process.env.RECEIPT_SIGNING_SECRET!),   // key stays out of the database
+  hooks: { afterVerify, afterVoid },                          // later services join the same transaction
+});
+
+const p = await payments.submitPayment({ studentId, branchId, paymentMethodId, bankAccountId, slipFileId, amount: "1500.00", referenceNo, submittedBy });
+const done = await payments.verifyPayment({ paymentId: p.id, verifiedBy, invoiceIds: [invoiceId] });  // allocate, caches, receipt
+await payments.rejectPayment({ paymentId, rejectedBy, reason });
+await payments.voidPayment({ paymentId, voidedBy, reason });
+await payments.recordCashPayment({ studentId, branchId, amount, recordedBy, invoiceIds });
+const check = await verifyReceipt(db, verificationCode, signer);   // for the public verify page
+```
+
+What they do, by rule: E3 and E4 (verification and allocation in one transaction, no advance payments), E5 (never more than an item's net outstanding,
+with invoice rows locked in id order), E7 (default split: oldest due date first, pro rata across payable items with largest-remainder rounding, or explicit
+item lines), E1 and E16 (invoice and installment caches re-derived in the same transaction), E8, E9 (void reverses allocations, voids the receipt),
+E11 (cash), E12 and E13 (one signed receipt per payment, number from the branch counter), J3 (audit rows). Domain errors are `ServiceError` with a `code`.
+Pure arithmetic (`splitProRata`, `planAllocation`, `waterfall`, status derivation, money in cents) is exported and unit tested.
+
+Receipts: the hash is SHA-256 of a fixed-order text of the receipt number, branch, payment, student, amount, verification time and active allocations.
+The signature is `signer.sign(hash)`. `verifyReceipt` rebuilds the data from the database, so any later change to the data, or a forged hash or signature, shows as invalid,
+and a voided receipt shows as void. The default signer is HMAC-SHA256 with a shared secret. Use a public-key signer (same interface) if third parties must verify offline.
+
+The row locks (`FOR UPDATE` on the payment and the invoices) cannot be exercised by PGlite, which has one connection. Before going live, run two simultaneous verifications of the same payment, and two payments on the same invoice, against a real PostgreSQL database. Both should leave consistent totals, and the second verification of one payment should fail with `payment_not_pending`.
+
+### Enrolment, invoicing and fee exceptions
+
+```ts
+import { createEnrollmentService, createInvoicingService, createFeeExceptionService } from "@workspace/domain";
+
+const enrolment = createEnrollmentService(db);
+const invoicing = createInvoicingService(db);
+const exceptions = createFeeExceptionService(db);
+
+const { enrollment, invoiceId } = await enrolment.enrollStudent({ studentId, courseId, intakeId, feeStructureId, installmentOptionId });
+await enrolment.dropEnrollment({ enrollmentId, actorUserId, reason });
+
+const report = await invoicing.generateRecurringInvoices({ branchId });   // run daily from a scheduled job; safe to run twice
+await invoicing.addInvoiceLine({ invoiceId, kind: "discount", amount: "-500", appliesToItemId, description, createdBy, reason });
+await invoicing.cancelInvoice({ invoiceId, cancelledBy, reason });
+
+await exceptions.createFeeException({ enrollmentId, kind: "discount", discountType: "percent", discountValue: "25", effectiveFrom, reason, createdBy });
+await exceptions.endFeeException({ exceptionId, endedBy });
+```
+
+By rule: C1 to C6 and C10 (course open, student active, intake rules, one active place, capacity counted under a lock on the course row, grade list with an audited override),
+D1 (fee option: the one given, else the default, else the only active one, else `fee_structure_required`), D6 (rate by billing grade, then grade on the period start, then the all-grades rate;
+a missing rate is reported and nothing is billed, never zero), D7 (one recurring line per enrolment and period, so generation is idempotent), D8 and D23 (signed lines, totals re-derived from them),
+D9 and D19 (a 100% discount gives a zero `waived` invoice), D10 and D25 (installment schedule, surcharge as an adjustment line, unpaid installments re-spread after an adjustment),
+D12 (package invoice at enrolment, access end = start + months), D17 to D22 (fee exceptions, module check only when creating), D24 (one invoice per student, branch and due date),
+D26 (invoices are append-only: cancel only without payments), C7 (drop), B5 and B7 (grade on a date, student_branch).
+
+Implementation choices to review:
+- Monthly fees bill calendar months, starting with the month of `access_starts_on`, with no proration for a mid-month start.
+- A per-term fee bills the course's academic term once (`term.starts_on` to `ends_on`). A course without a term is reported as a failure.
+- Generation bills every missing period whose start is on or before today (plus `leadDays`) and before `access_ends_on`, oldest first, at most `maxPeriodsPerEnrollment` (12) per run.
+- Due date is the period start plus `dueAfterDays` (7), but never before today. Periods with different due dates become separate invoices.
+- A discount exception becomes a negative `discount` line linked to the fee line and the exception. An alternate option replaces the fee structure for its dates only, and the enrolment is never rewritten.
+- Dates such as `enrolled_on`, `paid_on` and invoice issue dates use the organization's time zone, not UTC.
+- Dropping an enrolment sets access to end today (or the next day if it started today).
+- Not done yet: proration, promotion confirm (it will call `enrollStudent` with `promotedFromEnrollmentId`), and the overdue job.
+
+### Commission accrual
+
+```ts
+import { createCommissionService, createPaymentService, combineHooks } from "@workspace/domain";
+
+const commissions = createCommissionService();
+const payments = createPaymentService(db, { signer, hooks: commissions.hooks });   // or combineHooks(commissions.hooks, otherHooks)
+```
+
+Accrual runs inside the verification transaction (`afterVerify`), and reversal inside the void transaction (`afterVoid`), so a failure in either rolls the whole payment step back.
+`commissions.accrue(tx, event)` returns what it created and what it skipped (with a reason such as `no_rule`), so gaps can be reported.
+
+By rule: H1 and H2 (base = basis-adjusted allocation x the lecturer's share, one entry per allocation and lecturer, split with largest-remainder rounding),
+H4 (most specific rule in effect: course, subject plus grade, subject, lecturer default; `pickRule` is exported), H5 (percent of the base; fixed per student month split by share,
+accrued in proportion to what is paid, and the last payment of an item takes the remainder so the total is exact), H6 (rule, rate, share and basis snapshotted on the entry),
+H7 (void: unsettled entries become `void`, settled ones get one negative reversal entry), H9 (module off: nothing accrues, but voids still unwind earlier entries),
+H10 (`paid` basis uses the money allocated, `list` scales it to the list price), H11 (fee items only), H12 (commission capped at the base, `capped = true`).
+
+Things to know:
+- A lecturer with no matching rule accrues nothing (the institute keeps no commission on that fee). It shows in `skipped`.
+- Course shares are not validated to sum to 100 here (H3 is checked when the course is saved), so a course whose shares sum to less than 100 simply accrues less.
+- Rule dates are compared with the day of verification in the organization's time zone, not the invoice period.
+- If a payment is voided after its entries joined a draft payout, a reversal is added (as for settled entries). The payout service takes that reversal into the draft when the draft is approved (see Teacher payouts).
+
+### Teacher payouts
+
+```ts
+import { createPayoutService } from "@workspace/domain";
+const payouts = createPayoutService(db);
+
+const r = await payouts.createPayout({ lecturerId, periodEnd: "2027-04-01", createdBy });   // { status: "created", payout, entryIds } or { status: "carried_forward", reason, net, ... }
+await payouts.approvePayout({ payoutId, approvedBy });                                      // rebuilds draft totals, then freezes them
+await payouts.markPaid({ payoutId, paidBy, paymentReference: "TRX-1042", paidOn, proofFileId });
+await payouts.discardDraft({ payoutId, discardedBy, reason });                              // entries return to accrued
+const pending = await payouts.previewPayout({ lecturerId, periodEnd });                     // read-only: what a payout would hold now
+await payouts.getPayout({ payoutId });  await payouts.listPayouts({ lecturerId, status });
+```
+
+By rule: H8 (a payout takes the lecturer's accrued entries, accruals and negative reversals, and marks them settled; it is inserted with its final totals and the totals are
+re-added from the entries in the same transaction; a paid payout is immutable; a negative net creates no payout and the entries carry forward), H7 (reversals are deducted in the next payout),
+H9 (every payout action needs the commissions module), J3 (audit rows for create, approve, pay and discard).
+
+Behaviour to know:
+- **Period end is a cut-off, not a filter.** A payout takes every unsettled accrued entry created before the start of `periodEnd` (organization time zone), including entries from before `periodStart`. This is what makes carry-forward work: nothing is ever stranded in an earlier period. `periodStart` defaults to the end of the lecturer's previous payout, else the day of the oldest included entry, and only labels the payout. Payouts of one lecturer cannot overlap, and a period cannot end after tomorrow.
+- **Carry-forward.** If the net is zero or negative, or no entries exist, nothing is created and the result is `carried_forward` with a reason (`no_entries`, `net_not_positive`). A third reason, `reversal_heavy`, covers a positive net that the table's checks cannot hold (gross or commission total below zero, for example a large reversed commission against an accrual on a lower rate). It carries forward too.
+- **Draft totals are rebuilt at approval.** If a payment in a draft was voided, its reversal is pulled into the draft, which removes that entry from the payout. If nothing payable is left, approval fails with `payout_nothing_to_pay` and changes nothing; discard the draft and create a new one.
+- **Approved totals are fixed.** A payment voided after approval adds a reversal that is deducted from the lecturer's next payout, so the approved amount is the amount to transfer.
+- Only a draft can be discarded (the database refuses to delete an approved or paid payout). A zero-net payout is never created, so `paid` always means money was sent.
+- Separation of duties (creator, approver and payer being different people) is not enforced here. Do it with permissions in the app if the institute wants it.
+
+### Access and overdue
+
+```ts
+import { createAccessService, createPaymentService, combineHooks, hasAccess, accessState } from "@workspace/domain";
+
+const access = createAccessService(db);
+const payments = createPaymentService(db, { signer, hooks: combineHooks(commissions.hooks, access.hooks) });   // verify and void re-check overdue state
+
+const result = await access.runOverdueJob();          // run daily from a scheduled job; safe to run twice
+const state = accessState(enrollmentRow, today);       // { allowed: true } or { allowed: false, reason: "not_active" | "not_started" | "ended" | "restricted" }
+await access.getAccess({ enrollmentId });             // the same, on today's date in the organization's time zone
+await access.recheckStudent(tx, studentId, actorId);   // call after anything that changes what a student owes
+```
+
+By rule: C8 (`accessState` and `hasAccess` are the one place that decides effective access; route guards, jobs and notification code should all call it), C9 (overdue status,
+restrict and restore), J1 and J2 (overdue notifications), J3 (audit rows for every restrict and restore).
+
+Behaviour to know:
+- **Overdue means past the grace period.** An invoice is overdue from the day after `due date + grace days`. With installments each unpaid installment is judged by its own due date and the invoice follows. A part-paid item is still unpaid, so it stays overdue.
+- **Settings.** Grace days and action come from the fee option of the invoice's earliest fee line, field by field, else from the organization. An invoice that mixes classes with different settings follows its earliest fee line.
+- **Action `none`** still moves the invoice and installments to `overdue` (a label for staff) but notifies and restricts nothing. `notify` only notifies, `restrict` only restricts.
+- **Restrict and restore are per enrolment.** Every active or completed enrolment with a fee line on a past-grace invoice whose action includes restrict becomes `restricted`. It is restored only when no such invoice remains unpaid, so paying one of two overdue invoices keeps the restriction. Dropped enrolments are never touched. A restriction is a billing overlay: C8 reads it, nothing else changes.
+- **Verified payment and void.** The hooks run the same reconcile for the payment's student in the same transaction. A verified payment that clears the last overdue invoice restores access straight away (the verifier is the audit actor, which matches "access returns after staff verify the payment"). A void that leaves an invoice unpaid and past grace marks it overdue and restricts again at once. The daily job writes audit rows with no actor.
+- **Statuses go back too.** If an invoice or installment is no longer overdue (grace changed, due date moved) it returns to pending or partial.
+- **Notifications.** One row per recipient, channel and overdue item (invoice, or installment number), event `installment_overdue`, so reruns add nothing. Recipients are the student's portal user and, when the `parent_portal` module is on, guardians with a portal login. Channels are in-app always, plus email, SMS and push only when the module and the channel switch are both on. In-app rows are `sent`, external ones `queued` for the dispatcher (not built yet). A student with no portal login still gets the status and restriction, but no notification (the table needs a user).
+- Invoices with no fee line (content only) get the overdue status and notification but restrict nothing.
+- The job reconciles each student in a transaction of their own and reports failures in `errors` rather than stopping.
+- Not covered: the "due soon" reminder (`installment_due`), and the notification dispatcher that actually sends email, SMS and push.
+
+### Yearly promotion
+
+```ts
+import { createPromotionService } from "@workspace/domain";
+const promotion = createPromotionService(db);
+
+const draft = await promotion.createDraft({ performedBy });                    // effective date defaults to the 1st of next month
+await promotion.updateItem({ runId, itemId, decision: "move", toCourseId });    // review: move, stay, skip
+await promotion.setEffectiveDate({ runId, effectiveDate });
+const result = await promotion.confirm({ runId, confirmedBy });                 // { status: "confirmed", ... } or { status: "blocked", flagged }
+await promotion.discardDraft({ runId, discardedBy });
+await promotion.clearBillingGrade({ enrollmentId, clearedBy, reason });
+```
+
+By rule: B6 and B8 (draft, review, confirm once; nothing changes before confirm; students whose items are all `skip` do not advance), C12 (target = class in the same
+course group that serves the next grade, otherwise same subject, branch, primary lecturer and batch label; exactly one match proposes a move, otherwise `needs_review`),
+C13 (a move completes the old enrolment with `end_reason = promoted` and `access_ends_on` = the effective date, and opens a new one with `promoted_from_enrollment_id`,
+the target's default fee option, and access from the effective date), C14 (the effective date is refused if it is not after the old enrolment started, or if a period past it is
+already invoiced for a class being left), C15 (capacity under a lock on the target course; a full target, a duplicate or a class with no fee option is not applied),
+B5 (the old grade row ends on the effective date and the new one starts on it), B7 (`student_branch`), B8 stay (billing grade pinned to the grade before promotion)
+and the rule for clearing a pin (needs a reason and a fee rate for the current grade), J3 (audit on confirm and discard).
+
+Behaviour to know:
+- A draft covers every active student who has a current grade. Students with no grade (for example adults in programs) are not included. Only class enrolments are promoted, not programs.
+- Confirm refuses while any item is `needs_review`. If a move cannot be placed, confirm changes nothing, flags those items `needs_review` with a note, and returns `status: "blocked"` with the list. Fix them and confirm again.
+- Seats freed by students moving up in the same run count for the class behind them.
+- A student with no class enrolment gets a `stay` item (grade only), and a student already at the highest grade gets `skip`.
+- A draft goes stale if an enrolment in it ends before confirm (`promotion_stale`). Discard it and build a new one.
+- Nothing stops two drafts existing at once. Confirm the one you want and discard the other.
+
+Not yet built: exam grading and result release, the notification dispatcher (queued email, SMS and push rows are created but nothing sends them), the "due soon" reminder (`installment_due`),
+and a scheduled worker that calls `runOverdueJob()` daily.
+
+## Tests
+
+`bun run test` (from this folder) runs everything on an in-process PostgreSQL (PGlite) with the migrations of `@workspace/db` applied. Each file creates its own database, so files never share state.
+No test needs a server or a connection string.
+
+| File | Kind | What it covers |
+| --- | --- | --- |
+| `allocation.test.ts`, `dates.test.ts`, `commission-rules.test.ts`, `payout-totals.test.ts`, `access-rules.test.ts` | pure unit tests, no database | pro rata split, allocation plan, waterfall, invoice status, dates, schedules, discounts, rule matching, payout totals, access and overdue rules |
+| `payments.test.ts` | scenario | E rules: submit, verify and allocate, installments, void, cash, receipts, hooks |
+| `enrolment.test.ts` | scenario | C and D rules: enrolment, recurring and package invoices, adjustments, cancellation, fee exceptions |
+| `commissions.test.ts` | scenario | H rules: accrual and reversal inside verify and void |
+| `payouts.test.ts` | scenario | H rules: create, carry forward, approve, pay, discard |
+| `promotion.test.ts` | scenario | B and C rules: yearly promotion |
+| `access.test.ts` | scenario | C8, C9, J rules: overdue job, restrict and restore, notifications |
+| `server-only.test.ts` | boundary | the `browser` condition blocks the client bundle and leaves server bundles alone |
+
+Most scenario files tell one story in order (a later test relies on the rows an earlier one left), so run a file whole rather than a single test.
+`setup.ts` creates the database, `helpers.ts` has `eq` and `fails`.
+
+The row locks (`FOR UPDATE`) cannot be exercised by PGlite, which has one connection. Before going live, run two simultaneous verifications of the same payment,
+two payments on the same invoice, and two payout creations for one lecturer against a real PostgreSQL database.
