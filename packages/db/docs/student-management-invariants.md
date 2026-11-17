@@ -228,3 +228,4 @@ These were recorded as judgment calls during the reviews and are accepted for de
 ## Changelog
 
 - 2026-11-10: Design v1.0 frozen. Before the freeze, H2, H10 and the ERD `base_amount` description were aligned so the commission base is the basis-adjusted amount × the lecturer's share.
+- 2026-11-11: Phase 2 schema built in `packages/db` (installments, fee exceptions, notifications, push, messaging). No rule changes. Implementation additions: `notification.event_key`/`read_at`, `message_thread.created_by`, `fee_exception.course_id`.

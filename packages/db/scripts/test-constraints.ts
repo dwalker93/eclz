@@ -72,6 +72,11 @@ await ok("seed: 13 grades, 5 roles, default payment method is bank transfer", as
   const m = await q(`SELECT type FROM payment_method WHERE is_default`);
   if (g[0]!.n !== 13 || r[0]!.n !== 5 || m[0]!.type !== "bank_transfer") throw new Error("seed content wrong");
 });
+await ok("seed: notification channels, in-app on and the rest off", async () => {
+  const r = await q(`SELECT channel, is_enabled FROM notification_channel ORDER BY channel`);
+  const on = r.filter((x) => x.is_enabled).map((x) => x.channel);
+  if (r.length !== 4 || on.length !== 1 || on[0] !== "in_app") throw new Error("channel seed wrong");
+});
 await rejects("A2: a second organization is rejected", /organization_singleton/, () =>
   q(`INSERT INTO organization (name, type) VALUES ('Second', 'individual')`),
 );
@@ -485,6 +490,156 @@ await rejects("a confirmed promotion run needs its confirmation time", /promotio
 );
 await rejects("a recurring fee structure with no frequency is rejected (NULL-safe)", /fee_structure_frequency_check/, () =>
   q(`INSERT INTO fee_structure (branch_id, course_id, name, billing_type, frequency) VALUES ($1, $2, 'y', 'recurring', NULL)`, [b1, cls]),
+);
+
+// ---- phase 2: installments, fee exceptions, notifications, push, messaging
+const optA = await id(
+  `INSERT INTO installment_option (fee_structure_id, name, installment_count, interval_days) VALUES ($1, '3 installments', 3, 30)`,
+  [feeOther],
+);
+await rejects("installment option needs at least 2 installments", /installment_option_count_check/, () =>
+  q(`INSERT INTO installment_option (fee_structure_id, name, installment_count, interval_days) VALUES ($1, 'one', 1, 30)`, [feeOther]),
+);
+await rejects("installment down payment must be under 100 percent", /installment_option_down_payment_check/, () =>
+  q(`INSERT INTO installment_option (fee_structure_id, name, installment_count, down_payment_percent, interval_days) VALUES ($1, 'full', 2, 100, 30)`, [feeOther]),
+);
+await rejects("installment interval must be positive", /installment_option_interval_check/, () =>
+  q(`INSERT INTO installment_option (fee_structure_id, name, installment_count, interval_days) VALUES ($1, 'zero', 2, 0)`, [feeOther]),
+);
+await rejects("installment option names are unique per fee structure", /installment_option_structure_name_uq/, () =>
+  q(`INSERT INTO installment_option (fee_structure_id, name, installment_count, interval_days) VALUES ($1, '3 installments', 4, 30)`, [feeOther]),
+);
+const invInst = await id(
+  `INSERT INTO invoice (student_id, branch_id, installment_option_id, due_date, subtotal, total) VALUES ($1, $2, $3, CURRENT_DATE + 7, 3000, 3000)`,
+  [st1, b1, optA],
+);
+await ok("D10: installments with sequence numbers", async () => {
+  await q(`INSERT INTO invoice_installment (invoice_id, seq, due_date, amount) VALUES ($1, 1, CURRENT_DATE + 7, 1000), ($1, 2, CURRENT_DATE + 37, 1000), ($1, 3, CURRENT_DATE + 67, 1000)`, [invInst]);
+});
+await rejects("D10: installment sequence is unique per invoice", /invoice_installment_seq_uq/, () =>
+  q(`INSERT INTO invoice_installment (invoice_id, seq, due_date, amount) VALUES ($1, 2, CURRENT_DATE + 90, 10)`, [invInst]),
+);
+await rejects("installment amount must be positive", /invoice_installment_amount_check/, () =>
+  q(`INSERT INTO invoice_installment (invoice_id, seq, due_date, amount) VALUES ($1, 9, CURRENT_DATE, 0)`, [invInst]),
+);
+await rejects("installment paid amount cannot exceed its amount", /invoice_installment_paid_check/, () =>
+  q(`UPDATE invoice_installment SET amount_paid = 1500 WHERE invoice_id = $1 AND seq = 1`, [invInst]),
+);
+await rejects("installment status must be a known value", /invoice_installment_status_check/, () =>
+  q(`UPDATE invoice_installment SET status = 'late' WHERE invoice_id = $1 AND seq = 1`, [invInst]),
+);
+
+const feeAlt = await id(
+  `INSERT INTO fee_structure (branch_id, course_id, name, billing_type, frequency) VALUES ($1, $2, 'Quarterly', 'recurring', 'monthly')`,
+  [b1, cls],
+);
+const mkExc = (kind: string, from: string, to: string | null, alt: string | null, dType: string | null, dVal: number | null, reason = "Hardship", course = cls, enrollment = enr) =>
+  id(
+    `INSERT INTO fee_exception (enrollment_id, course_id, kind, alternate_fee_structure_id, discount_type, discount_value, effective_from, effective_to, reason, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [enrollment, course, kind, alt, dType, dVal, from, to, reason, u1],
+  );
+const enrFresh = await id(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [cls, st2]);
+const exc1 = await mkExc("discount", "2027-02-01", "2027-06-01", null, "percent", 50);
+await ok("D16: an alternate option of the same class", () => mkExc("alternate_option", "2027-02-01", null, feeAlt, null, null));
+await rejects("D20: an alternate option cannot come from another class", /fee_exception_alternate_course_fk/, () =>
+  mkExc("alternate_option", "2028-01-01", null, feeOther, null, null, "Hardship", cls, enrFresh),
+);
+await rejects("D16: a discount cannot name an alternate option", /fee_exception_kind_columns_check/, () =>
+  mkExc("discount", "2028-01-01", null, feeAlt, "percent", 10),
+);
+await rejects("D16: an alternate option cannot carry a discount", /fee_exception_kind_columns_check/, () =>
+  mkExc("alternate_option", "2028-01-01", null, feeAlt, "percent", 10),
+);
+await rejects("D16: a discount needs a type and a value (NULL-safe)", /fee_exception_kind_columns_check/, () =>
+  mkExc("discount", "2028-01-01", null, null, null, null),
+);
+await rejects("D19: a percent discount is at most 100", /fee_exception_discount_value_check/, () =>
+  mkExc("discount", "2028-01-01", null, null, "percent", 150),
+);
+await rejects("D19: a fixed discount cannot be negative", /fee_exception_discount_value_check/, () =>
+  mkExc("discount", "2028-01-01", null, null, "fixed", -5),
+);
+await ok("D19: a 100 percent discount (free place) is allowed", () => mkExc("discount", "2027-06-01", "2027-07-01", null, "percent", 100));
+await rejects("D17: an exception needs a reason", /fee_exception_reason_check/, () =>
+  mkExc("discount", "2028-01-01", null, null, "fixed", 100, "   "),
+);
+await rejects("D17: an exception ends after it starts", /fee_exception_dates_check/, () =>
+  mkExc("discount", "2028-01-01", "2028-01-01", null, "fixed", 100),
+);
+await rejects("D18: two discounts cannot overlap on one enrolment", /fee_exception_no_overlap/, () =>
+  mkExc("discount", "2027-05-01", "2027-08-01", null, "fixed", 100),
+);
+await rejects("D18: an open-ended exception overlaps a later one", /fee_exception_no_overlap/, () =>
+  mkExc("alternate_option", "2030-01-01", null, feeAlt, null, null),
+);
+await ok("D18: ranges are end-exclusive, so back to back is allowed", () =>
+  mkExc("discount", "2027-07-01", null, null, "fixed", 200),
+);
+await rejects("D21: ended_by without effective_to is rejected", /fee_exception_ended_check/, () =>
+  q(`INSERT INTO fee_exception (enrollment_id, course_id, kind, discount_type, discount_value, effective_from, reason, created_by, ended_by) VALUES ($1, $2, 'discount', 'fixed', 5, '2040-01-01', 'x', $3, $3)`, [enr, cls, u1]),
+);
+await rejects("an exception's course must be its enrolment's course", /fee_exception_enrollment_course_fk/, () =>
+  mkExc("discount", "2035-01-01", null, null, "fixed", 1, "x", sched, enrFresh),
+);
+await ok("D19: a discount item can link to its exception", () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id) VALUES ($1, 'discount', -500, $2, $3)`, [inv1, item1, exc1]),
+);
+await rejects("only discount items can carry a fee exception", /invoice_item_exception_kind_check/, () =>
+  q(`INSERT INTO invoice_item (invoice_id, kind, amount, fee_exception_id) VALUES ($1, 'adjustment', 10, $2)`, [inv1, exc1]),
+);
+
+const u2 = await id(`INSERT INTO "user" (email) VALUES ('parent@example.com')`);
+await ok("J2: a notification is created", () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key) VALUES ($1, 'in_app', 'installment_due', 'inst-1')`, [u2]),
+);
+await rejects("J2: the same user, event key and channel cannot repeat", /notification_dedupe_uq/, () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key) VALUES ($1, 'in_app', 'installment_due', 'inst-1')`, [u2]),
+);
+await ok("J2: another channel for the same event key is allowed", () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key) VALUES ($1, 'sms', 'installment_due', 'inst-1')`, [u2]),
+);
+await rejects("a sent notification needs sent_at", /notification_sent_check/, () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key, status) VALUES ($1, 'email', 'notice', 'n-1', 'sent')`, [u2]),
+);
+await rejects("a failed notification needs an error (NULL-safe)", /notification_failed_check/, () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key, status) VALUES ($1, 'email', 'notice', 'n-2', 'failed')`, [u2]),
+);
+await rejects("a notification channel must be known", /notification_channel_value_check/, () =>
+  q(`INSERT INTO notification (user_id, channel, event, event_key) VALUES ($1, 'fax', 'notice', 'n-3')`, [u2]),
+);
+await ok("a notification channel can be switched on", () =>
+  q(`UPDATE notification_channel SET is_enabled = true WHERE channel = 'sms'`),
+);
+await rejects("one row per notification channel", /notification_channel_uq/, () =>
+  q(`INSERT INTO notification_channel (organization_id, channel) VALUES ((SELECT id FROM organization), 'sms')`),
+);
+await ok("a notification template", () =>
+  q(`INSERT INTO notification_template (organization_id, event, channel, body) VALUES ((SELECT id FROM organization), 'payment_verified', 'sms', 'Payment received')`),
+);
+await rejects("one template per event and channel", /notification_template_uq/, () =>
+  q(`INSERT INTO notification_template (organization_id, event, channel, body) VALUES ((SELECT id FROM organization), 'payment_verified', 'sms', 'Again')`),
+);
+await ok("a push subscription", () =>
+  q(`INSERT INTO push_subscription (user_id, endpoint, p256dh_key, auth_key) VALUES ($1, 'https://push.example/1', 'k', 'a')`, [u2]),
+);
+await rejects("a push endpoint is unique", /push_subscription_endpoint_unique/, () =>
+  q(`INSERT INTO push_subscription (user_id, endpoint, p256dh_key, auth_key) VALUES ($1, 'https://push.example/1', 'k', 'a')`, [u1]),
+);
+
+const thread = await id(`INSERT INTO message_thread (subject, created_by) VALUES ('Fees question', $1)`, [u2]);
+await q(`INSERT INTO thread_participant (thread_id, user_id) VALUES ($1, $2), ($1, $3)`, [thread, u1, u2]);
+await ok("a participant can post a message", () =>
+  q(`INSERT INTO message (thread_id, sender_id, body) VALUES ($1, $2, 'Hello')`, [thread, u2]),
+);
+const u3 = await id(`INSERT INTO "user" (email) VALUES ('outsider@example.com')`);
+await rejects("a non-participant cannot post", /message_sender_participant_fk/, () =>
+  q(`INSERT INTO message (thread_id, sender_id, body) VALUES ($1, $2, 'Hi')`, [thread, u3]),
+);
+await rejects("a message cannot be blank", /message_body_check/, () =>
+  q(`INSERT INTO message (thread_id, sender_id, body) VALUES ($1, $2, '  ')`, [thread, u2]),
+);
+await rejects("a user joins a thread only once", /thread_participant_pk/, () =>
+  q(`INSERT INTO thread_participant (thread_id, user_id) VALUES ($1, $2)`, [thread, u2]),
 );
 
 console.log(`\n${passed} passed, ${failed} failed`);
