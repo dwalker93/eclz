@@ -1,8 +1,10 @@
+import { Fragment } from "react"
 import type { ReactElement } from "react"
+
 import {
   Avatar,
-  AvatarImage,
   AvatarFallback,
+  AvatarImage,
 } from "@workspace/ui/components/avatar"
 import {
   DropdownMenu,
@@ -14,13 +16,14 @@ import {
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import {
-  UserIcon,
-  SettingsIcon,
-  CreditCardIcon,
-  UsersIcon,
-  SquarePenIcon,
   CirclePlusIcon,
+  CreditCardIcon,
   LogOutIcon,
+  SettingsIcon,
+  SquarePenIcon,
+  UserIcon,
+  UsersIcon,
+  type LucideIcon,
 } from "lucide-react"
 
 type Props = {
@@ -29,11 +32,44 @@ type Props = {
   align?: "start" | "center" | "end"
 }
 
-const ProfileDropdown = ({ trigger, defaultOpen, align = "end" }: Props) => {
+type ProfileMenuItem = {
+  icon: LucideIcon
+  label: string
+  variant?: "destructive"
+}
+
+const profileMenuSections: { id: string; items: ProfileMenuItem[] }[] = [
+  {
+    id: "account",
+    items: [
+      { icon: UserIcon, label: "My account" },
+      { icon: SettingsIcon, label: "Settings" },
+      { icon: CreditCardIcon, label: "Billing" },
+    ],
+  },
+  {
+    id: "team",
+    items: [
+      { icon: UsersIcon, label: "Manage team" },
+      { icon: SquarePenIcon, label: "Customization" },
+      { icon: CirclePlusIcon, label: "Add team account" },
+    ],
+  },
+  {
+    id: "session",
+    items: [{ icon: LogOutIcon, label: "Logout", variant: "destructive" }],
+  },
+]
+
+const ProfileDropdown = ({
+  trigger,
+  defaultOpen,
+  align = "end",
+}: Props) => {
   return (
     <DropdownMenu defaultOpen={defaultOpen}>
       <DropdownMenuTrigger render={trigger} />
-      <DropdownMenuContent className="w-80" align={align || "end"}>
+      <DropdownMenuContent className="w-80" align={align}>
         <DropdownMenuGroup>
           <DropdownMenuLabel className="flex items-center gap-4 px-4 py-2.5 font-normal">
             <div className="relative">
@@ -57,51 +93,29 @@ const ProfileDropdown = ({ trigger, defaultOpen, align = "end" }: Props) => {
           </DropdownMenuLabel>
         </DropdownMenuGroup>
 
-        <DropdownMenuSeparator />
-
-        <DropdownMenuGroup>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <UserIcon className="size-5 text-foreground" />
-            <span>My account</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <SettingsIcon className="size-5 text-foreground" />
-            <span>Settings</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <CreditCardIcon className="size-5 text-foreground" />
-            <span>Billing</span>
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
-
-        <DropdownMenuSeparator />
-
-        <DropdownMenuGroup>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <UsersIcon className="size-5 text-foreground" />
-            <span>Manage team</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <SquarePenIcon className="size-5 text-foreground" />
-            <span>Customization</span>
-          </DropdownMenuItem>
-          <DropdownMenuItem className="gap-2 px-4 py-2.5 text-base">
-            <CirclePlusIcon className="size-5 text-foreground" />
-            <span>Add team account</span>
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
-
-        <DropdownMenuSeparator />
-
-        <DropdownMenuGroup>
-          <DropdownMenuItem
-            variant="destructive"
-            className="gap-2 px-4 py-2.5 text-base"
-          >
-            <LogOutIcon className="size-5" />
-            <span>Logout</span>
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
+        {profileMenuSections.map((section) => (
+          <Fragment key={section.id}>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              {section.items.map(({ icon: Icon, label, variant }) => (
+                <DropdownMenuItem
+                  key={label}
+                  variant={variant}
+                  className="gap-2 px-4 py-2.5 text-base"
+                >
+                  <Icon
+                    className={
+                      variant === "destructive"
+                        ? "size-5"
+                        : "size-5 text-foreground"
+                    }
+                  />
+                  <span>{label}</span>
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuGroup>
+          </Fragment>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   )

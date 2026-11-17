@@ -17,23 +17,27 @@ type Props = {
   align?: "start" | "center" | "end"
 }
 
-const LanguageDropdown = ({ defaultOpen, align, trigger }: Props) => {
+const languages = [
+  { value: "english", label: "English" },
+  { value: "german", label: "Deutsch" },
+  { value: "spanish", label: "Española" },
+  { value: "portuguese", label: "Português" },
+  { value: "korean", label: "한국인" },
+]
+
+const LanguageDropdown = ({ defaultOpen, align = "end", trigger }: Props) => {
   const [language, setLanguage] = useState("english")
 
   return (
     <DropdownMenu defaultOpen={defaultOpen}>
       <DropdownMenuTrigger render={trigger} />
-      <DropdownMenuContent className="w-50" align={align || "end"}>
+      <DropdownMenuContent className="w-50" align={align}>
         <DropdownMenuRadioGroup value={language} onValueChange={setLanguage}>
-          <DropdownMenuRadioItem value="english">English</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="german">Deutsch</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="spanish">
-            Española
-          </DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="portuguese">
-            Português
-          </DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="korean">한국인</DropdownMenuRadioItem>
+          {languages.map(({ value, label }) => (
+            <DropdownMenuRadioItem key={value} value={value}>
+              {label}
+            </DropdownMenuRadioItem>
+          ))}
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
