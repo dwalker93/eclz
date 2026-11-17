@@ -3,7 +3,7 @@ import type { Tx } from "./types";
 
 export async function writeAudit(
   tx: Tx,
-  e: { actor: string; action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; reason?: string },
+  e: { actor: string | null; action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; reason?: string },
 ) {
   await tx.insert(auditLog).values({
     actorUserId: e.actor,

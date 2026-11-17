@@ -1,3 +1,4 @@
+export * from "./access";
 export * from "./allocation";
 export * from "./commissions";
 export * from "./dates";
@@ -7,6 +8,7 @@ export * from "./invoices";
 export * from "./invoicing";
 export * from "./money";
 export * from "./payments";
+export * from "./payouts";
 export * from "./promotion";
 export * from "./receipts";
 export * from "./types";

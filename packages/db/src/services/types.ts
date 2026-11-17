@@ -37,7 +37,11 @@ export type ServiceErrorCode =
   | "promotion_not_draft"
   | "promotion_unresolved"
   | "promotion_date_invalid"
-  | "promotion_stale";
+  | "promotion_stale"
+  | "payout_not_draft"
+  | "payout_not_approved"
+  | "payout_period_invalid"
+  | "payout_nothing_to_pay";
 
 /** A rule of the business was broken. The message is safe to show to staff. */
 export class ServiceError extends Error {

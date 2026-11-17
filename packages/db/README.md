@@ -61,7 +61,7 @@ add a dated entry to the changelog in `docs/student-management-invariants.md`.
 ## Services (payments, enrolment, invoicing)
 
 `src/services` holds the business logic that the database cannot enforce, as typed functions over Drizzle. They work with the production
-`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions, commission accrual, yearly promotion.
+`createDb` object and with PGlite in tests. Services so far: payments and receipts, enrolment, invoice generation, fee exceptions, commission accrual, yearly promotion, teacher payouts, effective access and the overdue job.
 
 ```ts
 import { createDb, createPaymentService, hmacSigner, verifyReceipt } from "@workspace/db";
@@ -151,8 +151,62 @@ Things to know:
 - A lecturer with no matching rule accrues nothing (the institute keeps no commission on that fee). It shows in `skipped`.
 - Course shares are not validated to sum to 100 here (H3 is checked when the course is saved), so a course whose shares sum to less than 100 simply accrues less.
 - Rule dates are compared with the day of verification in the organization's time zone, not the invoice period.
-- If a payment is voided after its entries joined a draft payout, a reversal is added (as for settled entries) but the draft payout's totals are not recalculated. The payout service should rebuild draft totals.
-- Not done yet: teacher payouts (create, approve, pay, carry-forward of a negative net).
+- If a payment is voided after its entries joined a draft payout, a reversal is added (as for settled entries). The payout service takes that reversal into the draft when the draft is approved (see Teacher payouts).
+
+### Teacher payouts
+
+```ts
+import { createPayoutService } from "@workspace/db";
+const payouts = createPayoutService(db);
+
+const r = await payouts.createPayout({ lecturerId, periodEnd: "2027-04-01", createdBy });   // { status: "created", payout, entryIds } or { status: "carried_forward", reason, net, ... }
+await payouts.approvePayout({ payoutId, approvedBy });                                      // rebuilds draft totals, then freezes them
+await payouts.markPaid({ payoutId, paidBy, paymentReference: "TRX-1042", paidOn, proofFileId });
+await payouts.discardDraft({ payoutId, discardedBy, reason });                              // entries return to accrued
+const pending = await payouts.previewPayout({ lecturerId, periodEnd });                     // read-only: what a payout would hold now
+await payouts.getPayout({ payoutId });  await payouts.listPayouts({ lecturerId, status });
+```
+
+By rule: H8 (a payout takes the lecturer's accrued entries, accruals and negative reversals, and marks them settled; it is inserted with its final totals and the totals are
+re-added from the entries in the same transaction; a paid payout is immutable; a negative net creates no payout and the entries carry forward), H7 (reversals are deducted in the next payout),
+H9 (every payout action needs the commissions module), J3 (audit rows for create, approve, pay and discard).
+
+Behaviour to know:
+- **Period end is a cut-off, not a filter.** A payout takes every unsettled accrued entry created before the start of `periodEnd` (organization time zone), including entries from before `periodStart`. This is what makes carry-forward work: nothing is ever stranded in an earlier period. `periodStart` defaults to the end of the lecturer's previous payout, else the day of the oldest included entry, and only labels the payout. Payouts of one lecturer cannot overlap, and a period cannot end after tomorrow.
+- **Carry-forward.** If the net is zero or negative, or no entries exist, nothing is created and the result is `carried_forward` with a reason (`no_entries`, `net_not_positive`). A third reason, `reversal_heavy`, covers a positive net that the table's checks cannot hold (gross or commission total below zero, for example a large reversed commission against an accrual on a lower rate). It carries forward too.
+- **Draft totals are rebuilt at approval.** If a payment in a draft was voided, its reversal is pulled into the draft, which removes that entry from the payout. If nothing payable is left, approval fails with `payout_nothing_to_pay` and changes nothing; discard the draft and create a new one.
+- **Approved totals are fixed.** A payment voided after approval adds a reversal that is deducted from the lecturer's next payout, so the approved amount is the amount to transfer.
+- Only a draft can be discarded (the database refuses to delete an approved or paid payout). A zero-net payout is never created, so `paid` always means money was sent.
+- Separation of duties (creator, approver and payer being different people) is not enforced here. Do it with permissions in the app if the institute wants it.
+
+### Access and overdue
+
+```ts
+import { createAccessService, createPaymentService, combineHooks, hasAccess, accessState } from "@workspace/db";
+
+const access = createAccessService(db);
+const payments = createPaymentService(db, { signer, hooks: combineHooks(commissions.hooks, access.hooks) });   // verify and void re-check overdue state
+
+const result = await access.runOverdueJob();          // run daily from a scheduled job; safe to run twice
+const state = accessState(enrollmentRow, today);       // { allowed: true } or { allowed: false, reason: "not_active" | "not_started" | "ended" | "restricted" }
+await access.getAccess({ enrollmentId });             // the same, on today's date in the organization's time zone
+await access.recheckStudent(tx, studentId, actorId);   // call after anything that changes what a student owes
+```
+
+By rule: C8 (`accessState` and `hasAccess` are the one place that decides effective access; route guards, jobs and notification code should all call it), C9 (overdue status,
+restrict and restore), J1 and J2 (overdue notifications), J3 (audit rows for every restrict and restore).
+
+Behaviour to know:
+- **Overdue means past the grace period.** An invoice is overdue from the day after `due date + grace days`. With installments each unpaid installment is judged by its own due date and the invoice follows. A part-paid item is still unpaid, so it stays overdue.
+- **Settings.** Grace days and action come from the fee option of the invoice's earliest fee line, field by field, else from the organization. An invoice that mixes classes with different settings follows its earliest fee line.
+- **Action `none`** still moves the invoice and installments to `overdue` (a label for staff) but notifies and restricts nothing. `notify` only notifies, `restrict` only restricts.
+- **Restrict and restore are per enrolment.** Every active or completed enrolment with a fee line on a past-grace invoice whose action includes restrict becomes `restricted`. It is restored only when no such invoice remains unpaid, so paying one of two overdue invoices keeps the restriction. Dropped enrolments are never touched. A restriction is a billing overlay: C8 reads it, nothing else changes.
+- **Verified payment and void.** The hooks run the same reconcile for the payment's student in the same transaction. A verified payment that clears the last overdue invoice restores access straight away (the verifier is the audit actor, which matches "access returns after staff verify the payment"). A void that leaves an invoice unpaid and past grace marks it overdue and restricts again at once. The daily job writes audit rows with no actor.
+- **Statuses go back too.** If an invoice or installment is no longer overdue (grace changed, due date moved) it returns to pending or partial.
+- **Notifications.** One row per recipient, channel and overdue item (invoice, or installment number), event `installment_overdue`, so reruns add nothing. Recipients are the student's portal user and, when the `parent_portal` module is on, guardians with a portal login. Channels are in-app always, plus email, SMS and push only when the module and the channel switch are both on. In-app rows are `sent`, external ones `queued` for the dispatcher (not built yet). A student with no portal login still gets the status and restriction, but no notification (the table needs a user).
+- Invoices with no fee line (content only) get the overdue status and notification but restrict nothing.
+- The job reconciles each student in a transaction of their own and reports failures in `errors` rather than stopping.
+- Not covered: the "due soon" reminder (`installment_due`), and the notification dispatcher that actually sends email, SMS and push.
 
 ### Yearly promotion
 
@@ -184,7 +238,7 @@ Behaviour to know:
 - A draft goes stale if an enrolment in it ends before confirm (`promotion_stale`). Discard it and build a new one.
 - Nothing stops two drafts existing at once. Confirm the one you want and discard the other.
 
-Not yet in services: teacher payouts, access re-evaluation and the overdue job, exam grading. Run the service tests with `bun run db:test:services` and `bun run db:test:enrolment`.
+Not yet in services: exam grading and result release, the notification dispatcher. Run the service tests with `bun run db:test:services`, `db:test:enrolment`, `db:test:commissions`, `db:test:promotion`, `db:test:payouts` and `db:test:access`.
 
 ## What the database enforces
 
