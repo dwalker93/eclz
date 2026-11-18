@@ -19,7 +19,7 @@ afterAll(async () => {
   await close();
 });
 
-await q(`UPDATE organization SET timezone = 'UTC', enabled_modules = '{"parent_portal": true}'::jsonb`);
+await q(`UPDATE organization SET timezone = 'UTC', enabled_modules = '{"parent_portal": true, "online_exams": true}'::jsonb`);
 const b1 = String((await q(`SELECT id FROM branch LIMIT 1`))[0]!.id);
 let clock = new Date("2027-03-10T07:00:00Z");
 const ex = createExamService(db, { now: () => clock });
@@ -39,7 +39,7 @@ async function newStudent(courses: string[], opts: { restricted?: boolean } = {}
   return { userId, studentId, enrollmentIds };
 }
 const mcq = (body: string, correctIndex = 0, marks: number | string = 2) =>
-  ex.createQuestion({ lecturerId: lec, body, defaultMarks: marks, explanation: "because", options: ["Alpha", "Beta", "Gamma"].map((b, i) => ({ body: b, isCorrect: i === correctIndex })) });
+  ex.createQuestion({ actor: null, lecturerId: lec, body, defaultMarks: marks, explanation: "because", options: ["Alpha", "Beta", "Gamma"].map((b, i) => ({ body: b, isCorrect: i === correctIndex })) });
 
 /** An online exam from 08:00 to 12:00, with two 2-mark questions (correct answers A and B), published. */
 async function publishedExam(opts: Partial<Parameters<typeof ex.createExam>[0]> = {}, courses?: string[]) {
@@ -104,11 +104,11 @@ describe("pure", () => {
 
 describe("setup and publishing (G4)", () => {
   test("question rules", async () => {
-    await fails("question_invalid", () => ex.createQuestion({ lecturerId: lec, body: " ", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] }));
-    await fails("question_invalid", () => ex.createQuestion({ lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: true }] }));
-    await fails("question_invalid", () => ex.createQuestion({ lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: true }] }));
-    await fails("question_invalid", () => ex.createQuestion({ lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: false }, { body: "b", isCorrect: false }] }));
-    await fails("question_invalid", () => ex.createQuestion({ lecturerId: lec, body: "Q", defaultMarks: 0, options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] }));
+    await fails("question_invalid", () => ex.createQuestion({ actor: null, lecturerId: lec, body: " ", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] }));
+    await fails("question_invalid", () => ex.createQuestion({ actor: null, lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: true }] }));
+    await fails("question_invalid", () => ex.createQuestion({ actor: null, lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: true }] }));
+    await fails("question_invalid", () => ex.createQuestion({ actor: null, lecturerId: lec, body: "Q", options: [{ body: "a", isCorrect: false }, { body: "b", isCorrect: false }] }));
+    await fails("question_invalid", () => ex.createQuestion({ actor: null, lecturerId: lec, body: "Q", defaultMarks: 0, options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] }));
   });
 
   test("exam rules per mode", async () => {
@@ -131,7 +131,7 @@ describe("setup and publishing (G4)", () => {
     const e = await ex.createExam({ lecturerId: lec, title: "Draft", mode: "online_mcq", courseIds: [c], opensAt: new Date("2027-03-10T08:00:00Z"), closesAt: new Date("2027-03-10T09:00:00Z"), maxAttempts: 1 });
     await fails("exam_invalid", () => ex.publishExam({ examId: e.id }));
     const mine = await mcq("mine");
-    const other = await ex.createQuestion({ lecturerId: lec2, body: "theirs", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] });
+    const other = await ex.createQuestion({ actor: null, lecturerId: lec2, body: "theirs", options: [{ body: "a", isCorrect: true }, { body: "b", isCorrect: false }] });
     await fails("question_invalid", () => ex.setQuestions({ examId: e.id, questions: [{ questionId: other.id }] }));
     await fails("question_invalid", () => ex.setQuestions({ examId: e.id, questions: [{ questionId: mine.id }, { questionId: mine.id }] }));
     await ex.setQuestions({ examId: e.id, questions: [{ questionId: mine.id, marks: 3 }] });
@@ -144,7 +144,7 @@ describe("setup and publishing (G4)", () => {
   test("question edits after publish never change the exam (G4)", async () => {
     const p = await publishedExam();
     const [row] = await q(`SELECT question_id, snapshot FROM exam_question WHERE id = $1`, [p.q1]);
-    await ex.updateQuestion({ questionId: String(row!.question_id), body: "Changed!", options: [{ body: "X", isCorrect: false }, { body: "Y", isCorrect: true }] });
+    await ex.updateQuestion({ actor: null, questionId: String(row!.question_id), body: "Changed!", options: [{ body: "X", isCorrect: false }, { body: "Y", isCorrect: true }] });
     const [after] = await q(`SELECT snapshot FROM exam_question WHERE id = $1`, [p.q1]);
     eq(JSON.stringify(after!.snapshot), JSON.stringify(row!.snapshot), "snapshot frozen");
     eq(JSON.stringify(after!.snapshot).includes("Changed!"), false, "old text kept");

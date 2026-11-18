@@ -6,7 +6,7 @@ where every rule says whether it is enforced by the database, a transaction, app
 
 The business rules that need a transaction or a job are in the service layer, `@workspace/domain` (`packages/domain`), not here.
 
-**All five phases are done** (69 tables). Two optional extras need no tables (see phase 5 below).
+**All five phases are done** (69 tables), plus three sign-in tables (`auth_session`, `user_two_factor`, `auth_rate_limit`, migration 0011) used by `@workspace/auth`: 72 tables. Two optional extras need no tables (see phase 5 below).
 
 ## What is in phase 1
 
