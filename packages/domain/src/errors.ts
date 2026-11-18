@@ -33,7 +33,25 @@ export type ServiceErrorCode =
   | "payout_not_draft"
   | "payout_not_approved"
   | "payout_period_invalid"
-  | "payout_nothing_to_pay";
+  | "payout_nothing_to_pay"
+  | "attendance_disabled"
+  | "session_invalid"
+  | "session_not_open"
+  | "session_in_future"
+  | "session_has_attendance"
+  | "student_not_enrolled"
+  | "qr_unknown"
+  | "guardian_required"
+  | "question_invalid"
+  | "exam_invalid"
+  | "exam_not_draft"
+  | "exam_not_published"
+  | "exam_not_open"
+  | "exam_not_closed"
+  | "attempt_limit_reached"
+  | "attempt_not_running"
+  | "attempt_time_over"
+  | "answer_locked";
 
 /** A rule of the business was broken. The message is safe to show to staff. */
 export class ServiceError extends Error {

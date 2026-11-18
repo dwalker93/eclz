@@ -95,6 +95,8 @@ export const exam = pgTable(
     maxAttempts: integer("max_attempts"),
     attemptScoring: text("attempt_scoring").notNull().default("best"),
     shuffleQuestions: boolean("shuffle_questions").notNull().default(false),
+    /** true = an answer is final once chosen (it cannot be changed or cleared); false = answers can change until the attempt ends. */
+    lockAnswers: boolean("lock_answers").notNull().default(false),
     resultsVisibility: text("results_visibility").notNull().default("after_release"),
     status: text("status").notNull().default("draft"),
     createdAt: createdAt(),

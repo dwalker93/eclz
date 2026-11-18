@@ -110,7 +110,7 @@ What each table stores, grouped by area. "Phase" is the build phase that added i
 |---|---|
 | `question` | A lecturer's question bank item: text, image, explanation, default marks. |
 | `question_option` | The answer options of a question and which are correct. |
-| `exam` | An online MCQ or paper exam: owner, mode, dates or open window, time limit, attempt limit, best or latest scoring, result visibility, status. |
+| `exam` | An online MCQ or paper exam: owner, mode, dates or open window, time limit, attempt limit, best or latest scoring, whether answers are locked once chosen, result visibility, status. |
 | `exam_course` | Which courses an exam is attached to (branch-specific or shared). |
 | `exam_question` | A question placed in an exam with its marks, order, and a frozen snapshot taken at publish so later edits never change it. |
 | `exam_attempt` | One try by a student: the enrolment used, attempt number, start and submit times, score, status. |
