@@ -530,6 +530,7 @@ erDiagram
         int max_attempts
         text attempt_scoring "best | latest"
         bool shuffle_questions
+        bool lock_answers
         text results_visibility "immediate | after_release | manual"
         text status "draft | published | closed"
     }

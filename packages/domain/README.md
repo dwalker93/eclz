@@ -172,6 +172,108 @@ Behaviour to know:
 - The job reconciles each student in a transaction of their own and reports failures in `errors` rather than stopping.
 - Not covered: the "due soon" reminder (`installment_due`), and the notification dispatcher that actually sends email, SMS and push.
 
+### Notifications
+
+```ts
+import { createNotificationService, createTextLkSms } from "@workspace/domain";
+
+const notifications = createNotificationService(db, {
+  providers: {
+    sms: createTextLkSms({ apiToken: process.env.TEXTLK_TOKEN!, senderId: "MyInstitute" }),
+    email: async ({ to, subject, body }) => { /* your mailer; throw on failure */ },
+    push: async ({ subscription, title, body }) => { /* web-push; throw on failure */ },
+  },
+});
+
+await notifications.runDueSoonJob({ leadDays: 3 }); // run daily: queues installment_due reminders
+await notifications.dispatchQueued({ limit: 100 }); // run every minute or so: sends queued email, SMS and push
+await notifications.retryFailed();                  // after fixing a provider key
+await notifications.listInApp({ userId, unreadOnly: true });
+await notifications.markRead({ userId, ids });
+```
+
+- J1, J2: `queueNotifications` (shared with the overdue job) makes one row per recipient, channel and item. In-app rows are `sent` at once; email, SMS and push rows exist only when the module flag and the channel switch are both on, and start `queued`.
+- The dispatcher locks each row (`FOR UPDATE SKIP LOCKED`), so two workers never send the same row. A row ends `sent` or `failed` with the reason (no phone, bad number, no subscription, provider error, channel switched off after queueing, inactive user, no provider configured). Failed rows are not retried by themselves.
+- Templates use `{{student_name}}` or `{{studentName}}`; without a template for the channel a built-in text is used.
+- "Due soon": every unpaid installment (or unpaid invoice without installments) due from today up to `leadDays` ahead, both ends inclusive. One reminder per item for good, whatever the number of runs. The amount in the message is what is still owed.
+- `createTextLkSms` follows the text.lk v3 plain SMS API; numbers are normalised to `94XXXXXXXXX`. Email and push are provider callbacks you supply.
+
+### Attendance
+
+```ts
+import { createAttendanceService } from "@workspace/domain";
+const attendance = createAttendanceService(db);
+
+const session = await attendance.createSession({ courseId, sessionDate: "2027-03-10", startsAt: "16:00", endsAt: "18:00" });
+const { students } = await attendance.getRoster({ sessionId: session.id });
+await attendance.mark({ sessionId: session.id, entries: [{ studentId, status: "present" }], actor: staffUserId });
+await attendance.markRemainingAbsent({ sessionId: session.id, actor: staffUserId });
+await attendance.markByQr({ sessionId: session.id, qrToken, actor: staffUserId }); // needs the qr_attendance module
+await attendance.rotateQrToken({ studentId });                                      // lost card
+await attendance.studentSummary({ studentId, courseId, from: "2027-03-01", to: "2027-04-01" });
+```
+
+- A session needs a course with attendance on. The roster is the students with an active enrolment whose access window covers the session day (end exclusive), in the session's intake when it has one. Billing restriction does not remove a student from the roster; `restricted` is returned so staff can see it.
+- Marking is allowed on the session day or later, never before, and never on a cancelled session. A later mark corrects an earlier one. Marking sets the session to `held`; a session with marks cannot be cancelled.
+- `attended_via` is filled for present and late: the session's mode, else the explicit value, else the enrolment's preferred mode (hybrid sessions need one of these). Absent and excused have none.
+- Newly absent students: their guardians with portal access get an `attendance_marked` notification (in-app plus any enabled SMS/email/push), once per session and student. Guardians registered through `createStudentService` always have a login record, so they are reachable; guardians created by hand or import need `provisionGuardianLogins()` once.
+- QR: scanning twice changes nothing; an earlier absent or excused mark is corrected to present (or late).
+- `studentSummary` rate = (present + late) / (present + late + absent); excused sessions are left out; cancelled sessions are ignored.
+- Class capacity (C5) is enforced at enrolment, see the enrolment service.
+
+### Student registration
+
+```ts
+import { createStudentService } from "@workspace/domain";
+const students = createStudentService(db);
+
+const { student, guardians } = await students.register({
+  fullName: "Nimal Perera",
+  dateOfBirth: "2015-05-01",
+  gradeLevelId,
+  guardians: [{ fullName: "Kamala Perera", phone: "077 123 4567", address: "12 Lake Road, Kandy" }],
+});
+await students.provisionGuardianLogins(); // one-off, for guardians entered before this rule or imported
+```
+
+- B1, B2: name and date of birth are required. A student younger than the organization's `guardian_required_below_age` on the registration day needs at least one guardian with name, phone and address; the limit is exclusive (a student who has just turned 16 needs none).
+- Each guardian gets a lightweight login record automatically: a user named `parent-94XXXXXXXXX` with the phone number, the email when given and free, no password (no sign-in until the parent is invited and sets one), and `portal_enabled` on. This is what lets absence and payment notices reach a parent, because notifications belong to users. The parent portal module still decides whether parents can use it.
+- A guardian whose phone number matches an existing guardian is the same person (a sibling's parent) and is linked, not duplicated. Numbers are stored as `94XXXXXXXXX`.
+- Student numbers are generated (`STU-000001`, ...) unless one is given. A grade starts a `student_level` on the registration day.
+
+### Exams
+
+```ts
+import { createExamService } from "@workspace/domain";
+const exams = createExamService(db);
+
+const q = await exams.createQuestion({ lecturerId, body: "2 + 2 = ?", options: [{ body: "3", isCorrect: false }, { body: "4", isCorrect: true }] });
+const exam = await exams.createExam({ lecturerId, title: "Unit 1", mode: "online_mcq", courseIds, opensAt, closesAt, timeLimitMinutes: 30, maxAttempts: 2, lockAnswers: false });
+await exams.setQuestions({ examId: exam.id, questions: [{ questionId: q.id, marks: 2 }] });
+await exams.publishExam({ examId: exam.id });                 // freezes the questions, notifies students
+
+const { paper } = await exams.startAttempt({ examId: exam.id, studentId });   // or resumes the running one
+await exams.saveAnswers({ attemptId: paper.attemptId, studentId, answers: [{ examQuestionId, selectedOptionKey: "B" }] });
+await exams.submitAttempt({ attemptId: paper.attemptId, studentId });
+
+await exams.closeExam({ examId: exam.id });
+await exams.releaseResults({ examId: exam.id });
+await exams.getResultForStudent({ examId: exam.id, studentId });             // G9 visibility
+await exams.enterMarks({ examId: paperExamId, entries: [{ studentId, marks: 72.5 }], actor });
+await exams.overrideResult({ examId: exam.id, studentId, marks: 3, reason: "Question 2 was ambiguous", actor });
+await exams.runReleaseJob();            // daily or hourly
+await exams.finalizeExpiredAttempts();  // every few minutes
+```
+
+- G4: publishing copies each question and its options (with correct flags) into `exam_question.snapshot`; options are keyed A, B, C by position. The exam's total marks become the sum of the question marks. Later question-bank edits never reach a published exam. A question has exactly one correct option.
+- G1, G3: a student may start only with effective access (C8) in an attached course; the enrolment used is stored on the attempt. G2: the attempt limit counts the student's attempts in the exam across all attached courses; two simultaneous starts are settled by the unique indexes.
+- G6: the window and time limit use server time. An attempt ends at the earlier of its time limit and the closing time. Answers cannot be saved after that. An attempt that runs out of time (or is cut off by closing the exam) is graded from the answers already saved and gets status `expired`; it still counts for the result and the attempt limit.
+- Answer locking, chosen per exam (`lockAnswers`, default off): off means a student can change or clear an answer until the attempt ends; on means the first choice is final (`answer_locked` on a change or clear; saving the same choice again is accepted, so network retries are safe; a batch with a refused answer saves nothing). The student's paper carries `lockAnswers` so the screen can disable chosen options. Either way every choice should be saved as it is made, so nothing is lost if the connection drops.
+- G5: answers store the option key; grading reads only the snapshot. The student's paper never contains correct flags or explanations.
+- G7: after each finished attempt the result follows the counted attempt (`best`: highest score, earliest on a tie; `latest`: highest attempt number) until it is released or overridden. Paper exams get results only through `enterMarks` (within the total marks).
+- G8: results are released only for a closed exam. An online exam past its closing time is closed first. A paper exam must be closed by hand. After release, `enterMarks` (paper) and `overrideResult` (online, sets `manual_override`) need a reason and write an audit row (J3).
+- G9: `immediate` shows the score as soon as it exists, marked provisional until released; `after_release` and `manual` show nothing until released. The release job releases `immediate` and `after_release` exams after they close; `manual` ones wait for `releaseResults`.
+
 ### Yearly promotion
 
 ```ts
@@ -202,8 +304,7 @@ Behaviour to know:
 - A draft goes stale if an enrolment in it ends before confirm (`promotion_stale`). Discard it and build a new one.
 - Nothing stops two drafts existing at once. Confirm the one you want and discard the other.
 
-Not yet built: exam grading and result release, the notification dispatcher (queued email, SMS and push rows are created but nothing sends them), the "due soon" reminder (`installment_due`),
-and a scheduled worker that calls `runOverdueJob()` daily.
+Not yet built: content access, and a scheduled worker that calls `runOverdueJob()`, `runDueSoonJob()` and `dispatchQueued()` on a timer.
 
 ## Tests
 
@@ -219,6 +320,10 @@ No test needs a server or a connection string.
 | `payouts.test.ts` | scenario | H rules: create, carry forward, approve, pay, discard |
 | `promotion.test.ts` | scenario | B and C rules: yearly promotion |
 | `access.test.ts` | scenario | C8, C9, J rules: overdue job, restrict and restore, notifications |
+| `notifications.test.ts` | scenario | J rules: queueing, dispatcher, retries, text.lk request, due-soon reminders, in-app inbox |
+| `attendance.test.ts` | scenario | sessions, roster, marking and corrections, QR, absence notices, summaries |
+| `students.test.ts` | scenario | B1, B2: registration, guardian logins, sibling linking, numbering, end-to-end absence notice |
+| `exams.test.ts` | scenario | G rules: snapshots, attempts, grading, results, release, paper marks, overrides |
 | `server-only.test.ts` | boundary | the `browser` condition blocks the client bundle and leaves server bundles alone |
 
 Most scenario files tell one story in order (a later test relies on the rows an earlier one left), so run a file whole rather than a single test.

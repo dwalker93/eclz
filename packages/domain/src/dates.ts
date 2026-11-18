@@ -116,3 +116,12 @@ export function respreadInstallments(remaining: number, unpaidCount: number): nu
   if (unpaidCount === 0) return [];
   return spreadCents(remaining, unpaidCount);
 }
+
+/** Whole years between a date of birth and a day (B2). A birthday counts on its day. */
+export function ageOn(dateOfBirth: string, day: string): number {
+  const b = parseDay(dateOfBirth);
+  const t = parseDay(day);
+  let age = t.y - b.y;
+  if (t.m < b.m || (t.m === b.m && t.d < b.d)) age--;
+  return age;
+}

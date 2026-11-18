@@ -2,19 +2,14 @@ import { and, asc, eq, inArray, isNull } from "drizzle-orm";
 import {
   enrollment,
   feeStructure,
-  guardian,
   invoice,
   invoiceInstallment,
   invoiceItem,
-  notification,
-  notificationChannel,
-  notificationTemplate,
-  student,
-  studentGuardian,
 } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
 import { addDays } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
+import { queueNotifications, resolveRecipients } from "./notifications";
 import { fromCents, toCents } from "@workspace/db/money";
 import type { VerifiedEvent, VoidedEvent } from "./payments";
 import { ServiceError } from "./errors";
@@ -108,12 +103,6 @@ export interface ReconcileSummary {
 }
 
 const FEE_KINDS = ["recurring_fee", "package_fee"] as const;
-const EXTERNAL: { channel: "email" | "sms" | "push"; module: "email" | "sms" | "web_push" }[] = [
-  { channel: "email", module: "email" },
-  { channel: "sms", module: "sms" },
-  { channel: "push", module: "web_push" },
-];
-
 interface OverdueNote {
   eventKey: string;
   payload: Record<string, unknown>;
@@ -122,53 +111,13 @@ interface OverdueNote {
 /** J1, J2: one notification per recipient, channel and overdue item. Disabled external channels create no rows, and a retry creates none twice. */
 async function queueOverdueNotifications(tx: Tx, org: OrgRow, studentId: string, notes: OverdueNote[], at: Date): Promise<number> {
   if (notes.length === 0) return 0;
-  const [stu] = await tx.select().from(student).where(eq(student.id, studentId));
-  const recipients = new Set<string>();
-  if (stu?.userId) recipients.add(stu.userId);
-  const modules = (org.enabledModules ?? {}) as Record<string, boolean | undefined>;
-  if (modules.parent_portal === true) {
-    const guardians = await tx
-      .select({ userId: guardian.userId })
-      .from(studentGuardian)
-      .innerJoin(guardian, eq(guardian.id, studentGuardian.guardianId))
-      .where(and(eq(studentGuardian.studentId, studentId), eq(guardian.portalEnabled, true)));
-    for (const g of guardians) if (g.userId) recipients.add(g.userId);
-  }
-  if (recipients.size === 0) return 0;
-
-  const channels: string[] = ["in_app"];
-  const enabled = await tx.select().from(notificationChannel).where(and(eq(notificationChannel.organizationId, org.id), eq(notificationChannel.isEnabled, true)));
-  for (const ext of EXTERNAL) {
-    if (modules[ext.module] === true && enabled.some((c) => c.channel === ext.channel)) channels.push(ext.channel);
-  }
-  const templates = await tx
-    .select()
-    .from(notificationTemplate)
-    .where(and(eq(notificationTemplate.organizationId, org.id), eq(notificationTemplate.event, "installment_overdue")));
-
-  let created = 0;
-  for (const userId of [...recipients].sort()) {
-    for (const channel of channels) {
-      for (const note of notes) {
-        const rows = await tx
-          .insert(notification)
-          .values({
-            userId,
-            templateId: templates.find((t) => t.channel === channel)?.id ?? null,
-            channel,
-            event: "installment_overdue",
-            eventKey: note.eventKey,
-            payload: { studentName: stu?.fullName, ...note.payload },
-            status: channel === "in_app" ? "sent" : "queued",
-            sentAt: channel === "in_app" ? at : null,
-          })
-          .onConflictDoNothing()
-          .returning({ id: notification.id });
-        created += rows.length;
-      }
-    }
-  }
-  return created;
+  const { userIds, studentName } = await resolveRecipients(tx, org, studentId);
+  return queueNotifications(tx, org, {
+    event: "installment_overdue",
+    userIds,
+    items: notes.map((n) => ({ eventKey: n.eventKey, payload: { studentName, ...n.payload } })),
+    at,
+  });
 }
 
 /**
