@@ -143,3 +143,55 @@ describe("end to end: an absence reaches a parent who was never given an account
     eq(rows.map((x) => `${x.channel}:${x.status}`), ["in_app:sent", "sms:queued"], "rows for the parent");
   });
 });
+
+const b1 = String((await q(`SELECT id FROM branch LIMIT 1`))[0]!.id);
+const b2 = await id(`INSERT INTO branch (organization_id, name) VALUES ((SELECT id FROM organization), 'Galle')`);
+
+describe("branch, list, get, update", () => {
+  const adult = (over: Record<string, unknown> = {}) => ({ fullName: "Adult Learner", dateOfBirth: "1990-01-01", ...over });
+
+  test("a registered student joins the given branch as primary; an unknown branch is refused", async () => {
+    const r = await students.register(adult({ branchId: b1 }));
+    eq(await q(`SELECT branch_id, is_primary FROM student_branch WHERE student_id = $1`, [r.student.id]), [{ branch_id: b1, is_primary: true }]);
+    await fails("not_found", () => students.register(adult({ branchId: "00000000-0000-0000-0000-000000000000" })));
+    const none = await students.register(adult());
+    eq(Number((await q(`SELECT count(*)::int AS c FROM student_branch WHERE student_id = $1`, [none.student.id]))[0]!.c), 0);
+  });
+
+  test("list respects the branch scope, searches, and shows a student once", async () => {
+    const a = await students.register(adult({ fullName: "Zed Unique Alpha", branchId: b1, contactPhone: "0779990001" }));
+    const b = await students.register(adult({ fullName: "Zed Unique Beta", branchId: b2 }));
+    await q(`INSERT INTO student_branch (student_id, branch_id, is_primary) VALUES ($1,$2,false)`, [a.student.id, b2]);
+    const names = async (scope: "all" | string[], search = "Zed Unique") => (await students.list({ scope, search })).map((s) => s.fullName);
+    eq(await names("all"), ["Zed Unique Alpha", "Zed Unique Beta"]);
+    eq(await names([b1]), ["Zed Unique Alpha"]);
+    eq(await names([b2]), ["Zed Unique Alpha", "Zed Unique Beta"]);
+    eq(await names([]), []);
+    eq(await names("all", "0779990001"), ["Zed Unique Alpha"]);
+    eq(await names("all", b.student.studentNo), ["Zed Unique Beta"]);
+    eq(await names("all", "100%"), []);
+    eq((await students.list({ scope: "all", search: "Zed Unique", limit: 1, offset: 1 })).map((s) => s.fullName), ["Zed Unique Beta"]);
+  });
+
+  test("get returns guardians, branches and enrolments", async () => {
+    const r = await students.register({ fullName: "Young One", dateOfBirth: "2015-06-01", branchId: b1, guardians: [parent({ phone: "0771119999" })] });
+    const g = await students.get({ studentId: r.student.id });
+    eq([g.student.fullName, g.guardians.map((x) => x.fullName), g.branches.map((x) => x.branchId), g.enrolments], ["Young One", ["Kamala Perera"], [b1], []]);
+    await fails("not_found", () => students.get({ studentId: "00000000-0000-0000-0000-000000000000" }));
+  });
+
+  test("update changes only the given fields and is audited with before and after", async () => {
+    const r = await students.register(adult({ branchId: b1, schoolName: "Old School" }));
+    const actor = await id(`INSERT INTO "user" (email) VALUES ('editor@example.com')`);
+    const row = await students.update({ studentId: r.student.id, actor, schoolName: "New School", status: "suspended" });
+    eq([row.schoolName, row.status, row.fullName], ["New School", "suspended", "Adult Learner"]);
+    const [a] = await q(`SELECT before_data, after_data FROM audit_log WHERE action = 'student.update' AND entity_id = $1`, [r.student.id]);
+    eq([a!.before_data, a!.after_data], [{ status: "active", schoolName: "Old School" }, { status: "suspended", schoolName: "New School" }]);
+    await students.update({ studentId: r.student.id, actor });
+    eq(Number((await q(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'student.update' AND entity_id = $1`, [r.student.id]))[0]!.c), 1);
+    await fails("invalid_input", () => students.update({ studentId: r.student.id, actor, fullName: "  " }));
+    await fails("invalid_input", () => students.update({ studentId: r.student.id, actor, dateOfBirth: "1/1/90" }));
+    await fails("invalid_input", () => students.update({ studentId: r.student.id, actor, status: "gone" as never }));
+    await fails("not_found", () => students.update({ studentId: "00000000-0000-0000-0000-000000000000", actor, fullName: "X" }));
+  });
+});

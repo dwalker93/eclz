@@ -114,6 +114,9 @@ describe("Yearly promotion", () => {
     eq((await itemOf(d.runId, b)).decision, "needs_review");
     eq((await q(`SELECT count(*)::int n FROM promotion_item WHERE student_id = $1`, [ungraded]))[0]!.n, 0);
     eq(await codeOf(async () => promo.confirm({ runId: d.runId, confirmedBy: staff })), "promotion_unresolved");
+    const view = await promo.getRun({ runId: d.runId });
+    eq([view.run.status, view.byDecision.move >= 1, view.items.some((i) => i.studentId === a && i.decision === "move" && i.studentName.length > 0)], ["draft", true, true]);
+    eq(await codeOf(async () => promo.getRun({ runId: "00000000-0000-0000-0000-000000000000" })), "not_found");
     await promo.discardDraft({ runId: d.runId, discardedBy: staff });
     eq(await codeOf(async () => promo.confirm({ runId: d.runId, confirmedBy: staff })), "promotion_not_draft");
     eq((await levels(a)).length, 1);

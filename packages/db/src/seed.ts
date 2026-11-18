@@ -38,6 +38,7 @@ export const STARTER_PERMISSIONS = [
   "payouts.manage",
   "commissions.manage",
   "content.handover",
+  "reports.read",
 ] as const;
 
 /** Built-in roles. Custom roles can be added later as data. root_admin gets every permission. */
@@ -129,10 +130,12 @@ export async function seedDefaults(db: AnyPgDatabase, opts: SeedOptions) {
       { organizationId: org.id, type: "cash", label: "Cash" },
     ]);
 
-    const permissions = await tx
+    // A migration may already have added a permission to this database (for example reports.read), so inserts skip existing codes.
+    await tx
       .insert(s.permission)
       .values(STARTER_PERMISSIONS.map((code) => ({ code })))
-      .returning();
+      .onConflictDoNothing();
+    const permissions = await tx.select().from(s.permission);
     const permissionIdByCode = new Map(permissions.map((p) => [p.code, p.id]));
 
     for (const [name, def] of Object.entries(STARTER_ROLES)) {

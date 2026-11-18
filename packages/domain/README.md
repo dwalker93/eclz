@@ -301,6 +301,61 @@ await content.pendingHandovers({ branchId });
 - F6: physical books use channel `physical`, digital items `online`. `handOver` needs a paid purchase, records who and when, and can happen once. Payment and handover are separate events.
 - Overdue handling is unchanged: an unpaid content-only invoice gets the overdue label and notice but never restricts class access (C9).
 
+### Guardians
+```ts
+const guardians = createGuardianService(db);
+await guardians.update({ guardianId, actor, fullName, address, nic, email });   // details; the phone has its own method
+await guardians.changePhone({ guardianId, actor, phone });                       // moves the parent's login (username parent-<phone>), ends their sessions
+await guardians.link({ studentId, actor, fullName, phone, relationship, isPrimary });  // a known phone links the same person; the first guardian is primary
+await guardians.updateLink({ studentId, guardianId, actor, relationship, isPrimary: true });
+await guardians.unlink({ studentId, guardianId, actor });                        // removes the link only; promotes the next guardian if the primary left
+```
+- Needs `guardians.manage`: student-level calls in the student's branches, guardian-level calls in any branch of any of the guardian's children.
+- A student under the guardian-required age keeps at least one guardian. A phone number another guardian or login already has is refused (`phone_taken`).
+
+### Commission rules
+```ts
+const rules = createCommissionRuleService(db);
+await rules.create({ actor, lecturerId, scope: { courseId } | { subjectId, gradeLevelId? } | {}, calcType, rate, effectiveFrom, effectiveTo });  // -> { rule, warnings }
+await rules.end({ ruleId, actor, effectiveTo });   // closes or shortens, never extends
+await rules.remove({ ruleId, actor });             // only if no earning used it
+await rules.list({ actor, lecturerId, activeOn });
+```
+- Institute-wide, so every call needs `commissions.manage` as an all-branches role. Rules of the same scope never overlap in dates (`rule_overlap`; the database has the same guard).
+- A rate is never edited: end the old rule and create a new one, so past earnings keep their rule (H6). A used rule cannot be deleted (`rule_in_use`).
+- A fixed amount above the lowest current fee of the courses it covers returns a warning (H12). Rules can be prepared while the commissions module is off.
+
+### Reports (the owner's)
+```ts
+const reports = createReportService(db);
+await reports.overdue({ actor, branchId?, limit?, offset? });   // unpaid invoices past their due date: totals, aging, per branch, rows with the parent's phone
+await reports.collections({ actor, from, to, branchId? });      // money verified in a period (local dates, at most 366 days): by branch, method and day, plus slips still pending
+```
+- Needs `reports.read`, and covers only the branches the actor holds it in (all with an all-branches assignment). The root admin has it from the seed; migration 0012 adds it to existing databases.
+- Overdue means unpaid after the due date whatever the stored status says, so it is right before the overdue job runs. Aging buckets are 1 to 30, 31 to 60 and 61 or more days late; a due date of today is not late yet. Totals cover every overdue invoice, the rows are paged.
+- Collected money is by verification date in the organization's time zone; a payment voided later is left out.
+
+### Notices
+```ts
+const notices = createNoticeService(db);
+await notices.create({ actor, branchId, title, body, publishAt, expiresAt, targets: [{ type: "grade", id: gradeId }] }); // default target: everyone
+await notices.update({ noticeId, actor, title, body, expiresAt });   // wording and expiry only; branch and audience stay as published
+await notices.remove({ noticeId, actor });                           // the audit trail keeps what it said
+await notices.listManaged({ actor });                                // every notice of the actor's branches (all with an all-branches role)
+await notices.listForStudent(studentId);                             // live, in the student's branches, aimed at them
+await notices.listForGuardian(guardianId);                           // the union over their children, once each
+await notices.listForStaff(userId);                                  // live notices aimed at a role the staff member holds
+```
+- Writing needs `notices.manage` in the notice's branch; an all-branches notice (`branchId` null) needs an all-branches assignment.
+- Targets: `all` (every student and parent in the notice's branches; it cannot be combined with others), `course` (active enrolment), `grade` (current grade), `student`, and `role` (staff only, shown by `listForStaff`). A course or student target must belong to the notice's branch.
+- Visible while `publishedAt <= now` and not expired. Notices do not queue SMS or push yet; that comes with the notification wiring.
+
+### Students (reads and edits)
+
+`createStudentService(db)`: `register` (now takes `branchId`, the student joins it as primary), `list({ scope, search, limit, offset })` (scope from `branchScope`, a student in several branches appears once), `get`, `update` (audited with before and after).
+
+`createPromotionService(db)` also has `getRun({ runId })` for the review screen: the run, its items with student names, and counts per decision.
+
 ### Authorization
 
 `authorization.ts`. Functions take a `Db` or `Tx` and a user id; roles and permissions stay data.
@@ -312,6 +367,7 @@ await content.pendingHandovers({ branchId });
 - `requireModule(q, name)` and `gateModule(db, name, service, jobs)` (K). `createExamService` is gated by `online_exams` and `createContentService` by `content_store`; their scheduled jobs return an empty result when the module is off, payment hooks always pass through.
 - Questions belong to the lecturer who created them: `createQuestion` and `updateQuestion` take an `actor` (a user id, or null for a trusted system call) and allow only that lecturer or a root administrator.
 - Parent first sign-in: `findFirstLoginUser({ phone })` finds the guardian login by phone while it has no password (parent_portal on, portal enabled, active), `setInitialPassword` saves the first password once, and `resolveIdentity(...).needsPasswordSetup` tells sign-in to open the set-password form.
+- `authorizeStudent` / `requireStudent` (I2): staff may use a permission on a student through an all-branches assignment or any branch the student belongs to. A student in no branch is reachable only through an all-branches assignment, so registration takes a `branchId`.
 - `createAccessControlService(db)`: `assignRole`, `revokeRole`, `setUserStatus`, `setLecturerPortal`, `listAssignments`. The last active all-branches root admin cannot be revoked or disabled (A7, `last_root_admin`). Role, status and portal changes are audited (J3).
 
 ### Yearly promotion

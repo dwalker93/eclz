@@ -6,6 +6,8 @@ import {
   authorize,
   authorizeAnywhere,
   authorizeResource,
+  authorizeStudent,
+  requireStudent,
   branchScope,
   canAccessStudent,
   createAccessControlService,
@@ -319,5 +321,23 @@ describe("parent first login by phone, then set a password", () => {
     const lec = await id(`INSERT INTO lecturer (full_name, user_id) VALUES ('Lec Parent', $1)`, [u]);
     eq(await acl.findFirstLoginUser({ phone: "0771110003" }), null);
     eq(lec.length > 0, true);
+  });
+});
+
+describe("staff access to one student (I2)", () => {
+  test("an all-branches assignment, or one for a branch the student is in; a student with no branch needs all-branches", async () => {
+    const inB1 = await newStudent([b1]);
+    const inB2 = await newStudent([b2]);
+    const nowhere = await newStudent([]);
+    const mine = await newUser();
+    const all = await newUser();
+    await acl.assignRole({ userId: mine, roleName: "student_counselor", branchId: b1, actor: root });
+    await acl.assignRole({ userId: all, roleName: "student_counselor", actor: root });
+    eq([await authorizeStudent(db, mine, "students.update", inB1), await authorizeStudent(db, mine, "students.update", inB2), await authorizeStudent(db, mine, "students.update", nowhere)], [true, false, false]);
+    eq([await authorizeStudent(db, all, "students.update", inB2), await authorizeStudent(db, all, "students.update", nowhere)], [true, true]);
+    eq(await authorizeStudent(db, mine, "fees.manage", inB1), false);
+    await requireStudent(db, mine, "students.update", inB1);
+    await fails("forbidden", () => requireStudent(db, mine, "students.update", inB2));
+    await fails("not_found", () => requireStudent(db, mine, "students.update", "00000000-0000-0000-0000-000000000000"));
   });
 });

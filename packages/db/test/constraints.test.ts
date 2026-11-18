@@ -1130,3 +1130,48 @@ describe("Gateway transactions", () => {
   test("transactions without a reference yet can coexist", () =>
     q(`INSERT INTO gateway_transaction (payment_id, provider) VALUES ($1, 'payhere')`, [gwPayment]));
 });
+
+describe("Course changes keep enrolments valid (C2) and money is never NaN", () => {
+  const mkCourse = (kind: string, mode: string) =>
+    id(`INSERT INTO course (subject_id, branch_id, name, kind, learning_mode, attendance_enabled) VALUES ($1, $2, $3, $4, $5, $5 = 'scheduled')`, [subj, b1, `chg-${kind}-${mode}-${Math.random()}`, kind, mode]);
+
+  test("a class with an enrolment cannot become a scheduled program (the enrolment has no intake)", async () => {
+    const c = await mkCourse("class", "scheduled");
+    await q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [c, st1]);
+    await rejects(/C2/, () => q(`UPDATE course SET kind = 'program' WHERE id = $1`, [c]));
+  });
+  test("a scheduled program with an intake enrolment cannot become a class or self-paced", async () => {
+    const c = await mkCourse("program", "scheduled");
+    const i = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'I', '2027-03-01')`, [c]);
+    await q(`INSERT INTO enrollment (course_id, student_id, intake_id) VALUES ($1, $2, $3)`, [c, st1, i]);
+    await rejects(/C2/, () => q(`UPDATE course SET learning_mode = 'self_paced' WHERE id = $1`, [c]));
+    await rejects(/C2|course_class_is_scheduled_check/, () => q(`UPDATE course SET kind = 'class' WHERE id = $1`, [c]));
+  });
+  test("a self-paced program with an enrolment cannot become scheduled", async () => {
+    const c = await mkCourse("program", "self_paced");
+    await q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [c, st1]);
+    await rejects(/C2/, () => q(`UPDATE course SET learning_mode = 'scheduled' WHERE id = $1`, [c]));
+  });
+  test("a course without enrolments can change freely, and other updates are not blocked", async () => {
+    const c = await mkCourse("class", "scheduled");
+    await q(`UPDATE course SET kind = 'program' WHERE id = $1`, [c]);
+    const d = await mkCourse("class", "scheduled");
+    await q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [d, st1]);
+    await q(`UPDATE course SET name = 'renamed' WHERE id = $1`, [d]);
+  });
+
+  test("NaN is rejected in a money column", () => rejects(/finite_check/, () =>
+    q(`INSERT INTO fee_rate (fee_structure_id, amount, effective_from) VALUES ($1, 'NaN', '2030-01-01')`, [fee1])));
+
+  test("every numeric column has a NaN check (add one in the migration for any new numeric column)", async () => {
+    const missing = await q(`
+      SELECT c.table_name, c.column_name FROM information_schema.columns c
+      WHERE c.table_schema = 'public' AND c.data_type = 'numeric'
+        AND c.table_name IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public')
+        AND NOT EXISTS (
+          SELECT 1 FROM pg_constraint k
+          WHERE k.conrelid = format('%I.%I', c.table_schema, c.table_name)::regclass AND k.contype = 'c'
+            AND pg_get_constraintdef(k.oid) LIKE '%NaN%' AND pg_get_constraintdef(k.oid) LIKE '%' || c.column_name || '%')`);
+    if (missing.length > 0) throw new Error(`numeric columns without a NaN check: ${missing.map((m) => `${m.table_name}.${m.column_name}`).join(", ")}`);
+  });
+});

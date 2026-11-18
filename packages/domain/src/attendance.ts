@@ -287,3 +287,4 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
     },
   };
 }
+export type AttendanceService = ReturnType<typeof createAttendanceService>;

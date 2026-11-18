@@ -190,6 +190,24 @@ export async function requireResource(q: Q, userId: string, code: PermissionCode
   if (!(await authorizeResource(q, userId, code, resource))) throw new ServiceError("forbidden", `You may not do this (${code}).`);
 }
 
+/**
+ * I2: may this staff user use the permission on this student? An all-branches assignment, or an assignment for any branch the student
+ * belongs to. A student who is in no branch yet can only be reached by an all-branches assignment.
+ */
+export async function authorizeStudent(q: Q, userId: string, code: PermissionCode, studentId: string): Promise<boolean> {
+  const scope = await branchScope(q, userId, code);
+  if (scope === "all") return true;
+  if (scope.length === 0) return false;
+  const [hit] = await q.select({ b: studentBranch.branchId }).from(studentBranch).where(and(eq(studentBranch.studentId, studentId), inArray(studentBranch.branchId, scope))).limit(1);
+  return !!hit;
+}
+
+export async function requireStudent(q: Q, userId: string, code: PermissionCode, studentId: string): Promise<void> {
+  const [s] = await q.select({ id: student.id }).from(student).where(eq(student.id, studentId));
+  if (!s) throw new ServiceError("not_found", "Student not found.");
+  if (!(await authorizeStudent(q, userId, code, studentId))) throw new ServiceError("forbidden", `You may not do this (${code}).`);
+}
+
 // ---- who is this user (A1, A3)
 
 export interface Identity {
