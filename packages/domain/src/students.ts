@@ -1,5 +1,6 @@
-import { and, count, eq, isNull, sql } from "drizzle-orm";
-import { guardian, student, studentGuardian, studentLevel, user, gradeLevel } from "@workspace/db/schema";
+import { and, asc, count, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
+import { branch, enrollment, guardian, student, studentBranch, studentGuardian, studentLevel, user, gradeLevel, STUDENT_STATUSES } from "@workspace/db/schema";
+import { writeAudit } from "./audit";
 import { ageOn } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { normalizeSriLankaPhone } from "./notifications";
@@ -24,7 +25,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
  * the email when it is given and free, and no password (they cannot sign in until invited and a password is set).
  * This is what lets notifications reach a parent, because notifications belong to users.
  */
-async function ensureGuardianLogin(tx: Tx, g: { id: string; userId: string | null; phone: string | null; email: string | null }): Promise<string | null> {
+export async function ensureGuardianLogin(tx: Tx, g: { id: string; userId: string | null; phone: string | null; email: string | null }): Promise<string | null> {
   if (g.userId) return g.userId;
   const phone = g.phone ? normalizeSriLankaPhone(g.phone) : null;
   if (!phone) return null;
@@ -69,6 +70,8 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
       login?: { email?: string; username?: string };
       guardians?: GuardianInput[];
       registeredOn?: string;
+      /** The branch the student joins (primary). Without it the student belongs to no branch until enrolled, so branch staff cannot see them. */
+      branchId?: string;
     }) {
       const fullName = clean(input.fullName);
       if (!fullName) throw new ServiceError("invalid_input", "The student's name is required.");
@@ -86,6 +89,10 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
         if (ageOn(input.dateOfBirth, on) < org.guardianRequiredBelowAge) {
           if (guardians.length === 0) throw new ServiceError("guardian_required", `A student under ${org.guardianRequiredBelowAge} needs a guardian.`);
           if (guardians.some((g) => !clean(g.address))) throw new ServiceError("guardian_required", "A guardian needs an address for a student of this age.");
+        }
+        if (input.branchId) {
+          const [b] = await tx.select({ id: branch.id }).from(branch).where(eq(branch.id, input.branchId));
+          if (!b) throw new ServiceError("not_found", "Branch not found.");
         }
         if (input.gradeLevelId) {
           const [gl] = await tx.select({ id: gradeLevel.id }).from(gradeLevel).where(eq(gradeLevel.id, input.gradeLevelId));
@@ -134,6 +141,7 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
             contactPhone: input.contactPhone ?? null,
           })
           .returning();
+        if (input.branchId) await tx.insert(studentBranch).values({ studentId: stu!.id, branchId: input.branchId, isPrimary: true, joinedOn: on });
         if (input.gradeLevelId) await tx.insert(studentLevel).values({ studentId: stu!.id, gradeLevelId: input.gradeLevelId, fromDate: on });
 
         const linked: { guardianId: string; userId: string | null; created: boolean }[] = [];
@@ -165,6 +173,92 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /**
+     * Students the caller may see, by name, student number or phone. `scope` is `"all"` or the branch ids from `branchScope` (I2): an empty
+     * list returns nothing. A student in several branches appears once.
+     */
+    async list(input: { scope: "all" | string[]; search?: string; limit?: number; offset?: number }) {
+      if (input.scope !== "all" && input.scope.length === 0) return [];
+      const term = input.search?.trim();
+      const like = term ? `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%` : null;
+      const rows = await db
+        .selectDistinct({ id: student.id, studentNo: student.studentNo, fullName: student.fullName, status: student.status, dateOfBirth: student.dateOfBirth })
+        .from(student)
+        .leftJoin(studentBranch, eq(studentBranch.studentId, student.id))
+        .where(
+          and(
+            input.scope === "all" ? undefined : inArray(studentBranch.branchId, input.scope),
+            like ? or(ilike(student.fullName, like), ilike(student.studentNo, like), ilike(student.contactPhone, like)) : undefined,
+          ),
+        )
+        .orderBy(asc(student.fullName), asc(student.id))
+        .limit(Math.min(Math.max(input.limit ?? 50, 1), 200))
+        .offset(Math.max(input.offset ?? 0, 0));
+      return rows;
+    },
+
+    /** One student with guardians, branches and enrolments. The caller has already been checked (see `authorizeStudent`). */
+    async get(input: { studentId: string }) {
+      const [stu] = await db.select().from(student).where(eq(student.id, input.studentId));
+      if (!stu) throw new ServiceError("not_found", "Student not found.");
+      const guardians = await db
+        .select({ id: guardian.id, fullName: guardian.fullName, phone: guardian.phone, address: guardian.address, relationship: studentGuardian.relationship, isPrimary: studentGuardian.isPrimary, portalEnabled: guardian.portalEnabled })
+        .from(studentGuardian)
+        .innerJoin(guardian, eq(guardian.id, studentGuardian.guardianId))
+        .where(eq(studentGuardian.studentId, stu.id))
+        .orderBy(asc(guardian.fullName));
+      const branches = await db.select({ branchId: studentBranch.branchId, isPrimary: studentBranch.isPrimary }).from(studentBranch).where(eq(studentBranch.studentId, stu.id));
+      const enrolments = await db
+        .select({ id: enrollment.id, courseId: enrollment.courseId, status: enrollment.status, accessStatus: enrollment.accessStatus, enrolledOn: enrollment.enrolledOn })
+        .from(enrollment)
+        .where(eq(enrollment.studentId, stu.id))
+        .orderBy(asc(enrollment.enrolledOn), asc(enrollment.id));
+      return { student: stu, guardians, branches, enrolments };
+    },
+
+    /** Edits the basic details. Audited with before and after (J3). Fields left out stay as they are. */
+    async update(input: {
+      studentId: string;
+      actor: string;
+      fullName?: string;
+      dateOfBirth?: string;
+      gender?: string | null;
+      schoolName?: string | null;
+      nic?: string | null;
+      contactEmail?: string | null;
+      contactPhone?: string | null;
+      status?: (typeof STUDENT_STATUSES)[number];
+    }) {
+      return db.transaction(async (tx) => {
+        const [old] = await tx.select().from(student).where(eq(student.id, input.studentId)).for("update");
+        if (!old) throw new ServiceError("not_found", "Student not found.");
+        const patch: Partial<typeof student.$inferInsert> = {};
+        if (input.fullName !== undefined) {
+          if (!clean(input.fullName)) throw new ServiceError("invalid_input", "The student's name is required.");
+          patch.fullName = clean(input.fullName);
+        }
+        if (input.dateOfBirth !== undefined) {
+          if (!DAY.test(input.dateOfBirth)) throw new ServiceError("invalid_input", "Date of birth must be YYYY-MM-DD.");
+          patch.dateOfBirth = input.dateOfBirth;
+        }
+        if (input.status !== undefined) {
+          if (!STUDENT_STATUSES.includes(input.status)) throw new ServiceError("invalid_input", "Unknown status.");
+          patch.status = input.status;
+        }
+        for (const k of ["gender", "schoolName", "nic", "contactEmail", "contactPhone"] as const) if (input[k] !== undefined) patch[k] = input[k];
+        if (Object.keys(patch).length === 0) return old;
+        const [row] = await tx.update(student).set(patch).where(eq(student.id, old.id)).returning();
+        const before: Record<string, unknown> = {};
+        const after: Record<string, unknown> = {};
+        for (const k of Object.keys(patch) as (keyof typeof patch)[]) {
+          before[k] = old[k as keyof typeof old];
+          after[k] = row![k as keyof typeof row];
+        }
+        await writeAudit(tx, { actor: input.actor, action: "student.update", entityType: "student", entityId: old.id, before, after });
+        return row!;
+      });
+    },
+
+    /**
      * Gives a login record to every guardian that has a valid phone number but no user yet (for data that was entered before
      * this rule, or by import). Safe to run again. Returns how many were created or linked and which guardians had no usable phone.
      */
@@ -182,3 +276,4 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
     },
   };
 }
+export type StudentService = ReturnType<typeof createStudentService>;

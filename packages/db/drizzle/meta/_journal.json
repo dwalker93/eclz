@@ -85,6 +85,20 @@
       "when": 1794745578120,
       "tag": "0011_auth_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794831978120,
+      "tag": "0012_reports_permission",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1794918378120,
+      "tag": "0013_course_change_and_finite_money",
+      "breakpoints": true
     }
   ]
 }

@@ -143,6 +143,29 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
       });
     },
 
+    /** A run with its items and student names, for the review screen. Works for a run in any state. */
+    async getRun(input: { runId: string }) {
+      const [run] = await db.select().from(promotionRun).where(eq(promotionRun.id, input.runId));
+      if (!run) throw new ServiceError("not_found", "Promotion run not found.");
+      const items = await db
+        .select({
+          id: promotionItem.id,
+          studentId: promotionItem.studentId,
+          studentName: student.fullName,
+          fromEnrollmentId: promotionItem.fromEnrollmentId,
+          toCourseId: promotionItem.toCourseId,
+          decision: promotionItem.decision,
+          note: promotionItem.note,
+        })
+        .from(promotionItem)
+        .innerJoin(student, eq(student.id, promotionItem.studentId))
+        .where(eq(promotionItem.promotionRunId, run.id))
+        .orderBy(asc(student.fullName), asc(promotionItem.id));
+      const byDecision: Record<Decision, number> = { move: 0, stay: 0, skip: 0, needs_review: 0 };
+      for (const it of items) byDecision[it.decision as Decision]++;
+      return { run, items, byDecision };
+    },
+
     /** B6: the admin changes one item. `move` needs a target class of the same subject (I3). */
     async updateItem(input: { runId: string; itemId: string; decision: Decision; toCourseId?: string | null; note?: string | null }) {
       return db.transaction(async (tx) => {

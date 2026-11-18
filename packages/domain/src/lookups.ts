@@ -1,15 +1,15 @@
 import { and, eq, isNull, lte, or, gt, sql } from "drizzle-orm";
 import { feeRate, organization, studentLevel } from "@workspace/db/schema";
-import type { Tx } from "./types";
+import type { Db, Tx } from "./types";
 import { localDate } from "./dates";
 
-export async function loadOrganization(tx: Tx) {
+export async function loadOrganization(tx: Tx | Db) {
   const [org] = await tx.select().from(organization);
   if (!org) throw new Error("organization is not set up");
   return org;
 }
 
-export async function todayFor(tx: Tx, now: Date): Promise<string> {
+export async function todayFor(tx: Tx | Db, now: Date): Promise<string> {
   return localDate(now, (await loadOrganization(tx)).timezone);
 }
 
