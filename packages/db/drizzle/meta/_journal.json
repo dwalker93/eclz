@@ -78,6 +78,13 @@
       "when": 1794680875694,
       "tag": "0010_exam_lock_answers",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794745578120,
+      "tag": "0011_auth_sessions",
+      "breakpoints": true
     }
   ]
 }

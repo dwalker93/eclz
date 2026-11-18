@@ -11,3 +11,4 @@ export * from "./messaging";
 export * from "./exams";
 export * from "./commissions";
 export * from "./gateway";
+export * from "./auth";

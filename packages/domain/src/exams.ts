@@ -18,6 +18,7 @@ import { accessState } from "./access";
 import { writeAudit, isConstraintError } from "./audit";
 import { loadOrganization, todayFor } from "./lookups";
 import { queueNotifications, resolveRecipients } from "./notifications";
+import { activeLecturerOf, gateModule, isRootAdmin, requireResource } from "./authorization";
 import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
 
@@ -113,7 +114,7 @@ function checkQuestion(input: QuestionInput) {
   if (!(Number(m) > 0)) throw new ServiceError("question_invalid", "Marks must be above zero.");
 }
 
-export function createExamService(db: Db, opts: { now?: () => Date } = {}) {
+function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
 
   async function loadExam(tx: Tx, examId: string, lock = false): Promise<ExamRow> {
@@ -186,9 +187,15 @@ export function createExamService(db: Db, opts: { now?: () => Date } = {}) {
   return {
     // ---- question bank
 
-    async createQuestion(input: QuestionInput & { lecturerId: string }) {
+    /** The question belongs to `lecturerId`. `actor` (a user id) must be that lecturer or a root administrator; null is a trusted system call. */
+    async createQuestion(input: QuestionInput & { lecturerId: string; actor: string | null }) {
       checkQuestion(input);
       return db.transaction(async (tx) => {
+        if (input.actor !== null) {
+          const [l] = await tx.select({ userId: lecturer.userId }).from(lecturer).where(eq(lecturer.id, input.lecturerId));
+          const own = !!l && l.userId === input.actor && !!(await activeLecturerOf(tx, input.actor));
+          if (!own && !(await isRootAdmin(tx, input.actor))) throw new ServiceError("forbidden", "Only the lecturer or a root administrator can add their questions.");
+        }
         const [l] = await tx.select({ id: lecturer.id }).from(lecturer).where(eq(lecturer.id, input.lecturerId));
         if (!l) throw new ServiceError("not_found", "Lecturer not found.");
         const [q] = await tx
@@ -201,9 +208,10 @@ export function createExamService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /** Replaces a question's text and options. Published exams keep their frozen copy (G4); drafts pick the change up at publish. */
-    async updateQuestion(input: QuestionInput & { questionId: string }) {
+    async updateQuestion(input: QuestionInput & { questionId: string; actor: string | null }) {
       checkQuestion(input);
       return db.transaction(async (tx) => {
+        if (input.actor !== null) await requireResource(tx, input.actor, "exams.manage", { type: "question", id: input.questionId });
         const [q] = await tx.select().from(question).where(eq(question.id, input.questionId)).for("update");
         if (!q) throw new ServiceError("not_found", "Question not found.");
         await tx.update(question).set({ body: input.body.trim(), imageFileId: input.imageFileId ?? null, explanation: input.explanation ?? null, defaultMarks: String(input.defaultMarks ?? q.defaultMarks) }).where(eq(question.id, q.id));
@@ -611,3 +619,12 @@ export function createExamService(db: Db, opts: { now?: () => Date } = {}) {
     },
   };
 }
+
+/** K: every exam action needs the online_exams module. The two scheduled jobs skip quietly when it is off. */
+export function createExamService(db: Db, opts: { now?: () => Date } = {}) {
+  return gateModule(db, "online_exams", buildExamService(db, opts), {
+    finalizeExpiredAttempts: 0,
+    runReleaseJob: () => ({ closed: 0, released: 0, errors: [] as { examId: string; message: string }[] }),
+  });
+}
+export type ExamService = ReturnType<typeof buildExamService>;

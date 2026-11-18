@@ -51,7 +51,22 @@ export type ServiceErrorCode =
   | "attempt_limit_reached"
   | "attempt_not_running"
   | "attempt_time_over"
-  | "answer_locked";
+  | "answer_locked"
+  | "content_invalid"
+  | "content_not_accessible"
+  | "already_purchased"
+  | "purchase_not_paid"
+  | "already_handed_over"
+  | "forbidden"
+  | "last_root_admin"
+  | "unauthenticated"
+  | "invalid_credentials"
+  | "rate_limited"
+  | "weak_password"
+  | "invalid_code"
+  | "mfa_required"
+  | "mfa_setup_required"
+  | "password_setup_required";
 
 /** A rule of the business was broken. The message is safe to show to staff. */
 export class ServiceError extends Error {

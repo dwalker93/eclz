@@ -274,6 +274,46 @@ await exams.finalizeExpiredAttempts();  // every few minutes
 - G8: results are released only for a closed exam. An online exam past its closing time is closed first. A paper exam must be closed by hand. After release, `enterMarks` (paper) and `overrideResult` (online, sets `manual_override`) need a reason and write an audit row (J3).
 - G9: `immediate` shows the score as soon as it exists, marked provisional until released; `after_release` and `manual` show nothing until released. The release job releases `immediate` and `after_release` exams after they close; `manual` ones wait for `releaseResults`.
 
+### Content
+
+```ts
+import { createContentService, createPaymentService, combineHooks } from "@workspace/domain";
+const content = createContentService(db);
+const payments = createPaymentService(db, { signer, hooks: combineHooks(commissions.hooks, access.hooks, content.hooks) });
+
+const item = await content.createItem({ lecturerId, kind: "recording", title: "Lesson 1", externalUrl: "https://youtu.be/...", accessType: "paid", price: 500, branchIds });
+await content.setStatus({ contentId: item.id, status: "published" });
+await content.attachToCourse({ courseId, contentId: item.id, sectionId });
+
+await content.listForStudent({ studentId });                  // { available, store, purchases }, no links
+await content.openContent({ studentId, contentId });          // the link or file id, only when F3 allows it
+const { invoiceId } = await content.purchase({ contentId, studentId, branchId });   // pending purchase plus its invoice
+await content.handOver({ purchaseId, handedOverBy: staffUserId });                  // physical books, after payment
+await content.pendingHandovers({ branchId });
+```
+
+- F1, F2: a recording needs a web link, a file item needs an uploaded file, a physical book has neither and can only be sold. Only paid items have a price (above zero). Paid and free-for-registered items must be listed in at least one branch. Items start as drafts; draft, published and archived move as `setStatus` allows.
+- F3: `canViewContent` / `openContent` decide in one place. A student can open a published item that is in a course where they have effective access (C8), or a `free_registered` item listed in a branch they belong to, or an item they have bought. Drafts and archived items close for course and free access. A physical book can never be opened.
+- F4: a purchase makes a pending purchase and one invoice with a single `content` line (price copied from the item, due 7 days after issue by default, D13 branch rules apply). Pending grants nothing. When the invoice is fully paid (through the normal slip, verify and receipt flow) `content.hooks` turn the purchase `paid`, which is permanent: archiving the item later does not take it away.
+- Voiding the payment turns a digital purchase back to `pending` and closes access. A physical item that was already handed over stays `paid` (the record of the handover is kept) while the invoice shows the money owed again; staff resolve it.
+- F5: one pending or paid purchase per student and item. Asking again while one is pending returns it (`existing: true`); once paid, `already_purchased`. A cancelled purchase can be bought again with a new invoice.
+- `cancelPurchase` cancels a pending purchase and its invoice, and is refused once any payment is allocated.
+- F6: physical books use channel `physical`, digital items `online`. `handOver` needs a paid purchase, records who and when, and can happen once. Payment and handover are separate events.
+- Overdue handling is unchanged: an unpaid content-only invoice gets the overdue label and notice but never restricts class access (C9).
+
+### Authorization
+
+`authorization.ts`. Functions take a `Db` or `Tx` and a user id; roles and permissions stay data.
+
+- `authorize(q, userId, code, { branchId })`: A6. An assignment for that branch or for all branches counts. With no branch given only an all-branches assignment counts. A disabled user holds nothing. The built-in `lecturer` role never grants a branch-wide permission.
+- `requirePermission` throws `forbidden`. `authorizeAnywhere` and `branchScope` (`"all"` or a branch list) serve menus and scoped reads (I2).
+- `authorizeResource` / `requireResource` (A5): staff covering the resource's branch, or the lecturer who owns the course, content, exam or question, with the `lecturer` role, portal on and the lecturer_portal module on.
+- `resolveIdentity` (A1, A3): staff roles, lecturer, student, guardian and which portals are open. `canAccessStudent`: the student, a linked guardian (parent_portal on), or staff with `students.read` in the student's branch.
+- `requireModule(q, name)` and `gateModule(db, name, service, jobs)` (K). `createExamService` is gated by `online_exams` and `createContentService` by `content_store`; their scheduled jobs return an empty result when the module is off, payment hooks always pass through.
+- Questions belong to the lecturer who created them: `createQuestion` and `updateQuestion` take an `actor` (a user id, or null for a trusted system call) and allow only that lecturer or a root administrator.
+- Parent first sign-in: `findFirstLoginUser({ phone })` finds the guardian login by phone while it has no password (parent_portal on, portal enabled, active), `setInitialPassword` saves the first password once, and `resolveIdentity(...).needsPasswordSetup` tells sign-in to open the set-password form.
+- `createAccessControlService(db)`: `assignRole`, `revokeRole`, `setUserStatus`, `setLecturerPortal`, `listAssignments`. The last active all-branches root admin cannot be revoked or disabled (A7, `last_root_admin`). Role, status and portal changes are audited (J3).
+
 ### Yearly promotion
 
 ```ts
@@ -304,7 +344,7 @@ Behaviour to know:
 - A draft goes stale if an enrolment in it ends before confirm (`promotion_stale`). Discard it and build a new one.
 - Nothing stops two drafts existing at once. Confirm the one you want and discard the other.
 
-Not yet built: content access, and a scheduled worker that calls `runOverdueJob()`, `runDueSoonJob()` and `dispatchQueued()` on a timer.
+Sign-in itself is in `@workspace/auth` (`packages/auth`). Not yet built: the gateway webhook, and a scheduled worker that calls `runOverdueJob()`, `runDueSoonJob()` and `dispatchQueued()` on a timer.
 
 ## Tests
 
@@ -324,6 +364,8 @@ No test needs a server or a connection string.
 | `attendance.test.ts` | scenario | sessions, roster, marking and corrections, QR, absence notices, summaries |
 | `students.test.ts` | scenario | B1, B2: registration, guardian logins, sibling linking, numbering, end-to-end absence notice |
 | `exams.test.ts` | scenario | G rules: snapshots, attempts, grading, results, release, paper marks, overrides |
+| `authorization.test.ts` | scenario | A5 to A7, K: branch scope, lecturer ownership, portals, last root admin, module switches |
+| `content.test.ts` | scenario | F rules: items, who can open what, purchases through payment and void, physical handover |
 | `server-only.test.ts` | boundary | the `browser` condition blocks the client bundle and leaves server bundles alone |
 
 Most scenario files tell one story in order (a later test relies on the rows an earlier one left), so run a file whole rather than a single test.

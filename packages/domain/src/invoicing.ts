@@ -28,7 +28,7 @@ import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
 
 export interface DraftItem {
-  kind: "recurring_fee" | "package_fee" | "adjustment" | "discount";
+  kind: "recurring_fee" | "package_fee" | "content" | "adjustment" | "discount";
   cents: number;
   description?: string;
   enrollmentId?: string;
@@ -39,6 +39,8 @@ export interface DraftItem {
   /** Index of the earlier draft item this discount or negative adjustment applies to (D23). */
   appliesToIndex?: number;
   feeExceptionId?: string;
+  /** Content items point at the purchase they bill (D13). */
+  contentPurchaseId?: string;
 }
 
 /**
@@ -55,6 +57,8 @@ export async function insertInvoice(
     items: DraftItem[];
     installmentOptionId?: string | null;
     installments?: ScheduledInstallment[];
+    /** Runs after the invoice row exists and before its items, for links the items' foreign keys need (a content purchase's invoice). */
+    afterHeader?: (invoiceId: string) => Promise<void>;
   },
 ) {
   const total = o.items.reduce((s, i) => s + i.cents, 0);
@@ -73,6 +77,7 @@ export async function insertInvoice(
       status: total === 0 ? "waived" : "pending",
     })
     .returning();
+  await o.afterHeader?.(inv!.id);
   const ids: string[] = [];
   for (const it of o.items) {
     const [row] = await tx
@@ -89,6 +94,7 @@ export async function insertInvoice(
         periodEnd: it.periodEnd ?? null,
         appliesToItemId: it.appliesToIndex === undefined ? null : ids[it.appliesToIndex]!,
         feeExceptionId: it.feeExceptionId ?? null,
+        contentPurchaseId: it.contentPurchaseId ?? null,
       })
       .returning();
     ids.push(row!.id);

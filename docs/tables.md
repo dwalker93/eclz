@@ -1,4 +1,4 @@
-# Table guide (69 tables)
+# Table guide (72 tables)
 
 What each table stores, grouped by area. "Phase" is the build phase that added it. Almost every table has an `id` (uuid) and many have `created_at`, which are not repeated below.
 
@@ -130,6 +130,14 @@ What each table stores, grouped by area. "Phase" is the build phase that added i
 | Table | What it stores |
 |---|---|
 | `gateway_transaction` | An online payment attempt for a payment made through the gateway: provider, the provider's reference, status, and the raw callback data. |
+
+## 13. Sign-in (auth)
+
+| Table | What it stores |
+|---|---|
+| `auth_session` | A signed-in browser or device: a hash of the session token (never the token), expiry, last use, when the second step was passed, address and browser. |
+| `user_two_factor` | A user's authenticator-app setup: the secret (encrypted), when it was turned on, and hashes of the unused recovery codes. |
+| `auth_rate_limit` | Attempt counters for sign-in, first login and code entry, one row per key and time window. |
 
 ## How the main flow connects
 

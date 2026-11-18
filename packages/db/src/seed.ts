@@ -31,6 +31,13 @@ export const STARTER_PERMISSIONS = [
   "content.manage",
   "notices.manage",
   "notifications.manage",
+  "lecturers.manage",
+  "exams.manage",
+  "exams.release",
+  "payments.void",
+  "payouts.manage",
+  "commissions.manage",
+  "content.handover",
 ] as const;
 
 /** Built-in roles. Custom roles can be added later as data. root_admin gets every permission. */
@@ -47,6 +54,7 @@ export const STARTER_ROLES: Record<string, { description: string; permissions: r
       "attendance.read",
       "invoices.read",
       "notices.manage",
+      "content.handover",
     ],
   },
   payment_handler: {
@@ -59,7 +67,7 @@ export const STARTER_ROLES: Record<string, { description: string; permissions: r
   },
   lecturer: {
     description: "Teacher. Always limited to their own courses, content and exams in application code (A5)",
-    permissions: ["students.read", "attendance.read", "attendance.mark", "content.manage", "notices.manage"],
+    permissions: ["students.read", "attendance.read", "attendance.mark", "content.manage", "notices.manage", "exams.manage"],
   },
 };
 
