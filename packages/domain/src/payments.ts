@@ -9,7 +9,7 @@ import {
   paymentMethod,
   receipt,
 } from "@workspace/db/schema";
-import { planAllocation, type PlannedAllocation } from "./allocation";
+import { linkedTotals, planAllocation, type PlannedAllocation } from "./allocation";
 import { refreshInvoiceCaches } from "./invoices";
 import { todayFor } from "./lookups";
 import { fromCents, toCents } from "@workspace/db/money";
@@ -168,13 +168,11 @@ async function loadOpenItems(tx: Tx, p: PaymentRow, invoiceIds: string[] | undef
     .groupBy(paymentAllocation.invoiceItemId);
   const paidBy = new Map(allocated.map((a) => [a.itemId, toCents(a.total)]));
 
-  const applied = new Map<string, number>();
-  for (const it of items) {
-    if (it.appliesToItemId) applied.set(it.appliesToItemId, (applied.get(it.appliesToItemId) ?? 0) + toCents(it.amount));
-  }
+  // Lines linked to an item (discounts, reductions, positive adjustments) change that item's net and are not payable items of their own.
+  const applied = linkedTotals(items.map((i) => ({ id: i.id, cents: toCents(i.amount), appliesToItemId: i.appliesToItemId })));
   const open: OpenItem[] = [];
   for (const it of items) {
-    const payable = (PAYABLE_KINDS as readonly string[]).includes(it.kind) && toCents(it.amount) > 0;
+    const payable = (PAYABLE_KINDS as readonly string[]).includes(it.kind) && toCents(it.amount) > 0 && !it.appliesToItemId;
     if (!payable) continue;
     const net = toCents(it.amount) + (applied.get(it.id) ?? 0);
     const outstanding = net - (paidBy.get(it.id) ?? 0);

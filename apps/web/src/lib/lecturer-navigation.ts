@@ -19,36 +19,74 @@ import type { PortalNavGroup } from "@/lib/student-navigation"
 
 /**
  * Planned lecturer portal destinations from the public portal guide. The
- * dashboard and My Courses pages are implemented; every other item is an
- * intentionally disabled placeholder. My Earnings appears only when the
- * commissions module is enabled in the local demo fixtures.
+ * dashboard, My Courses, Timetable & Sessions, Attendance, Learning Materials,
+ * Exams, Question Bank, Results, Notices, Messages, My Earnings and My Profile
+ * pages are implemented; every other item is an intentionally disabled
+ * placeholder. My Earnings appears only when the commissions module is enabled
+ * in the local demo fixtures.
  */
 const teachingGroup: PortalNavGroup = {
   label: "Teaching",
   items: [
-    { title: "My Courses", icon: BookOpenIcon, url: "/portal/lecturer/courses" },
+    {
+      title: "My Courses",
+      icon: BookOpenIcon,
+      url: "/portal/lecturer/courses",
+    },
     {
       title: "Timetable & Sessions",
       icon: CalendarClockIcon,
       url: "/portal/lecturer/timetable",
     },
-    { title: "Attendance", icon: ClipboardCheckIcon, disabled: true },
-    { title: "Learning Materials", icon: FolderOpenIcon, disabled: true },
+    {
+      title: "Attendance",
+      icon: ClipboardCheckIcon,
+      url: "/portal/lecturer/attendance",
+    },
+    {
+      title: "Learning Materials",
+      icon: FolderOpenIcon,
+      url: "/portal/lecturer/materials",
+    },
   ],
 }
 
 const assessmentGroup: PortalNavGroup = {
   label: "Assessment",
   items: [
-    { title: "Exams", icon: FileCheck2Icon, disabled: true },
-    { title: "Question Bank", icon: ListChecksIcon, disabled: true },
-    { title: "Results", icon: AwardIcon, disabled: true },
+    {
+      title: "Exams",
+      icon: FileCheck2Icon,
+      url: "/portal/lecturer/exams",
+    },
+    lecturerModules.onlineExams
+      ? {
+          title: "Question Bank",
+          icon: ListChecksIcon,
+          url: "/portal/lecturer/questions",
+        }
+      : {
+          title: "Question Bank",
+          icon: ListChecksIcon,
+          disabled: true,
+        },
+    {
+      title: "Results",
+      icon: AwardIcon,
+      url: "/portal/lecturer/results",
+    },
   ],
 }
 
 const accountGroup: PortalNavGroup = {
   label: "Account",
-  items: [{ title: "My Profile", icon: UserRoundIcon, disabled: true }],
+  items: [
+    {
+      title: "My Profile",
+      icon: UserRoundIcon,
+      url: "/portal/lecturer/profile",
+    },
+  ],
 }
 
 export const lecturerNav: PortalNavGroup[] = [
@@ -60,8 +98,16 @@ export const lecturerNav: PortalNavGroup[] = [
   {
     label: "Communication",
     items: [
-      { title: "Notices", icon: MegaphoneIcon, disabled: true },
-      { title: "Messages", icon: MessagesSquareIcon, disabled: true },
+      {
+        title: "Notices",
+        icon: MegaphoneIcon,
+        url: "/portal/lecturer/notices",
+      },
+      {
+        title: "Messages",
+        icon: MessagesSquareIcon,
+        url: "/portal/lecturer/messages",
+      },
       { title: "Notifications", icon: BellIcon, disabled: true },
     ],
   },
@@ -69,7 +115,13 @@ export const lecturerNav: PortalNavGroup[] = [
     ? [
         {
           label: "Earnings",
-          items: [{ title: "My Earnings", icon: HandCoinsIcon, disabled: true }],
+          items: [
+            {
+              title: "My Earnings",
+              icon: HandCoinsIcon,
+              url: "/portal/lecturer/earnings",
+            },
+          ],
         } satisfies PortalNavGroup,
       ]
     : []),

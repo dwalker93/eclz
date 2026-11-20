@@ -99,6 +99,76 @@
       "when": 1794918378120,
       "tag": "0013_course_change_and_finite_money",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1795099855401,
+      "tag": "0014_discount_exception_enrollment",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1795100058671,
+      "tag": "0015_message_thread_cascade",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1795100239178,
+      "tag": "0016_exam_guard_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1795118437018,
+      "tag": "0017_validate_invoice_item_constraints",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1795118611829,
+      "tag": "0018_phase4_guard_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1795118821584,
+      "tag": "0019_gateway_parent_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1795118918274,
+      "tag": "0020_payout_signed_totals",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1795118926895,
+      "tag": "0021_validate_payout_amounts_check",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1795119104601,
+      "tag": "0022_content_purchase_paid_invoice",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1795119117670,
+      "tag": "0023_validate_content_purchase_paid_invoice",
+      "breakpoints": true
     }
   ]
 }

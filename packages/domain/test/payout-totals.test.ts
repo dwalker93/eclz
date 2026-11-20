@@ -18,8 +18,10 @@ describe("payout totals (pure functions)", () => {
     eq(payoutBlocker(summarizeEntries([])), "no_entries");
     eq(payoutBlocker(summarizeEntries([e("-100.00", "-10.00", "-90.00")])), "net_not_positive");
     eq(payoutBlocker(summarizeEntries([e("0.00", "0.00", "0.00")])), "net_not_positive");
-    // net is positive, but the commission total would be negative, which the table cannot hold
-    eq(payoutBlocker(summarizeEntries([e("-100.00", "-50.00", "-50.00"), e("60.00", "0.00", "60.00")])), "reversal_heavy");
+    // net is positive while the gross and commission totals are negative (a reversal of 1000/900/100 plus a new accrual of 500/0/500)
+    const heavy = summarizeEntries([e("-1000.00", "-900.00", "-100.00"), e("500.00", "0.00", "500.00")]);
+    eq([heavy.gross, heavy.commission, heavy.net], [-50000, -90000, 40000]);
+    eq(payoutBlocker(heavy), null);
   });
 
 });

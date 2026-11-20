@@ -350,6 +350,17 @@ export const invoiceItem = pgTable(
       columns: [t.appliesToItemId, t.invoiceId],
       foreignColumns: [t.id, t.invoiceId],
     }),
+    // A discount's exception belongs to the enrolment of the item it reduces: this key binds the exception to the line's enrolment_id,
+    // and the invoice_item_discount_enrollment trigger (0014) binds that enrolment_id to the applied-to item's.
+    foreignKey({
+      name: "invoice_item_exception_enrollment_fk",
+      columns: [t.feeExceptionId, t.enrollmentId],
+      foreignColumns: [feeException.id, feeException.enrollmentId],
+    }),
+    check(
+      "invoice_item_exception_enrollment_check",
+      sql`${t.feeExceptionId} IS NULL OR ${t.enrollmentId} IS NOT NULL`,
+    ),
     foreignKey({
       name: "invoice_item_purchase_invoice_fk",
       columns: [t.contentPurchaseId, t.invoiceId],

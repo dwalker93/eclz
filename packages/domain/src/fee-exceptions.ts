@@ -44,6 +44,12 @@ export function createFeeExceptionService(db: Db, opts: { now?: () => Date } = {
             throw new ServiceError("exception_invalid", "The alternate option must be an active option of the same class.");
           }
           if (alt.billingType !== "recurring") throw new ServiceError("exception_invalid", "The alternate option must be a recurring fee.");
+          // Periods are built from the enrolled option, so the alternate must bill on the same cycle (monthly or per term).
+          const [base] = enr.feeStructureId ? await tx.select().from(feeStructure).where(eq(feeStructure.id, enr.feeStructureId)) : [];
+          if (!base) throw new ServiceError("exception_invalid", "The enrolment has no fee option for an alternate to replace.");
+          if (alt.frequency !== base.frequency) {
+            throw new ServiceError("exception_invalid", "The alternate option must bill on the same cycle (monthly or per term) as the enrolled fee option.");
+          }
         } else {
           if (!input.discountType || input.discountValue === undefined || input.alternateFeeStructureId) {
             throw new ServiceError("exception_invalid", "A discount needs a type and a value.");

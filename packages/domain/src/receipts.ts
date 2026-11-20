@@ -120,5 +120,7 @@ export async function verifyReceipt(db: Db, verificationCode: string, signer: Re
   const payload = await buildPayload(db, r.paymentId, r.receiptNo);
   if (sha256(canonicalize(payload)) !== r.contentHash) return { valid: false, reason: "tampered" };
   if (!(await signer.verify(r.contentHash, r.signature))) return { valid: false, reason: "bad_signature" };
+  // The branch on the receipt row is not part of the signed data unless it matches the payload's, which comes from the payment.
+  if (r.branchId !== payload.branchId) return { valid: false, reason: "tampered" };
   return { valid: true, receiptNo: r.receiptNo, branchId: r.branchId, amount: payload.amount, verifiedAt: payload.verifiedAt, issuedAt: r.issuedAt };
 }

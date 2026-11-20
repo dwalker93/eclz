@@ -211,6 +211,10 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
               failures.push({ enrollmentId: enr.id, periodStart: period.start, code: "fee_structure_invalid", message: "The alternate fee option is not a recurring fee." });
               continue;
             }
+            if (used.frequency !== structure.frequency) {
+              failures.push({ enrollmentId: enr.id, periodStart: period.start, code: "fee_structure_invalid", message: "The alternate fee option bills on a different cycle than the enrolled option. Nothing was billed." });
+              continue;
+            }
             const gradeId = enr.billingGradeLevelId ?? (await gradeOn(tx, enr.studentId, period.start));
             const rate = await rateFor(tx, used.id, gradeId, period.start);
             if (rate === null) {
@@ -236,7 +240,7 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
             if (disc?.discountType && disc.discountValue !== null) {
               const off = discountCents(base, disc.discountType as "percent" | "fixed", disc.discountValue);
               if (off > 0) {
-                grp.items.push({ kind: "discount", cents: -off, description: `Discount: ${disc.reason}`, appliesToIndex: feeIndex, feeExceptionId: disc.id });
+                grp.items.push({ kind: "discount", cents: -off, description: `Discount: ${disc.reason}`, appliesToIndex: feeIndex, enrollmentId: enr.id, feeExceptionId: disc.id });
               }
             }
             grp.periodStarts.push(period.start);
@@ -248,17 +252,50 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
 
       const invoicesCreated: GenerationReport["invoicesCreated"] = [];
       for (const grp of groups.values()) {
-        try {
-          const created = await db.transaction((tx) =>
-            insertInvoice(tx, { studentId: grp.studentId, branchId: grp.branchId, issuedOn: today, dueDate: grp.dueDate, items: grp.items }),
-          );
-          invoicesCreated.push({ invoiceId: created.invoice.id, studentId: grp.studentId, branchId: grp.branchId, periodStarts: grp.periodStarts });
-        } catch (err) {
-          if (isConstraintError(err, "invoice_item_recurring_uq")) {
-            alreadyInvoiced += grp.periodStarts.length;
-            continue;
+        let items = grp.items;
+        // Another run may bill some of this group's periods first. The group's transaction then rolls back whole, so drop the periods that are now
+        // billed (counting them as already invoiced) and insert the rest, instead of treating the whole group as billed.
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const created = await db.transaction((tx) =>
+              insertInvoice(tx, { studentId: grp.studentId, branchId: grp.branchId, issuedOn: today, dueDate: grp.dueDate, items }),
+            );
+            invoicesCreated.push({
+              invoiceId: created.invoice.id,
+              studentId: grp.studentId,
+              branchId: grp.branchId,
+              periodStarts: items.filter((i) => i.kind === "recurring_fee").map((i) => i.periodStart!),
+            });
+            break;
+          } catch (err) {
+            if (!isConstraintError(err, "invoice_item_recurring_uq") || attempt >= 3) throw err;
+            const billed = await db
+              .select({ enrollmentId: invoiceItem.enrollmentId, periodStart: invoiceItem.periodStart })
+              .from(invoiceItem)
+              .where(
+                and(
+                  inArray(invoiceItem.enrollmentId, [...new Set(items.filter((i) => i.kind === "recurring_fee").map((i) => i.enrollmentId!))]),
+                  eq(invoiceItem.kind, "recurring_fee"),
+                  isNull(invoiceItem.cancelledAt),
+                ),
+              );
+            const billedKeys = new Set(billed.map((b) => `${b.enrollmentId}|${b.periodStart}`));
+            const keep = items.map((i) => i.kind !== "recurring_fee" || !billedKeys.has(`${i.enrollmentId}|${i.periodStart}`));
+            const dropped = items.filter((i, k) => i.kind === "recurring_fee" && !keep[k]).length;
+            if (dropped === 0) throw err; // nothing explains the conflict: do not loop
+            alreadyInvoiced += dropped;
+            // A discount goes with its fee line, and the links between lines are renumbered.
+            const keepAll = items.map((i, k) => (i.appliesToIndex !== undefined ? keep[i.appliesToIndex]! : keep[k]!));
+            const newIndex = new Map<number, number>();
+            const next: DraftItem[] = [];
+            items.forEach((i, k) => {
+              if (!keepAll[k]) return;
+              newIndex.set(k, next.length);
+              next.push({ ...i, appliesToIndex: i.appliesToIndex === undefined ? undefined : newIndex.get(i.appliesToIndex) });
+            });
+            if (next.length === 0) break;
+            items = next;
           }
-          throw err;
         }
       }
       return { asOf: today, invoicesCreated, alreadyInvoiced, failures };
@@ -338,6 +375,13 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
           const open = installments.filter((i) => toCents(i.amountPaid) < toCents(i.amount));
           const remaining = total - settled.reduce((s, i) => s + toCents(i.amount), 0);
           if (remaining < 0) throw new ServiceError("total_below_paid", "That would put the total below the installments already paid.");
+          if (open.length === 0 && remaining > 0) {
+            // Every installment is paid and the invoice grew: the new balance gets its own installment, so the schedule still adds up to the total.
+            const last = installments[installments.length - 1]!;
+            const today = await todayFor(tx, now());
+            const due = [last.dueDate, addDays(today, 7)].sort().reverse()[0]!;
+            await tx.insert(invoiceInstallment).values({ invoiceId: inv.id, seq: last.seq + 1, dueDate: due, amount: fromCents(remaining) });
+          }
           if (open.length > 0) {
             if (remaining === 0) {
               await tx.delete(invoiceInstallment).where(inArray(invoiceInstallment.id, open.map((i) => i.id)));

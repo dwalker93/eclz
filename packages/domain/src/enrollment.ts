@@ -26,12 +26,16 @@ export interface EnrollInput {
   actorUserId?: string;
 }
 
-/** D1: the fee option for a new enrolment: the one given, else the default (an intake default first), else the only active one. */
+/**
+ * D1, D12: the fee option for a new enrolment: the one given, else the default (an intake default first), else the only active one.
+ * Returns null for a free course, one that has no fee structure at all (a free enrolment has no fee structure and is never invoiced).
+ * A course that has fee structures but no usable default, or several to choose from, still needs a choice (`fee_structure_required`).
+ */
 export async function resolveFeeStructure(
   tx: Tx,
   c: { id: string },
   input: { feeStructureId?: string | null; intakeId?: string | null },
-) {
+): Promise<typeof feeStructure.$inferSelect | null> {
   const forCourse = and(eq(feeStructure.courseId, c.id), eq(feeStructure.isActive, true));
   const usable = (s: typeof feeStructure.$inferSelect) => !s.intakeId || s.intakeId === (input.intakeId ?? null);
   if (input.feeStructureId) {
@@ -45,14 +49,24 @@ export async function resolveFeeStructure(
   const defaults = all.filter((s) => s.isDefault);
   // An intake-specific default wins over the course-wide one.
   const pick = defaults.find((s) => s.intakeId) ?? defaults[0] ?? (all.length === 1 ? all[0] : undefined);
-  if (!pick) throw new ServiceError("fee_structure_required", "Choose a fee option: this course has no default.");
-  return pick;
+  if (pick) return pick;
+  // No fee structure of any kind (active or not, for any intake): the course is free.
+  const [anyStructure] = await tx.select({ id: feeStructure.id }).from(feeStructure).where(eq(feeStructure.courseId, c.id)).limit(1);
+  if (!anyStructure) return null;
+  throw new ServiceError("fee_structure_required", "Choose a fee option: this course has no default.");
 }
 
-/** B7: the student belongs to the course's branch. The first branch they get is the primary one. */
+/**
+ * B7: the student belongs to the course's branch. The first branch they get is the primary one.
+ * Locks the student row first, so two concurrent writers for one student (different courses, so different course locks) cannot both see no
+ * membership and both insert a primary one. The conflict target is the (student, branch) pair, so only a repeat of the same membership is skipped
+ * and a primary-index conflict would still raise.
+ */
 export async function ensureStudentBranch(tx: Tx, studentId: string, branchId: string, joinedOn: string) {
+  await tx.select({ id: student.id }).from(student).where(eq(student.id, studentId)).for("update");
   const [anyBranch] = await tx.select({ b: studentBranch.branchId }).from(studentBranch).where(eq(studentBranch.studentId, studentId));
-  await tx.insert(studentBranch).values({ studentId, branchId, isPrimary: !anyBranch, joinedOn }).onConflictDoNothing();
+  await tx.insert(studentBranch).values({ studentId, branchId, isPrimary: !anyBranch, joinedOn })
+    .onConflictDoNothing({ target: [studentBranch.studentId, studentBranch.branchId] });
 }
 
 export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {}) {
@@ -107,7 +121,8 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
             .where(and(eq(enrollment.courseId, c.id), eq(enrollment.status, "active"), intakeId ? eq(enrollment.intakeId, intakeId) : sql`true`));
           return r!.n;
         };
-        if (c.capacity !== null && (await count()) >= c.capacity) throw new ServiceError("capacity_full", "This course is full.");
+        // The course-wide limit applies only to an enrolment without an intake; with an intake, the intake's own capacity decides.
+        if (!it && c.capacity !== null && (await count()) >= c.capacity) throw new ServiceError("capacity_full", "This course is full.");
         if (it?.capacity != null && (await count(it.id)) >= it.capacity) throw new ServiceError("capacity_full", "This intake is full.");
 
         // C6: grade eligibility.
@@ -126,11 +141,11 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
         }
 
         const structure = await resolveFeeStructure(tx, c, input);
-        const isPackage = structure.billingType === "one_time_package";
+        const isPackage = structure?.billingType === "one_time_package";
         if (input.installmentOptionId && !isPackage) {
           throw new ServiceError("invalid_input", "Installments are only for one-time packages.");
         }
-        const accessEnds = isPackage && structure.accessDurationMonths ? addMonths(today, structure.accessDurationMonths) : null;
+        const accessEnds = structure && isPackage && structure.accessDurationMonths ? addMonths(today, structure.accessDurationMonths) : null;
 
         const [enr] = await tx
           .insert(enrollment)
@@ -138,7 +153,7 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
             courseId: c.id,
             studentId: s.id,
             intakeId: it?.id ?? null,
-            feeStructureId: structure.id,
+            feeStructureId: structure?.id ?? null,
             billingGradeLevelId: input.billingGradeLevelId ?? null,
             preferredMode: input.preferredMode ?? null,
             promotedFromEnrollmentId: input.promotedFromEnrollmentId ?? null,
@@ -157,7 +172,7 @@ export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {})
         await ensureStudentBranch(tx, s.id, c.branchId, today);
 
         let invoiceId: string | null = null;
-        if (isPackage) {
+        if (structure && isPackage) {
           const billingGrade = enr!.billingGradeLevelId ?? grade;
           const rate = await rateFor(tx, structure.id, billingGrade, today);
           if (rate === null) throw new ServiceError("rate_missing", `No fee rate for ${structure.name} today. The enrolment was not created.`);
