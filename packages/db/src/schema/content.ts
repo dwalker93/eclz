@@ -163,6 +163,8 @@ export const contentPurchase = pgTable(
     oneOf("content_purchase_channel_check", t.channel, PURCHASE_CHANNELS),
     oneOf("content_purchase_status_check", t.status, PURCHASE_STATUSES),
     check("content_purchase_price_check", sql`${t.price} > 0`),
+    // A purchase is paid only through its invoice, so a paid row always has one (billing record).
+    check("content_purchase_paid_invoice_check", sql`${t.status} <> 'paid' OR ${t.invoiceId} IS NOT NULL`),
     // F6: handover needs a paid physical purchase and records who handed it over.
     check(
       "content_purchase_handover_check",

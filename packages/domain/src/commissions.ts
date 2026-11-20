@@ -1,5 +1,6 @@
 import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { commissionEntry, commissionRule, course, courseLecturer, enrollment, invoiceItem, paymentAllocation } from "@workspace/db/schema";
+import { linkedTotals } from "./allocation";
 import { percentOf } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { fromCents, toCents } from "@workspace/db/money";
@@ -94,11 +95,11 @@ export function createCommissionService(opts: { now?: () => Date } = {}) {
 
       // Net amount of the item after the discounts and reductions that apply to it.
       const list = toCents(item.amount);
-      const reductions = await tx
-        .select({ amount: invoiceItem.amount })
+      const invoiceLines = await tx
+        .select({ id: invoiceItem.id, amount: invoiceItem.amount, appliesToItemId: invoiceItem.appliesToItemId })
         .from(invoiceItem)
-        .where(and(eq(invoiceItem.appliesToItemId, item.id), isNull(invoiceItem.cancelledAt)));
-      const net = list + reductions.reduce((s, r) => s + toCents(r.amount), 0);
+        .where(and(eq(invoiceItem.invoiceId, item.invoiceId), isNull(invoiceItem.cancelledAt)));
+      const net = list + (linkedTotals(invoiceLines.map((l) => ({ id: l.id, cents: toCents(l.amount), appliesToItemId: l.appliesToItemId }))).get(item.id) ?? 0);
       const allocated = toCents(alloc.amount);
       if (net <= 0) {
         summary.skipped.push({ allocationId: alloc.id, reason: "no_net_amount" });

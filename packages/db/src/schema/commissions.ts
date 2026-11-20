@@ -96,7 +96,8 @@ export const teacherPayout = pgTable(
     check("teacher_payout_period_check", sql`${t.periodEnd} > ${t.periodStart}`),
     check(
       "teacher_payout_amounts_check",
-      sql`${t.grossCollected} >= 0 AND ${t.commissionTotal} >= 0 AND ${t.netPayable} >= 0 AND ${t.netPayable} = ${t.grossCollected} - ${t.commissionTotal}`,
+      // Gross and commission are signed sums: reversals of earlier payouts' entries can make either negative while the net stays positive.
+      sql`${t.netPayable} >= 0 AND ${t.netPayable} = ${t.grossCollected} - ${t.commissionTotal}`,
     ),
     check(
       "teacher_payout_approved_check",

@@ -546,8 +546,10 @@ describe("fee exceptions, promotion and payouts", () => {
     eq((await post("/admin/payouts", { lecturerId: lec1, periodEnd: "march" }, all)).status, 400);
 
     const draft = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status) VALUES ($1,'2027-01-01','2027-02-01','1000','200','800','draft')`, [lec1]);
-    const approved = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status, approved_by) VALUES ($1,'2027-02-01','2027-03-01','1000','100','900','approved',$2)`, [lec1, root]);
-    const theirs = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status, approved_by) VALUES ($1,'2027-02-01','2027-03-01','500','50','450','approved',$2)`, [lec2, root]);
+    const approved = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1,'2027-02-01','2027-03-01','1000','100','900')`, [lec1]);
+    await q(`UPDATE teacher_payout SET status = 'approved', approved_by = $2 WHERE id = $1`, [approved, root]);
+    const theirs = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1,'2027-02-01','2027-03-01','500','50','450')`, [lec2]);
+    await q(`UPDATE teacher_payout SET status = 'approved', approved_by = $2 WHERE id = $1`, [theirs, root]);
 
     eq((await get("/admin/payouts?status=draft", all)).json.payouts.map((p: { id: string }) => p.id), [draft]);
     eq((await get(`/admin/payouts/${draft}`, all)).status, 200);

@@ -22,7 +22,7 @@ export interface PayoutTotals {
   entryCount: number;
 }
 
-export type PayoutBlocker = "no_entries" | "net_not_positive" | "reversal_heavy";
+export type PayoutBlocker = "no_entries" | "net_not_positive";
 
 /** Adds up entries (accruals and negative reversals) into payout totals. Pure. */
 export function summarizeEntries(rows: Pick<EntryRow, "baseAmount" | "commissionAmount" | "teacherAmount">[]): PayoutTotals {
@@ -38,14 +38,12 @@ export function summarizeEntries(rows: Pick<EntryRow, "baseAmount" | "commission
 }
 
 /**
- * H8: why a set of entries cannot become a payout yet, or null when it can. A payout needs a positive net.
- * `reversal_heavy` is the rare case where the net is positive but the table's own checks (gross and commission never negative)
- * cannot hold it, for example a large reversed commission against a new accrual on a lower rate. The entries carry forward too.
+ * H8: why a set of entries cannot become a payout yet, or null when it can. A payout needs a positive net. Gross and commission are signed sums
+ * (a reversal can make either negative while the net stays positive), so only the net decides.
  */
 export function payoutBlocker(t: PayoutTotals): PayoutBlocker | null {
   if (t.entryCount === 0) return "no_entries";
   if (t.net <= 0) return "net_not_positive";
-  if (t.gross < 0 || t.commission < 0) return "reversal_heavy";
   return null;
 }
 

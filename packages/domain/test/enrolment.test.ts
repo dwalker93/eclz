@@ -212,6 +212,41 @@ describe("Enrolment, recurring and package invoicing", () => {
     const only = await mkFee(solo, { def: false });
     eq((await enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: solo })).enrollment.feeStructureId, only);
   });
+  test("D1/D12: a course with no fee structure is free: enrolled with no fee option and no invoice", async () => {
+    const codeOf = async (fn: () => Promise<unknown>) => { try { await fn(); return "none"; } catch (e) { return (e as ServiceError).code; } };
+    const free = await mkCourse();
+    const s = await mkStudent(g6);
+    const r = await enrol.enrollStudent({ studentId: s, courseId: free });
+    eq([r.enrollment.feeStructureId, r.invoiceId], [null, null]);
+    eq((await q(`SELECT count(*)::int n FROM invoice WHERE student_id = $1`, [s]))[0]!.n, 0);
+    const rep = await inv.generateRecurringInvoices({ enrollmentIds: [r.enrollment.id] });
+    eq(rep.invoicesCreated.length, 0);
+    // an explicit but invalid choice, an installment plan on a free course, and a course whose only fee option is switched off are still refused
+    eq(await codeOf(async () => enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: free, feeStructureId: await mkFee(await mkCourse()) })), "fee_structure_invalid");
+    eq(await codeOf(async () => enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: free, installmentOptionId: free })), "invalid_input");
+    const off = await mkCourse();
+    await q(`UPDATE fee_structure SET is_active = false WHERE id = $1`, [await mkFee(off)]);
+    eq(await codeOf(async () => enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: off })), "fee_structure_required");
+  });
+  test("C5: course capacity applies only without an intake; each intake has its own", async () => {
+    const codeOf = async (fn: () => Promise<unknown>) => { try { await fn(); return "none"; } catch (e) { return (e as ServiceError).code; } };
+    const c = await mkCourse({ kind: "program", capacity: 1 });
+    await mkFee(c);
+    const a = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'A', '2027-04-01')`, [c]);
+    const b = await id(`INSERT INTO intake (course_id, name, starts_on, capacity) VALUES ($1, 'B', '2027-05-01', 1)`, [c]);
+    await enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: c, intakeId: a });
+    await enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: c, intakeId: b });
+    eq(await codeOf(async () => enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: c, intakeId: b })), "capacity_full");
+  });
+  test("B7: the first branch is primary, a repeat of a branch adds nothing", async () => {
+    const s = await mkStudent(g6);
+    const c1 = await mkCourse({ branch: b1 }), c2 = await mkCourse({ branch: b2 }), c3 = await mkCourse({ branch: b1 });
+    for (const c of [c1, c2, c3]) await mkFee(c, { branch: (await q(`SELECT branch_id FROM course WHERE id = $1`, [c]))[0]!.branch_id as string });
+    for (const c of [c1, c2, c3]) await enrol.enrollStudent({ studentId: s, courseId: c });
+    const rows = await q(`SELECT branch_id, is_primary FROM student_branch WHERE student_id = $1 ORDER BY is_primary DESC`, [s]);
+    eq(rows.length, 2);
+    eq(rows.filter((r) => r.is_primary).map((r) => r.branch_id), [b1]);
+  });
   test("D12: package enrolment issues an invoice and sets access end", async () => {
     const c = await mkCourse({ kind: "program", mode: "self_paced" });
     const f = await mkFee(c, { type: "one_time_package", months: 6 });
@@ -426,6 +461,44 @@ describe("Fee exceptions (D19 to D21)", () => {
     eq(items[1]!.fee_structure_id, alt);
     eq((await q(`SELECT fee_structure_id FROM enrollment WHERE id = $1`, [r.enrollment.id]))[0]!.fee_structure_id, f);
   });
+  test("D20: an alternate option must bill on the same cycle as the enrolled option", async () => {
+    await onModule();
+    const codeOf = async (fn: () => Promise<unknown>) => { try { await fn(); return "none"; } catch (e) { return (e as ServiceError).code; } };
+    const c = await mkCourse();
+    const f = await mkFee(c);
+    const termAlt = await mkFee(c, { def: false, freq: "per_term", name: "Per term" });
+    await mkRate(f, 1000, null);
+    await mkRate(termAlt, 3000, null);
+    const r = await enrol.enrollStudent({ studentId: await mkStudent(g6), courseId: c });
+    eq(await codeOf(async () => exc.createFeeException({ enrollmentId: r.enrollment.id, kind: "alternate_option", alternateFeeStructureId: termAlt, effectiveFrom: "2027-02-01", reason: "r", createdBy: staff })), "exception_invalid");
+    // a mismatched exception that got in some other way is reported by the generator and bills nothing for its periods
+    await q(`UPDATE enrollment SET access_starts_on = '2027-03-01' WHERE id = $1`, [r.enrollment.id]);
+    await q(`INSERT INTO fee_exception (enrollment_id, course_id, kind, alternate_fee_structure_id, effective_from, reason, created_by) VALUES ($1, $2, 'alternate_option', $3, '2027-03-01', 'r', $4)`, [r.enrollment.id, c, termAlt, staff]);
+    const rep = await inv.generateRecurringInvoices({ enrollmentIds: [r.enrollment.id] });
+    eq(rep.invoicesCreated.length, 0);
+    eq(rep.failures.map((x) => x.code), ["fee_structure_invalid"]);
+  });
+  test("D7: a conflict with another run bills the remaining periods and counts only the clashing one", async () => {
+    const { enr, s, f } = await recurring({ rate: 1000, start: "2027-01-01" });
+    // The second transaction of the run is the group insert. Before it starts, "another run" bills January.
+    let calls = 0;
+    const racing = new Proxy(db, {
+      get(t, k, r) {
+        if (k !== "transaction") return Reflect.get(t, k, r);
+        return async (...a: unknown[]) => {
+          if (++calls === 2) {
+            const i = await id(`INSERT INTO invoice (student_id, branch_id, due_date, subtotal, total) VALUES ($1, $2, CURRENT_DATE + 7, 1000, 1000)`, [s, b1]);
+            await q(`INSERT INTO invoice_item (invoice_id, kind, amount, enrollment_id, fee_structure_id, period_start, period_end) VALUES ($1, 'recurring_fee', 1000, $2, $3, '2027-01-01', '2027-02-01')`, [i, enr, f]);
+          }
+          return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+        };
+      },
+    });
+    const rep = await createInvoicingService(racing, { now }).generateRecurringInvoices({ enrollmentIds: [enr] });
+    eq(rep.invoicesCreated.map((x) => x.periodStarts), [["2027-02-01", "2027-03-01"]]);
+    eq(rep.alreadyInvoiced, 1);
+    eq((await q(`SELECT period_start FROM invoice_item WHERE enrollment_id = $1 AND cancelled_at IS NULL ORDER BY period_start`, [enr])).map((x) => String(x.period_start).slice(0, 10)), ["2027-01-01", "2027-02-01", "2027-03-01"]);
+  });
   test("D21: an active exception keeps applying after the module is switched off", async () => {
     await onModule();
     const { enr } = await recurring({ rate: 1000, start: "2027-03-01" });
@@ -487,6 +560,17 @@ describe("Invoice adjustment and cancellation (D8, D23 to D26)", () => {
     eq(i.total, "9500.00");
     eq(i.amount_paid, "3500.00");
     eq(i.status, "partial");
+  });
+  test("D25: an adjustment on a fully paid schedule gets its own installment", async () => {
+    const p = await packageInvoice(true);
+    await payInvoice(p, "10000");
+    await inv.addInvoiceLine({ invoiceId: p.invoiceId, kind: "adjustment", amount: "2000", description: "Extra", createdBy: staff, reason: "Materials" });
+    const ins = await q(`SELECT seq, amount, amount_paid, status FROM invoice_installment WHERE invoice_id = $1 ORDER BY seq`, [p.invoiceId]);
+    eq(ins.length, 4);
+    eq([ins[3]!.seq, ins[3]!.amount, ins[3]!.amount_paid, ins[3]!.status], [4, "2000.00", "0.00", "pending"]);
+    eq(ins.slice(0, 3).every((x) => x.status === "paid"), true);
+    eq((await q(`SELECT sum(amount)::text s FROM invoice_installment WHERE invoice_id = $1`, [p.invoiceId]))[0]!.s, "12000.00");
+    eq((await q(`SELECT total, status FROM invoice WHERE id = $1`, [p.invoiceId]))[0]!.status, "partial");
   });
   test("D26: a change that puts the total below what is paid is refused", () => fails("total_below_paid", async () => {
     const p = await packageInvoice();

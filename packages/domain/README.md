@@ -76,10 +76,10 @@ await exceptions.createFeeException({ enrollmentId, kind: "discount", discountTy
 await exceptions.endFeeException({ exceptionId, endedBy });
 ```
 
-By rule: C1 to C6 and C10 (course open, student active, intake rules, one active place, capacity counted under a lock on the course row, grade list with an audited override),
-D1 (fee option: the one given, else the default, else the only active one, else `fee_structure_required`), D6 (rate by billing grade, then grade on the period start, then the all-grades rate;
+By rule: C1 to C6 and C10 (course open, student active, intake rules, one active place, capacity counted under a lock on the course row (the course limit applies to enrolments without an intake, an intake's own capacity to its enrolments), grade list with an audited override),
+D1 (fee option: the one given, else the default, else the only active one; a course with no fee structure at all is free and is enrolled with no fee option and no invoice; otherwise `fee_structure_required`), D6 (rate by billing grade, then grade on the period start, then the all-grades rate;
 a missing rate is reported and nothing is billed, never zero), D7 (one recurring line per enrolment and period, so generation is idempotent), D8 and D23 (signed lines, totals re-derived from them),
-D9 and D19 (a 100% discount gives a zero `waived` invoice), D10 and D25 (installment schedule, surcharge as an adjustment line, unpaid installments re-spread after an adjustment),
+D9 and D19 (a 100% discount gives a zero `waived` invoice), D10 and D25 (installment schedule, surcharge as an adjustment line, unpaid installments re-spread after an adjustment; when every installment is already paid, a positive adjustment gets one new installment for the extra balance, due 7 days from today or after the last installment, whichever is later),
 D12 (package invoice at enrolment, access end = start + months), D17 to D22 (fee exceptions, module check only when creating), D24 (one invoice per student, branch and due date),
 D26 (invoices are append-only: cancel only without payments), C7 (drop), B5 and B7 (grade on a date, student_branch).
 
@@ -88,7 +88,7 @@ Implementation choices to review:
 - A per-term fee bills the course's academic term once (`term.starts_on` to `ends_on`). A course without a term is reported as a failure.
 - Generation bills every missing period whose start is on or before today (plus `leadDays`) and before `access_ends_on`, oldest first, at most `maxPeriodsPerEnrollment` (12) per run.
 - Due date is the period start plus `dueAfterDays` (7), but never before today. Periods with different due dates become separate invoices.
-- A discount exception becomes a negative `discount` line linked to the fee line and the exception. An alternate option replaces the fee structure for its dates only, and the enrolment is never rewritten.
+- A discount exception becomes a negative `discount` line linked to the fee line and the exception. An alternate option replaces the fee structure for its dates only, and the enrolment is never rewritten. It must bill on the same cycle (monthly or per term) as the enrolled option, because periods are built from the enrolled one; the generator also reports a mismatched alternate as `fee_structure_invalid` and bills nothing for that period. If another run bills some periods of a group first, the generator drops those periods (counted as already invoiced) and inserts the rest.
 - Dates such as `enrolled_on`, `paid_on` and invoice issue dates use the organization's time zone, not UTC.
 - Dropping an enrolment sets access to end today (or the next day if it started today).
 - Not done yet: proration, promotion confirm (it will call `enrollStudent` with `promotedFromEnrollmentId`), and the overdue job.
@@ -137,7 +137,7 @@ H9 (every payout action needs the commissions module), J3 (audit rows for create
 
 Behaviour to know:
 - **Period end is a cut-off, not a filter.** A payout takes every unsettled accrued entry created before the start of `periodEnd` (organization time zone), including entries from before `periodStart`. This is what makes carry-forward work: nothing is ever stranded in an earlier period. `periodStart` defaults to the end of the lecturer's previous payout, else the day of the oldest included entry, and only labels the payout. Payouts of one lecturer cannot overlap, and a period cannot end after tomorrow.
-- **Carry-forward.** If the net is zero or negative, or no entries exist, nothing is created and the result is `carried_forward` with a reason (`no_entries`, `net_not_positive`). A third reason, `reversal_heavy`, covers a positive net that the table's checks cannot hold (gross or commission total below zero, for example a large reversed commission against an accrual on a lower rate). It carries forward too.
+- **Carry-forward.** If the net is zero or negative, or no entries exist, nothing is created and the result is `carried_forward` with a reason (`no_entries`, `net_not_positive`). Gross and commission totals are signed sums, so a reversal can make either negative while the net stays positive; only the net decides.
 - **Draft totals are rebuilt at approval.** If a payment in a draft was voided, its reversal is pulled into the draft, which removes that entry from the payout. If nothing payable is left, approval fails with `payout_nothing_to_pay` and changes nothing; discard the draft and create a new one.
 - **Approved totals are fixed.** A payment voided after approval adds a reversal that is deducted from the lecturer's next payout, so the approved amount is the amount to transfer.
 - Only a draft can be discarded (the database refuses to delete an approved or paid payout). A zero-net payout is never created, so `paid` always means money was sent.
@@ -388,7 +388,7 @@ By rule: B6 and B8 (draft, review, confirm once; nothing changes before confirm;
 course group that serves the next grade, otherwise same subject, branch, primary lecturer and batch label; exactly one match proposes a move, otherwise `needs_review`),
 C13 (a move completes the old enrolment with `end_reason = promoted` and `access_ends_on` = the effective date, and opens a new one with `promoted_from_enrollment_id`,
 the target's default fee option, and access from the effective date), C14 (the effective date is refused if it is not after the old enrolment started, or if a period past it is
-already invoiced for a class being left), C15 (capacity under a lock on the target course; a full target, a duplicate or a class with no fee option is not applied),
+already invoiced for a class being left), C15 (capacity under a lock on the target course; a full target, a duplicate or a class with fee options but no default is not applied; a class with no fee structure at all is free and is joined with no fee option),
 B5 (the old grade row ends on the effective date and the new one starts on it), B7 (`student_branch`), B8 stay (billing grade pinned to the grade before promotion)
 and the rule for clearing a pin (needs a reason and a fee rate for the current grade), J3 (audit on confirm and discard).
 
@@ -429,3 +429,5 @@ Most scenario files tell one story in order (a later test relies on the rows an 
 
 The row locks (`FOR UPDATE`) cannot be exercised by PGlite, which has one connection. Before going live, run two simultaneous verifications of the same payment,
 two payments on the same invoice, and two payout creations for one lecturer against a real PostgreSQL database.
+
+Payment arithmetic note: lines linked to an item (discounts, reductions, positive adjustments with `appliesToItemId`) change that item's net once through `linkedTotals` and are not payable items of their own; receipt verification fails as `tampered` if the receipt row's branch differs from the signed payload's.

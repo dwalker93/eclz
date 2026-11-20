@@ -1,6 +1,7 @@
 import { Badge } from "@workspace/ui/components/badge"
 import { cn } from "@workspace/ui/lib/utils"
 import {
+  ArchiveIcon,
   BadgeCheckIcon,
   BanIcon,
   BanknoteIcon,
@@ -748,15 +749,17 @@ const noticeAudienceConfig: Record<NoticeAudienceType, BadgeConfig> = {
 
 export function NoticeAudienceBadge({
   audienceType,
+  label,
   className,
 }: {
   audienceType: NoticeAudienceType
+  label?: string
   className?: string
 }) {
   return (
     <ConfigBadge
       config={noticeAudienceConfig[audienceType]}
-      label={NOTICE_AUDIENCE_LABELS[audienceType]}
+      label={label ?? NOTICE_AUDIENCE_LABELS[audienceType]}
       className={className}
     />
   )
@@ -855,18 +858,24 @@ const lecturerCourseStatusConfig: Record<LecturerCourseStatus, BadgeConfig> = {
   },
 }
 
-const lecturerContentStatusConfig: Record<LecturerContentStatus, BadgeConfig> = {
-  published: {
-    icon: CircleCheckIcon,
-    className:
-      "border-emerald-600/20 bg-emerald-500/10 text-emerald-700 dark:border-emerald-400/20 dark:text-emerald-400",
-  },
-  draft: {
-    icon: Clock3Icon,
-    className:
-      "border-amber-600/20 bg-amber-500/10 text-amber-700 dark:border-amber-400/20 dark:text-amber-400",
-  },
-}
+const lecturerContentStatusConfig: Record<LecturerContentStatus, BadgeConfig> =
+  {
+    published: {
+      icon: CircleCheckIcon,
+      className:
+        "border-emerald-600/20 bg-emerald-500/10 text-emerald-700 dark:border-emerald-400/20 dark:text-emerald-400",
+    },
+    draft: {
+      icon: Clock3Icon,
+      className:
+        "border-amber-600/20 bg-amber-500/10 text-amber-700 dark:border-amber-400/20 dark:text-amber-400",
+    },
+    archived: {
+      icon: ArchiveIcon,
+      className:
+        "border-border bg-muted/60 text-muted-foreground dark:bg-muted/40",
+    },
+  }
 
 const lecturerExamStatusConfig: Record<LecturerExamStatus, BadgeConfig> = {
   draft: {

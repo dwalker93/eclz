@@ -77,8 +77,9 @@ export const notificationTemplate = pgTable(
 );
 
 /**
- * One row per (user, event, channel). event_key identifies the thing that caused it (an invoice installment,
- * a payment, a session) so a retry cannot send twice (J2). read_at tracks in-app reads.
+ * One row per (user, event_key, channel). event_key identifies the event and the thing that caused it (an invoice installment,
+ * a payment, a session) so a retry cannot send twice (J2). Two events with the same event_key therefore share one row per user and channel,
+ * so a key must be unique per event (the installment reminder uses `due:<invoice>:<seq>`). read_at tracks in-app reads.
  */
 export const notification = pgTable(
   "notification",
@@ -161,7 +162,10 @@ export const message = pgTable(
   "message",
   {
     id: pk(),
-    threadId: uuid("thread_id").notNull(),
+    /** A thread owns its messages: deleting the thread deletes them (0015). Removing one participant who has posted is still refused. */
+    threadId: uuid("thread_id")
+      .notNull()
+      .references((): AnyPgColumn => messageThread.id, { onDelete: "cascade" }),
     senderId: uuid("sender_id").notNull(),
     body: text("body").notNull(),
     sentAt: tstz("sent_at").notNull().defaultNow(),

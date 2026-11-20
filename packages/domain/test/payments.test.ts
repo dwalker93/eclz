@@ -6,6 +6,7 @@ import { toCents } from "@workspace/db/money";
 import {
   createPaymentService,
   hmacSigner,
+  linkedTotals,
   verifyReceipt,
 } from "../src";
 import { eq, fails } from "./helpers";
@@ -279,6 +280,55 @@ describe("Cash (E11)", () => {
     eq(ev.allocations.map((a) => a.invoiceItemId), [item]);
     eq((await invoiceRow(inv)).status, "paid");
     eq(ev.receipt.status, "issued");
+  });
+});
+
+describe("Linked positive adjustments count once (D23)", () => {
+  const adjustment = (invoice: string, amount: number, applies: string | null) =>
+    id(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id) VALUES ($1, 'adjustment', $2, $3)`, [invoice, amount, applies]);
+
+  test("linkedTotals adds a linked line to its root once, also through a chain", () => {
+    const m = linkedTotals([
+      { id: "fee", cents: 10000, appliesToItemId: null },
+      { id: "adj", cents: 2000, appliesToItemId: "fee" },
+      { id: "adj2", cents: 500, appliesToItemId: "adj" },
+      { id: "disc", cents: -300, appliesToItemId: "fee" },
+      { id: "solo", cents: 700, appliesToItemId: null },
+    ]);
+    eq([m.get("fee"), m.get("adj"), m.get("solo")], [2200, undefined, undefined]);
+  });
+  test("a payment of the invoice total settles it, allocated to the item and not to its linked adjustment", async () => {
+    const inv = await mkInvoice(st2, b1, "2027-05-01", 12000);
+    const item = await mkItem(inv, enr2, 10000);
+    await adjustment(inv, 2000, item);
+    const ev = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "12000.00", recordedBy: staff, invoiceIds: [inv] });
+    eq(ev.allocations.map((a) => [a.invoiceItemId, a.amount]), [[item, "12000.00"]]);
+    eq((await invoiceRow(inv)).status, "paid");
+  });
+  test("a payment above the invoice total is refused", () => fails("allocation_mismatch", async () => {
+    const inv = await mkInvoice(st2, b1, "2027-05-01", 12000);
+    const item = await mkItem(inv, enr2, 10000);
+    await adjustment(inv, 2000, item);
+    await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "12100.00", recordedBy: staff, invoiceIds: [inv] });
+  }));
+  test("a standalone positive adjustment is still its own payable item", async () => {
+    const inv = await mkInvoice(st2, b1, "2027-05-01", 10500);
+    const item = await mkItem(inv, enr2, 10000);
+    const solo = await adjustment(inv, 500, null);
+    const ev = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "10500.00", recordedBy: staff, invoiceIds: [inv] });
+    eq(new Map(ev.allocations.map((a) => [a.invoiceItemId, a.amount])).get(solo), "500.00");
+    eq(new Map(ev.allocations.map((a) => [a.invoiceItemId, a.amount])).get(item), "10000.00");
+  });
+});
+
+describe("Receipt branch is part of what is verified", () => {
+  test("a receipt moved to another branch is reported as tampered; an untouched one verifies", async () => {
+    const inv = await mkInvoice(st2, b1, "2027-05-01", 100);
+    await mkItem(inv, enr2, 100);
+    const ev = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "100.00", recordedBy: staff, invoiceIds: [inv] });
+    eq((await verifyReceipt(db, ev.receipt.verificationCode, hmacSigner("test-secret"))).valid, true);
+    await q(`UPDATE receipt SET branch_id = $2 WHERE id = $1`, [ev.receipt.id, b2]);
+    eq(await verifyReceipt(db, ev.receipt.verificationCode, hmacSigner("test-secret")), { valid: false, reason: "tampered" });
   });
 });
 

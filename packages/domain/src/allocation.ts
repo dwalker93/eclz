@@ -2,6 +2,24 @@
  * Pure payment arithmetic: no database. Everything is in integer cents.
  */
 
+/**
+ * D23: the amount that lines linked to an item (discounts, reductions, and positive adjustments with `appliesToItemId`) add to the item they
+ * belong to, in cents, keyed by that item. A link to a linked line is followed up to the item that stands on its own, so every linked line counts
+ * once and only in its root's net. Pure.
+ */
+export function linkedTotals(items: { id: string; cents: number; appliesToItemId: string | null }[]): Map<string, number> {
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const totals = new Map<string, number>();
+  for (const it of items) {
+    if (!it.appliesToItemId) continue;
+    let root = byId.get(it.appliesToItemId);
+    for (let hops = 0; root?.appliesToItemId && hops < items.length; hops++) root = byId.get(root.appliesToItemId);
+    if (!root || root.appliesToItemId) continue; // the target is not on this list (or a cycle): nothing to add it to
+    totals.set(root.id, (totals.get(root.id) ?? 0) + it.cents);
+  }
+  return totals;
+}
+
 export interface ItemWeight {
   id: string;
   /** The item's net outstanding amount in cents (D23). */
