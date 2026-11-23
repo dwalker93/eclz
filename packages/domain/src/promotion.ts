@@ -336,7 +336,7 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
                   .values({
                     courseId: target.id,
                     studentId: i.studentId,
-                    feeStructureId: structure.id,
+                    feeStructureId: structure?.id ?? null,
                     preferredMode: old.preferredMode,
                     promotedFromEnrollmentId: old.id,
                     enrolledOn: eff,

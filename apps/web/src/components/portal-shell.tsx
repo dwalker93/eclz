@@ -47,15 +47,18 @@ import {
   PresentationIcon,
   SparklesIcon,
   SunIcon,
+  UsersRoundIcon,
   type LucideIcon,
 } from "lucide-react"
 
 import { lecturer } from "@/lib/lecturer-portal-data"
 import { lecturerNav } from "@/lib/lecturer-navigation"
+import { parent, parentChildren } from "@/lib/parent-portal-data"
+import { parentNav } from "@/lib/parent-navigation"
 import { student } from "@/lib/student-portal-data"
 import { studentNav, type PortalNavGroup } from "@/lib/student-navigation"
 
-export type PortalRole = "student" | "lecturer"
+export type PortalRole = "student" | "lecturer" | "parent"
 
 type PortalShellConfig = {
   roleLabel: string
@@ -69,6 +72,7 @@ type PortalShellConfig = {
     meta: string
   }
   notificationsHref: string
+  notificationsLabel: string
   footerCopy: string
 }
 
@@ -84,6 +88,7 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
       meta: `${student.studentNo} · ${student.grade}`,
     },
     notificationsHref: "/portal/student#recent-notifications",
+    notificationsLabel: "Go to recent notifications",
     footerCopy:
       "Dashboard, My Courses, Timetable, Attendance, Learning Materials, Exams & Results, Invoices & Payments, Notices, Messages and My Profile are available. Other portal pages are planned for later steps.",
   },
@@ -97,9 +102,25 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
       initials: lecturer.initials,
       meta: `${lecturer.lecturerNo} · ${lecturer.designation}`,
     },
-    notificationsHref: "/portal/lecturer",
+    notificationsHref: "/portal/lecturer#recent-notices",
+    notificationsLabel: "Go to recent notices",
     footerCopy:
-      "The dashboard is available. Other lecturer pages are planned for later steps.",
+      "Dashboard, My Courses, Timetable & Sessions, Attendance, Learning Materials, Exams, Question Bank, Results, Notices, Messages, My Earnings and My Profile are available. Other lecturer pages are planned for later steps.",
+  },
+  parent: {
+    roleLabel: "Parent portal",
+    homeHref: "/portal/parent",
+    nav: parentNav,
+    brandIcon: UsersRoundIcon,
+    identity: {
+      fullName: parent.fullName,
+      initials: parent.initials,
+      meta: `Guardian · ${parentChildren.length} linked children`,
+    },
+    notificationsHref: "/portal/parent#latest-notice",
+    notificationsLabel: "Go to the latest notice",
+    footerCopy:
+      "Dashboard and My Children are available. Other parent pages are planned for later steps.",
   },
 }
 
@@ -235,7 +256,7 @@ function PortalHeader({ config }: { config: PortalShellConfig }) {
         <div className="flex items-center gap-1.5">
           <a
             href={config.notificationsHref}
-            aria-label="Go to recent notifications"
+            aria-label={config.notificationsLabel}
             className="relative inline-flex size-10 items-center justify-center rounded-md text-sm font-medium transition-colors outline-none hover:bg-muted hover:text-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
           >
             <BellIcon className="size-5" aria-hidden="true" />

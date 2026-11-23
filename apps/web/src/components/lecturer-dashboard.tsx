@@ -1,9 +1,11 @@
 "use client"
 
+import Link from "next/link"
 import { useState } from "react"
 
 import { Avatar, AvatarFallback } from "@workspace/ui/components/avatar"
 import { Badge } from "@workspace/ui/components/badge"
+import { buttonVariants } from "@workspace/ui/components/button"
 import {
   Card,
   CardContent,
@@ -30,6 +32,7 @@ import {
   CalendarClockIcon,
   CalendarDaysIcon,
   CheckCircle2Icon,
+  ChevronRightIcon,
   CircleDollarSignIcon,
   ClockIcon,
   FileCheck2Icon,
@@ -78,6 +81,7 @@ import {
   type LecturerNotice,
 } from "@/lib/lecturer-portal-data"
 import {
+  formatDateTime,
   formatDisplayDate,
   formatLkr,
   formatShortDate,
@@ -110,6 +114,12 @@ export function LecturerDashboard() {
   }
 
   const upcomingAfterNext = lecturerUpcomingSessions.slice(1, 4)
+  const activeCourses = lecturerCourses.filter(
+    (course) => course.status === "active"
+  )
+  /** Local demo availability only; no portal or module check is performed. */
+  const portalAvailable =
+    lecturer.portalEnabled && lecturerModules.lecturerPortal
 
   return (
     <main className="mx-auto size-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
@@ -151,15 +161,15 @@ export function LecturerDashboard() {
                   Welcome, {lecturer.preferredName}
                 </h2>
                 <Badge
-                  variant={lecturer.portalEnabled ? "secondary" : "outline"}
+                  variant={portalAvailable ? "secondary" : "outline"}
                   className="gap-1.5 rounded-full"
                 >
-                  {lecturer.portalEnabled ? (
+                  {portalAvailable ? (
                     <BadgeCheckIcon aria-hidden="true" />
                   ) : null}
-                  {lecturer.portalEnabled
+                  {portalAvailable
                     ? "Lecturer portal enabled"
-                    : "Portal not enabled"}
+                    : "Lecturer portal unavailable"}
                 </Badge>
               </div>
               <p className="text-sm text-muted-foreground">
@@ -179,8 +189,8 @@ export function LecturerDashboard() {
                 enabled={lecturerModules.onlineExams}
               />
               <ModuleStateBadge
-                label="Parent portal"
-                enabled={lecturerModules.parentPortal}
+                label="QR attendance"
+                enabled={lecturerModules.qrAttendance}
               />
             </div>
           </CardContent>
@@ -304,23 +314,45 @@ export function LecturerDashboard() {
                     </li>
                   ))}
                 </ul>
+                <Link
+                  href="/portal/lecturer/timetable"
+                  className={buttonVariants({
+                    variant: "ghost",
+                    size: "xs",
+                    className: "w-fit",
+                  })}
+                >
+                  View timetable &amp; sessions
+                  <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+                </Link>
               </CardFooter>
             ) : null}
           </Card>
 
           <Card className="gap-0 py-0">
             <CardHeader className="border-b px-4 py-4 sm:px-6">
-              <CardTitle className="flex items-center gap-2">
-                <TriangleAlertIcon
-                  className="size-4 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                Attendance needing attention
-              </CardTitle>
-              <CardDescription>
-                Students below the {lecturerAttendanceSummary.targetRate}%
-                target in your courses.
-              </CardDescription>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex flex-col gap-0.5">
+                  <CardTitle className="flex items-center gap-2">
+                    <TriangleAlertIcon
+                      className="size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    Attendance needing attention
+                  </CardTitle>
+                  <CardDescription>
+                    Students below the {lecturerAttendanceSummary.targetRate}%
+                    target in your courses.
+                  </CardDescription>
+                </div>
+                <Link
+                  href="/portal/lecturer/attendance"
+                  className={buttonVariants({ variant: "ghost", size: "xs" })}
+                >
+                  Open attendance
+                  <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+                </Link>
+              </div>
             </CardHeader>
             <CardContent className="flex flex-col gap-4 p-4 sm:p-6">
               <div className="grid grid-cols-2 gap-3">
@@ -331,8 +363,8 @@ export function LecturerDashboard() {
                 />
                 <SummaryField
                   icon={TriangleAlertIcon}
-                  label="Courses below target"
-                  value={String(lecturerAttendanceSummary.coursesBelowTarget)}
+                  label="Courses with follow-ups"
+                  value={String(lecturerAttendanceSummary.coursesWithFollowUps)}
                 />
               </div>
               {lecturerAttendanceAttention.length === 0 ? (
@@ -346,10 +378,7 @@ export function LecturerDashboard() {
               ) : (
                 <ul className="flex flex-col divide-y rounded-lg border">
                   {lecturerAttendanceAttention.map((entry) => (
-                    <li
-                      key={entry.id}
-                      className="flex flex-col gap-1 p-2.5"
-                    >
+                    <li key={entry.id} className="flex flex-col gap-1 p-2.5">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <span className="text-sm font-medium">
                           {entry.studentName}
@@ -384,94 +413,142 @@ export function LecturerDashboard() {
         </div>
 
         <div className="grid gap-4 lg:grid-cols-2">
-          <Card className="gap-0 py-0">
+          <Card id="courses-taught" className="scroll-mt-24 gap-0 py-0">
             <CardHeader className="border-b px-4 py-4 sm:px-6">
-              <CardTitle className="flex items-center gap-2">
-                <BookOpenIcon
-                  className="size-4 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                Courses taught
-              </CardTitle>
-              <CardDescription>
-                Courses assigned to you through your teaching schedule.
-              </CardDescription>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex flex-col gap-0.5">
+                  <CardTitle className="flex items-center gap-2">
+                    <BookOpenIcon
+                      className="size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    Courses taught
+                  </CardTitle>
+                  <CardDescription>
+                    Courses assigned to you through your teaching schedule.
+                  </CardDescription>
+                </div>
+                <Link
+                  href="/portal/lecturer/courses"
+                  className={buttonVariants({ variant: "ghost", size: "xs" })}
+                >
+                  View courses
+                  <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+                </Link>
+              </div>
             </CardHeader>
             <CardContent className="flex flex-col gap-4 p-4 sm:p-6">
-              {lecturerCourses
-                .filter((course) => course.status === "active")
-                .map((course) => {
-                  const fillPercent = Math.round(
-                    (course.enrolledCount / course.capacity) * 100
-                  )
+              {activeCourses.map((course) => {
+                const fillPercent = Math.round(
+                  (course.enrolledCount / course.capacity) * 100
+                )
 
-                  return (
-                    <div
-                      key={course.id}
-                      className="flex flex-col gap-3 rounded-lg border p-3"
-                    >
-                      <div className="flex flex-wrap items-start justify-between gap-2">
-                        <div className="flex min-w-0 flex-col gap-0.5">
-                          <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                            {course.name}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            {course.subject} · {course.branch} ·{" "}
-                            {course.gradeLevels.join(", ")}
-                          </span>
-                        </div>
-                        <Badge variant="outline" className="rounded-full">
-                          {getLecturerCourseTermLabel(course)}
-                        </Badge>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Badge variant="outline" className="rounded-full">
-                          {course.deliveryMode}
-                        </Badge>
-                        <Badge variant="outline" className="rounded-full">
-                          {course.scheduleSummary}
-                        </Badge>
-                        <Badge variant="outline" className="rounded-full">
-                          Your share {course.sharePercent}%
-                        </Badge>
-                      </div>
-                      <Progress value={fillPercent} className="gap-2">
-                        <ProgressLabel className="text-xs text-muted-foreground">
-                          Enrolled {course.enrolledCount} of {course.capacity} ·{" "}
-                          {fillPercent}%
-                        </ProgressLabel>
-                      </Progress>
-                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                        <span>
-                          Attendance{" "}
-                          {course.attendanceRate !== null
-                            ? `${course.attendanceRate}%`
-                            : "not tracked"}
+                return (
+                  <div
+                    key={course.id}
+                    className="flex flex-col gap-3 rounded-lg border p-3"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                          {course.name}
                         </span>
-                        <span>
-                          {course.coTeachers.length > 0
-                            ? `Co-teachers: ${course.coTeachers.join(", ")}`
-                            : "Sole teacher"}
+                        <span className="text-xs text-muted-foreground">
+                          {course.subject} · {course.branch} ·{" "}
+                          {course.gradeLevels.join(", ")}
                         </span>
                       </div>
+                      <Badge variant="outline" className="rounded-full">
+                        {getLecturerCourseTermLabel(course)}
+                      </Badge>
                     </div>
-                  )
-                })}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant="outline" className="rounded-full">
+                        {course.deliveryMode}
+                      </Badge>
+                      <Badge variant="outline" className="rounded-full">
+                        {course.scheduleSummary}
+                      </Badge>
+                      <Badge variant="outline" className="rounded-full">
+                        Your share {course.sharePercent}%
+                      </Badge>
+                    </div>
+                    <Progress value={fillPercent} className="gap-2">
+                      <ProgressLabel className="text-xs text-muted-foreground">
+                        Enrolled {course.enrolledCount} of {course.capacity} ·{" "}
+                        {fillPercent}%
+                      </ProgressLabel>
+                    </Progress>
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        Attendance{" "}
+                        {course.attendanceRate !== null
+                          ? `${course.attendanceRate}%`
+                          : "not tracked"}
+                      </span>
+                      <span>
+                        {course.coTeachers.length > 0
+                          ? `Co-teachers: ${course.coTeachers.join(", ")}`
+                          : "Sole teacher"}
+                      </span>
+                    </div>
+                  </div>
+                )
+              })}
+              {activeCourses.length === 0 ? (
+                <EmptyState
+                  icon={<BookOpenIcon className="size-5" aria-hidden="true" />}
+                  title="No active courses"
+                  description="Courses assigned to you will appear here. Contact the Academic Office if an assignment is missing."
+                />
+              ) : null}
             </CardContent>
           </Card>
 
           <Card className="gap-0 py-0">
             <CardHeader className="border-b px-4 py-4 sm:px-6">
-              <CardTitle className="flex items-center gap-2">
-                <FileCheck2Icon
-                  className="size-4 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                Exams &amp; results
-              </CardTitle>
-              <CardDescription>
-                Exams you own and results still to release.
-              </CardDescription>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex flex-col gap-0.5">
+                  <CardTitle className="flex items-center gap-2">
+                    <FileCheck2Icon
+                      className="size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    Exams &amp; results
+                  </CardTitle>
+                  <CardDescription>
+                    Exams you own and results still to release.
+                  </CardDescription>
+                </div>
+                <div className="flex flex-wrap items-center gap-1">
+                  <Link
+                    href="/portal/lecturer/results"
+                    className={buttonVariants({
+                      variant: "ghost",
+                      size: "xs",
+                    })}
+                  >
+                    Open results
+                    <ChevronRightIcon
+                      data-icon="inline-end"
+                      aria-hidden="true"
+                    />
+                  </Link>
+                  <Link
+                    href="/portal/lecturer/exams"
+                    className={buttonVariants({
+                      variant: "ghost",
+                      size: "xs",
+                    })}
+                  >
+                    Open exams
+                    <ChevronRightIcon
+                      data-icon="inline-end"
+                      aria-hidden="true"
+                    />
+                  </Link>
+                </div>
+              </div>
             </CardHeader>
             <CardContent className="flex flex-col gap-4 p-4 sm:p-6">
               <div className="flex flex-col gap-2">
@@ -494,8 +571,7 @@ export function LecturerDashboard() {
                             {exam.title}
                           </span>
                           <span className="text-xs text-muted-foreground">
-                            {exam.courseName} ·{" "}
-                            {formatDisplayDate(exam.date)} ·{" "}
+                            {exam.courseName} · {formatDisplayDate(exam.date)} ·{" "}
                             {exam.durationMinutes} min · {exam.maxMarks} marks
                           </span>
                           <div className="flex flex-wrap items-center gap-2">
@@ -537,8 +613,7 @@ export function LecturerDashboard() {
                             {exam.title}
                           </span>
                           <span className="text-xs text-muted-foreground">
-                            {exam.courseName} ·{" "}
-                            {formatDisplayDate(exam.date)}
+                            {exam.courseName} · {formatDisplayDate(exam.date)}
                           </span>
                         </div>
                         <ExamResultStateBadge state={exam.resultsState} />
@@ -567,9 +642,24 @@ export function LecturerDashboard() {
                     Announcements for you, your branch and your courses.
                   </CardDescription>
                 </div>
-                <Badge variant="outline" className="rounded-full">
-                  {unreadNoticeCount} unread
-                </Badge>
+                <div className="flex flex-wrap items-center gap-1">
+                  <Badge variant="outline" className="rounded-full">
+                    {unreadNoticeCount} unread
+                  </Badge>
+                  <Link
+                    href="/portal/lecturer/notices"
+                    className={buttonVariants({
+                      variant: "ghost",
+                      size: "xs",
+                    })}
+                  >
+                    Open notices
+                    <ChevronRightIcon
+                      data-icon="inline-end"
+                      aria-hidden="true"
+                    />
+                  </Link>
+                </div>
               </div>
             </CardHeader>
             <ul className="divide-y">
@@ -605,6 +695,13 @@ export function LecturerDashboard() {
                 )
               })}
             </ul>
+            {lecturerNotices.length === 0 ? (
+              <EmptyState
+                icon={<MegaphoneIcon className="size-5" aria-hidden="true" />}
+                title="No recent notices"
+                description="Notices for you, your branch or your courses will appear here. Contact the Academic Office for urgent updates."
+              />
+            ) : null}
             <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
               Notice read state is local to this preview.
             </CardFooter>
@@ -612,16 +709,27 @@ export function LecturerDashboard() {
 
           <Card className="gap-0 py-0">
             <CardHeader className="border-b px-4 py-4 sm:px-6">
-              <CardTitle className="flex items-center gap-2">
-                <MessagesSquareIcon
-                  className="size-4 text-muted-foreground"
-                  aria-hidden="true"
-                />
-                Recent messages
-              </CardTitle>
-              <CardDescription>
-                Conversations you are part of.
-              </CardDescription>
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="flex flex-col gap-0.5">
+                  <CardTitle className="flex items-center gap-2">
+                    <MessagesSquareIcon
+                      className="size-4 text-muted-foreground"
+                      aria-hidden="true"
+                    />
+                    Recent messages
+                  </CardTitle>
+                  <CardDescription>
+                    Conversations you are part of.
+                  </CardDescription>
+                </div>
+                <Link
+                  href="/portal/lecturer/messages"
+                  className={buttonVariants({ variant: "ghost", size: "xs" })}
+                >
+                  Open messages
+                  <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+                </Link>
+              </div>
             </CardHeader>
             <ul className="divide-y">
               {lecturerMessageThreads.map((thread) => {
@@ -667,15 +775,24 @@ export function LecturerDashboard() {
                       </span>
                     ) : null}
                     <span className="text-[11px] text-muted-foreground">
-                      {formatDisplayDate(getLecturerThreadLastMessageAt(thread))}
+                      {formatDateTime(getLecturerThreadLastMessageAt(thread))}
                     </span>
                   </li>
                 )
               })}
             </ul>
+            {lecturerMessageThreads.length === 0 ? (
+              <EmptyState
+                icon={
+                  <MessagesSquareIcon className="size-5" aria-hidden="true" />
+                }
+                title="No messages"
+                description="Conversations you are part of will appear here. New messages are not sent from this preview."
+              />
+            ) : null}
             <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-              Only conversations you are part of are shown. Opening the Messages
-              page is planned for a later step.
+              Only conversations you are part of are shown. Replies composed on
+              the Messages page stay local to that preview.
             </CardFooter>
           </Card>
         </div>
@@ -696,16 +813,33 @@ export function LecturerDashboard() {
                   earnings are shown.
                 </CardDescription>
               </div>
-              <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                <Switch
-                  checked={commissionsEnabled}
-                  onCheckedChange={(checked) =>
-                    setCommissionsEnabled(Boolean(checked))
-                  }
-                  aria-label="Toggle commissions module demo state"
-                />
-                Commissions module (demo)
-              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Switch
+                    checked={commissionsEnabled}
+                    onCheckedChange={(checked) =>
+                      setCommissionsEnabled(Boolean(checked))
+                    }
+                    aria-label="Toggle commissions module demo state"
+                  />
+                  Commissions module (demo)
+                </label>
+                {commissionsEnabled ? (
+                  <Link
+                    href="/portal/lecturer/earnings"
+                    className={buttonVariants({
+                      variant: "ghost",
+                      size: "xs",
+                    })}
+                  >
+                    Open earnings
+                    <ChevronRightIcon
+                      data-icon="inline-end"
+                      aria-hidden="true"
+                    />
+                  </Link>
+                ) : null}
+              </div>
             </div>
           </CardHeader>
           {commissionsEnabled ? (
@@ -729,7 +863,7 @@ export function LecturerDashboard() {
                   />
                   <SummaryField
                     icon={HandCoinsIcon}
-                    label="Payout state"
+                    label="Current period"
                     value={lecturerEarnings.period}
                   />
                 </div>
@@ -774,8 +908,9 @@ export function LecturerDashboard() {
                   </span>
                   {lecturerEarnings.lastPaidOn ? (
                     <span className="text-xs text-muted-foreground">
-                      Last payout {formatLkr(lecturerEarnings.lastPaidAmount ?? 0)}{" "}
-                      on {formatDisplayDate(lecturerEarnings.lastPaidOn)}
+                      Last payout{" "}
+                      {formatLkr(lecturerEarnings.lastPaidAmount ?? 0)} on{" "}
+                      {formatDisplayDate(lecturerEarnings.lastPaidOn)}
                     </span>
                   ) : null}
                 </div>
@@ -805,10 +940,11 @@ export function LecturerDashboard() {
             />
             <p className="text-xs leading-relaxed text-muted-foreground">
               This dashboard uses local sample data and component state. It
-              shows only courses assigned to {lecturer.fullName}, their sessions,
-              attendance, exams, results, notices, messages and this lecturer's
-              own earnings. Nothing is saved, sent, published, graded or paid,
-              and no institute-wide or other lecturers' private data is shown.
+              shows only courses assigned to {lecturer.fullName}, their
+              sessions, attendance, exams, results, notices, messages and this
+              lecturer's own earnings. Nothing is saved, sent, published, graded
+              or paid, and no institute-wide or other lecturers' private data is
+              shown.
             </p>
           </CardContent>
         </Card>
@@ -899,7 +1035,10 @@ function StatTile({
     <div className="flex flex-col gap-1 rounded-lg border bg-card p-3">
       <div className="flex items-center justify-between gap-2">
         <p className="text-xl font-semibold tabular-nums">{value}</p>
-        <Icon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <Icon
+          className="size-4 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
       </div>
       <p className="text-xs font-medium">{label}</p>
       <p className="text-[11px] text-muted-foreground">{hint}</p>

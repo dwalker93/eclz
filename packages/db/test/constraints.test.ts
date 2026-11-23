@@ -2,7 +2,7 @@
  * Database-level rules from the invariants file: constraints, triggers and uniqueness, checked on an in-process PostgreSQL.
  */
 import { afterAll, beforeAll, describe, test } from "bun:test";
-import { rejects } from "./helpers";
+import { eq, rejects } from "./helpers";
 import { seedDefaults } from "../src/seed";
 import { createTestDb } from "./setup";
 
@@ -628,9 +628,17 @@ describe("Fee exceptions (D16 to D21)", () => {
   test("an exception's course must be its enrolment's course", () => rejects(/fee_exception_enrollment_course_fk/, () =>
     mkExc("discount", "2035-01-01", null, null, "fixed", 1, "x", sched, enrFresh)));
   test("D19: a discount item can link to its exception", () =>
-    q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id) VALUES ($1, 'discount', -500, $2, $3)`, [inv1, item1, exc1]));
+    q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id, enrollment_id) VALUES ($1, 'discount', -500, $2, $3, $4)`, [inv1, item1, exc1, enr]));
+  test("D19: an item with a fee exception needs an enrolment", () => rejects(/invoice_item_exception_enrollment_check/, () =>
+    q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id) VALUES ($1, 'discount', -10, $2, $3)`, [inv1, item1, exc1])));
+  test("D19: a discount's exception must belong to the item's enrolment", () => rejects(/invoice_item_exception_enrollment_fk/, () =>
+    q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id, enrollment_id) VALUES ($1, 'discount', -10, $2, $3, $4)`, [inv1, item1, exc1, enrFresh])));
+  test("D19: a discount cannot reduce an item of another enrolment", () => rejects(/D19: a discount must carry the same enrolment/, async () => {
+    const other = await id(`INSERT INTO invoice_item (invoice_id, kind, amount, enrollment_id) VALUES ($1, 'adjustment', 300, $2)`, [inv1, enrFresh]);
+    await q(`INSERT INTO invoice_item (invoice_id, kind, amount, applies_to_item_id, fee_exception_id, enrollment_id) VALUES ($1, 'discount', -10, $2, $3, $4)`, [inv1, other, exc1, enr]);
+  }));
   test("only discount items can carry a fee exception", () => rejects(/invoice_item_exception_kind_check/, () =>
-    q(`INSERT INTO invoice_item (invoice_id, kind, amount, fee_exception_id) VALUES ($1, 'adjustment', 10, $2)`, [inv1, exc1])));
+    q(`INSERT INTO invoice_item (invoice_id, kind, amount, fee_exception_id, enrollment_id) VALUES ($1, 'adjustment', 10, $2, $3)`, [inv1, exc1, enr])));
 });
 
 describe("Notifications and push (J2)", () => {
@@ -685,6 +693,19 @@ describe("Messaging: participants", () => {
     q(`INSERT INTO message (thread_id, sender_id, body) VALUES ($1, $2, '  ')`, [thread, u2])));
   test("a user joins a thread only once", () => rejects(/thread_participant_pk/, () =>
     q(`INSERT INTO thread_participant (thread_id, user_id) VALUES ($1, $2)`, [thread, u2])));
+});
+
+describe("Messaging: deletion", () => {
+  test("deleting a thread deletes its participants and messages", async () => {
+    const t = await id(`INSERT INTO message_thread (subject, created_by) VALUES ('Short-lived', $1)`, [u2]);
+    await q(`INSERT INTO thread_participant (thread_id, user_id) VALUES ($1, $2), ($1, $3)`, [t, u1, u2]);
+    await q(`INSERT INTO message (thread_id, sender_id, body) VALUES ($1, $2, 'Hello')`, [t, u2]);
+    await q(`DELETE FROM message_thread WHERE id = $1`, [t]);
+    eq((await q(`SELECT 1 FROM message WHERE thread_id = $1`, [t])).length, 0, "messages left");
+    eq((await q(`SELECT 1 FROM thread_participant WHERE thread_id = $1`, [t])).length, 0, "participants left");
+  });
+  test("a participant who has posted cannot be removed on their own", () => rejects(/message_sender_participant_fk/, () =>
+    q(`DELETE FROM thread_participant WHERE thread_id = $1 AND user_id = $2`, [thread, u2])));
 });
 
 describe("Exam questions", () => {
@@ -773,6 +794,26 @@ describe("Publishing and published exams (G4)", () => {
   }));
   test("the mode of a published exam cannot change", () => rejects(/mode of a published exam/, () =>
     q(`UPDATE exam SET mode = 'paper' WHERE id = $1`, [examA])));
+});
+
+describe("Exam guard hardening (0016)", () => {
+  test("G4: a question cannot move out of a published exam into a draft", () => rejects(/exam_question_frozen/, async () => {
+    const draft = await mkOnline("Move target");
+    await q(`UPDATE exam_question SET exam_id = $1 WHERE id = $2`, [draft, eqA]);
+  }));
+  test("G4: a question cannot move into a published exam", () => rejects(/exam_question_frozen/, async () => {
+    const draft = await mkOnline("Move source");
+    const qx = await id(`INSERT INTO question (lecturer_id, body) VALUES ($1, 'Mover')`, [lec]);
+    const eqx = await id(`INSERT INTO exam_question (exam_id, question_id, marks, position) VALUES ($1, $2, 1, 1)`, [draft, qx]);
+    await q(`UPDATE exam_question SET exam_id = $1 WHERE id = $2`, [examA, eqx]);
+  }));
+  test("G4: an exam cannot be inserted as published", () => rejects(/a new exam must start as a draft/, () =>
+    q(`INSERT INTO exam (lecturer_id, title, mode, opens_at, closes_at, max_attempts, status) VALUES ($1, 'Born published', 'online_mcq', now(), now() + interval '1 day', 1, 'published')`, [lec])));
+  test("G7: the mode cannot change while the exam has results", () => rejects(/mode of an exam with results cannot change/, async () => {
+    const p = await id(`INSERT INTO exam (lecturer_id, title, mode, exam_date, max_marks) VALUES ($1, 'Paper with result', 'paper', '2027-04-01', 100)`, [lec]);
+    await q(`INSERT INTO exam_result (exam_id, student_id, marks, source) VALUES ($1, $2, 50, 'manual')`, [p, st1]);
+    await q(`UPDATE exam SET mode = 'online_mcq', opens_at = now(), closes_at = now() + interval '1 day', max_attempts = 1, exam_date = NULL, max_marks = NULL WHERE id = $1`, [p]);
+  }));
 });
 
 describe("Attempts and answers (G2)", () => {
@@ -881,6 +922,10 @@ describe("Content purchases (F5, F6)", () => {
 
   test("F5: no second pending purchase of the same item", () => rejects(/content_purchase_active_uq/, () =>
     q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 500)`, [cPaid, st1, b1])));
+  test("a purchase cannot be redirected to a free item", () => rejects(/only a paid content item/, () =>
+    q(`UPDATE content_purchase SET content_id = $1 WHERE id = $2`, [cFree, purch])));
+  test("a paid purchase needs an invoice", () => rejects(/content_purchase_paid_invoice_check/, () =>
+    q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price, status) VALUES ($1, $2, $3, 'online', 500, 'paid')`, [cPaid2, st2, b1])));
   test("only a paid content item can be purchased", () => rejects(/only a paid content item/, () =>
     q(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 100)`, [cFree, st2, b1])));
   test("D13: the branch must be one the item is listed in", () => rejects(/content_purchase_listed_branch_fk/, () =>
@@ -1043,8 +1088,19 @@ describe("Teacher payouts", () => {
     );
   });
 
+  test("H8: a payout cannot be inserted as paid", () => rejects(/a new payout must start as a draft/, () =>
+    q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status, approved_by, paid_on, payment_reference) VALUES ($1, '2029-01-01', '2029-02-01', 0, 0, 0, 'paid', $2, '2029-02-05', 'TRX-9')`, [lec, u1])));
+  test("H8: a payout cannot be inserted as approved", () => rejects(/a new payout must start as a draft/, () =>
+    q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status, approved_by) VALUES ($1, '2029-01-01', '2029-02-01', 0, 0, 0, 'approved', $2)`, [lec, u1])));
   test("a payout's net is gross minus commission", () => rejects(/teacher_payout_amounts_check/, () =>
     q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-02-01', '2027-03-01', 100, 20, 90)`, [lec])));
+  test("H8: gross and commission may be negative while the net is positive", async () => {
+    const d = await id(
+      `INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2030-01-01', '2030-02-01', -500, -900, 400)`,
+      [lec],
+    );
+    await q(`DELETE FROM teacher_payout WHERE id = $1`, [d]);
+  });
   test("H8: a payout cannot be negative", () => rejects(/teacher_payout_amounts_check/, () =>
     q(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1, '2027-02-01', '2027-03-01', 0, 20, -20)`, [lec])));
   test("a payout period ends after it starts", () => rejects(/teacher_payout_period_check/, () =>
@@ -1102,6 +1158,15 @@ describe("Gateway transactions", () => {
   test("a gateway transaction starts initiated with no reference", async () => {
     const r = await q(`SELECT status, provider_ref FROM gateway_transaction WHERE id = $1`, [gwTx]);
     if (r[0]!.status !== "initiated" || r[0]!.provider_ref !== null) throw new Error("unexpected defaults");
+  });
+  test("a payment with a gateway transaction cannot move to a non-gateway method", () => rejects(/must keep a gateway payment method/, () =>
+    q(`UPDATE payment SET payment_method_id = $1 WHERE id = $2`, [bankMethod, gwPayment])));
+  test("a payment method with gateway transactions cannot stop being a gateway method", () => rejects(/must stay a gateway method/, () =>
+    q(`UPDATE payment_method SET type = 'cash' WHERE id = $1`, [gwMethod])));
+  test("a payment without gateway transactions can still change method", async () => {
+    const m = await id(`INSERT INTO payment_method (organization_id, type, label) VALUES ((SELECT id FROM organization), 'cash', 'Counter')`);
+    const p = await id(`INSERT INTO payment (student_id, branch_id, payment_method_id, amount, submitted_by) VALUES ($1, $2, $3, 50, $4)`, [st1, b1, bankMethod, u1]);
+    await q(`UPDATE payment SET payment_method_id = $1 WHERE id = $2`, [m, p]);
   });
   test("a gateway transaction needs a gateway payment", () => rejects(/must use a gateway payment method/, () =>
     q(`INSERT INTO gateway_transaction (payment_id, provider) VALUES ($1, 'payhere')`, [payA])));
