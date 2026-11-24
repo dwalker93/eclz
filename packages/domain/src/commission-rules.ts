@@ -2,15 +2,23 @@ import { and, asc, eq, inArray, isNull, gt, lte, or, sql } from "drizzle-orm";
 import { COMMISSION_CALC_TYPES, commissionEntry, commissionRule, course, courseLecturer, feeRate, feeStructure, gradeLevel, lecturer, subject } from "@workspace/db/schema";
 import { fromCents, toCents } from "@workspace/db/money";
 import { writeAudit } from "./audit";
-import { requirePermission } from "./authorization";
+import { isCalendarDay } from "./dates";
+import { gateModule, requirePermission } from "./authorization";
 import { ServiceError } from "./errors";
 import { todayFor } from "./lookups";
 import { type Db, type Tx } from "./types";
 
-const DAY = /^\d{4}-\d{2}-\d{2}$/;
+/** The largest amount the numeric(12,2) rate column holds, in cents. */
+const MAX_RATE_CENTS = 999_999_999_999;
+const DATE_MESSAGE = "Dates look like 2027-01-31 and must be real calendar days.";
 const MONEY = /^\d+(\.\d{1,2})?$/;
 
 export type CommissionRuleScope = { courseId: string } | { subjectId: string; gradeLevelId?: string } | Record<string, never>;
+
+function dbError(err: unknown): { code?: string; constraint?: string } {
+  const e = err as { code?: string; constraint?: string; cause?: { code?: string; constraint?: string } };
+  return { code: e.code ?? e.cause?.code, constraint: e.constraint ?? e.cause?.constraint };
+}
 
 function isExclusionViolation(err: unknown): boolean {
   const e = err as { code?: string; cause?: { code?: string } };
@@ -23,11 +31,11 @@ function isExclusionViolation(err: unknown): boolean {
  * dates. A rate is never edited: end the old rule and add a new one, so past earnings keep the rule they were calculated with (H6).
  * Rules can be prepared while the commissions module is off; only accrual and payouts need it (H9).
  */
-export function createCommissionRuleService(db: Db, opts: { now?: () => Date } = {}) {
+function buildCommissionRuleService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
 
   /** H12: a fixed amount above the lowest current fee of the courses it covers is allowed, with a warning. */
-  async function fixedRateWarning(q: Tx | Db, lecturerId: string, scope: { courseId?: string; subjectId?: string }, rate: number, today: string) {
+  async function fixedRateWarning(q: Tx | Db, lecturerId: string, scope: { courseId?: string; subjectId?: string; gradeLevelId?: string }, rate: number, today: string) {
     const courseIds = scope.courseId
       ? [scope.courseId]
       : (
@@ -42,8 +50,16 @@ export function createCommissionRuleService(db: Db, opts: { now?: () => Date } =
       .select({ amount: sql<string>`min(${feeRate.amount})` })
       .from(feeRate)
       .innerJoin(feeStructure, eq(feeStructure.id, feeRate.feeStructureId))
-      .where(and(inArray(feeStructure.courseId, courseIds), eq(feeStructure.isActive, true), lte(feeRate.effectiveFrom, today), or(isNull(feeRate.effectiveTo), gt(feeRate.effectiveTo, today))));
-    if (low?.amount && rate > toCents(low.amount)) return [`The fixed amount is more than the lowest current fee (${low.amount}) of the course(s) it covers; the commission will be capped at what is collected.`];
+            .where(
+        and(
+          inArray(feeStructure.courseId, courseIds),
+          eq(feeStructure.isActive, true),
+          // A grade rule only meets that grade's rates and the rates that apply to every grade.
+          scope.gradeLevelId ? or(eq(feeRate.gradeLevelId, scope.gradeLevelId), isNull(feeRate.gradeLevelId)) : undefined,
+          lte(feeRate.effectiveFrom, today), or(isNull(feeRate.effectiveTo), gt(feeRate.effectiveTo, today)),
+        ),
+      );
+    if (low?.amount && rate > toCents(low.amount)) return [`The fixed amount is more than the lowest current fee (${low.amount}) of the course(s) it covers; the commission on each charge is capped at that charge's commission base (the fee itself on the list basis, the amount collected on the paid basis).`];
     return [];
   }
 
@@ -53,8 +69,9 @@ export function createCommissionRuleService(db: Db, opts: { now?: () => Date } =
       if (!(COMMISSION_CALC_TYPES as readonly string[]).includes(input.calcType)) throw new ServiceError("invalid_input", "Unknown calculation type.");
       if (!MONEY.test(input.rate)) throw new ServiceError("invalid_input", "The rate must be a number with at most two decimals.");
       const rateCents = toCents(input.rate);
+      if (!Number.isSafeInteger(rateCents) || rateCents > MAX_RATE_CENTS) throw new ServiceError("invalid_input", "That rate is too large to store.");
       if (input.calcType === "percent" && rateCents > 10_000) throw new ServiceError("invalid_input", "A percent rate is between 0 and 100.");
-      if (!DAY.test(input.effectiveFrom) || (input.effectiveTo != null && !DAY.test(input.effectiveTo))) throw new ServiceError("invalid_input", "Dates look like 2027-01-31.");
+      if (!isCalendarDay(input.effectiveFrom) || (input.effectiveTo != null && !isCalendarDay(input.effectiveTo))) throw new ServiceError("invalid_input", DATE_MESSAGE);
       if (input.effectiveTo != null && input.effectiveTo <= input.effectiveFrom) throw new ServiceError("invalid_input", "The end date must be after the start date (it is the first day the rule no longer applies).");
       const scope = (input.scope ?? {}) as { courseId?: string; subjectId?: string; gradeLevelId?: string };
       if (scope.courseId && (scope.subjectId || scope.gradeLevelId)) throw new ServiceError("invalid_input", "A course rule cannot also name a subject or grade.");
@@ -99,9 +116,10 @@ export function createCommissionRuleService(db: Db, opts: { now?: () => Date } =
     /** Sets the first day a rule no longer applies. It can close an open rule or shorten one, never extend it. */
     async end(input: { ruleId: string; actor: string; effectiveTo: string }) {
       await requirePermission(db, input.actor, "commissions.manage", { branchId: null });
-      if (!DAY.test(input.effectiveTo)) throw new ServiceError("invalid_input", "Dates look like 2027-01-31.");
+      if (!isCalendarDay(input.effectiveTo)) throw new ServiceError("invalid_input", DATE_MESSAGE);
       return db.transaction(async (tx) => {
-        const [cur] = await tx.select().from(commissionRule).where(eq(commissionRule.id, input.ruleId));
+        // Locked, so a second request validates against the end date the first one set (never extends a rule the first closed).
+        const [cur] = await tx.select().from(commissionRule).where(eq(commissionRule.id, input.ruleId)).for("update");
         if (!cur) throw new ServiceError("not_found", "Commission rule not found.");
         if (input.effectiveTo <= cur.effectiveFrom) throw new ServiceError("invalid_input", "The end date must be after the rule's start date.");
         if (cur.effectiveTo && input.effectiveTo >= cur.effectiveTo) throw new ServiceError("invalid_input", "A rule can only be shortened, not extended.");
@@ -114,20 +132,28 @@ export function createCommissionRuleService(db: Db, opts: { now?: () => Date } =
     /** Deletes a rule that no earning has used. A used rule is ended instead, so history keeps its rule. */
     async remove(input: { ruleId: string; actor: string }) {
       await requirePermission(db, input.actor, "commissions.manage", { branchId: null });
-      await db.transaction(async (tx) => {
-        const [cur] = await tx.select().from(commissionRule).where(eq(commissionRule.id, input.ruleId));
-        if (!cur) throw new ServiceError("not_found", "Commission rule not found.");
-        const [used] = await tx.select({ id: commissionEntry.id }).from(commissionEntry).where(eq(commissionEntry.ruleId, cur.id)).limit(1);
-        if (used) throw new ServiceError("rule_in_use", "Earnings were calculated with this rule. End it instead of deleting it.");
-        await tx.delete(commissionRule).where(eq(commissionRule.id, cur.id));
-        await writeAudit(tx, { actor: input.actor, action: "commission_rule.remove", entityType: "commission_rule", entityId: cur.id, before: { lecturerId: cur.lecturerId, courseId: cur.courseId, subjectId: cur.subjectId, gradeLevelId: cur.gradeLevelId, calcType: cur.calcType, rate: cur.commissionRate, effectiveFrom: cur.effectiveFrom, effectiveTo: cur.effectiveTo } });
-      });
+      try {
+        await db.transaction(async (tx) => {
+          const [cur] = await tx.select().from(commissionRule).where(eq(commissionRule.id, input.ruleId)).for("update");
+          if (!cur) throw new ServiceError("not_found", "Commission rule not found.");
+          const [used] = await tx.select({ id: commissionEntry.id }).from(commissionEntry).where(eq(commissionEntry.ruleId, cur.id)).limit(1);
+          if (used) throw new ServiceError("rule_in_use", "Earnings were calculated with this rule. End it instead of deleting it.");
+          const gone = await tx.delete(commissionRule).where(eq(commissionRule.id, cur.id)).returning({ id: commissionRule.id });
+          if (gone.length === 0) throw new ServiceError("not_found", "Commission rule not found."); // another request deleted it first: no second audit entry
+          await writeAudit(tx, { actor: input.actor, action: "commission_rule.remove", entityType: "commission_rule", entityId: cur.id, before: { lecturerId: cur.lecturerId, courseId: cur.courseId, subjectId: cur.subjectId, gradeLevelId: cur.gradeLevelId, calcType: cur.calcType, rate: cur.commissionRate, effectiveFrom: cur.effectiveFrom, effectiveTo: cur.effectiveTo } });
+        });
+      } catch (err) {
+        // An earning committed a reference between the check and the delete; the foreign key kept the rule.
+        const e = dbError(err);
+        if (e.code === "23503" && e.constraint === "commission_entry_rule_lecturer_fk") throw new ServiceError("rule_in_use", "Earnings were calculated with this rule. End it instead of deleting it.");
+        throw err;
+      }
     },
 
     /** Rules, newest first. `activeOn` keeps only those that apply on that day. */
     async list(input: { actor: string; lecturerId?: string; activeOn?: string }) {
       await requirePermission(db, input.actor, "commissions.manage", { branchId: null });
-      if (input.activeOn && !DAY.test(input.activeOn)) throw new ServiceError("invalid_input", "Dates look like 2027-01-31.");
+      if (input.activeOn && !isCalendarDay(input.activeOn)) throw new ServiceError("invalid_input", DATE_MESSAGE);
       return db
         .select()
         .from(commissionRule)
@@ -142,4 +168,8 @@ export function createCommissionRuleService(db: Db, opts: { now?: () => Date } =
   };
 }
 
-export type CommissionRuleService = ReturnType<typeof createCommissionRuleService>;
+/** K: commission rules belong to the commissions module: create, list, end and remove all answer `module_disabled` while it is off. */
+export function createCommissionRuleService(db: Db, opts: { now?: () => Date } = {}) {
+  return gateModule(db, "commissions", buildCommissionRuleService(db, opts));
+}
+export type CommissionRuleService = ReturnType<typeof buildCommissionRuleService>;

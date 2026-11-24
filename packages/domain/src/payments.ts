@@ -11,7 +11,7 @@ import {
 } from "@workspace/db/schema";
 import { linkedTotals, planAllocation, type PlannedAllocation } from "./allocation";
 import { refreshInvoiceCaches } from "./invoices";
-import { todayFor } from "./lookups";
+import { lockStudent, todayFor } from "./lookups";
 import { fromCents, toCents } from "@workspace/db/money";
 import { issueReceipt, type IssueReceiptOptions, type ReceiptSigner } from "./receipts";
 import { ServiceError } from "./errors";
@@ -120,6 +120,7 @@ async function audit(
 async function lockPayment(tx: Tx, paymentId: string): Promise<PaymentRow> {
   const [p] = await tx.select().from(payment).where(eq(payment.id, paymentId)).for("update");
   if (!p) throw new ServiceError("not_found", "Payment not found.");
+  await lockStudent(tx, p.studentId); // payment, then student, then invoices: the order every entry point follows
   return p;
 }
 
@@ -170,12 +171,14 @@ async function loadOpenItems(tx: Tx, p: PaymentRow, invoiceIds: string[] | undef
 
   // Lines linked to an item (discounts, reductions, positive adjustments) change that item's net and are not payable items of their own.
   const applied = linkedTotals(items.map((i) => ({ id: i.id, cents: toCents(i.amount), appliesToItemId: i.appliesToItemId })));
+  // Allocations recorded against a linked line (a positive adjustment that was paid under its own id) count as paid on the root item it belongs to.
+  const paidOnLines = linkedTotals(items.map((i) => ({ id: i.id, cents: paidBy.get(i.id) ?? 0, appliesToItemId: i.appliesToItemId })));
   const open: OpenItem[] = [];
   for (const it of items) {
     const payable = (PAYABLE_KINDS as readonly string[]).includes(it.kind) && toCents(it.amount) > 0 && !it.appliesToItemId;
     if (!payable) continue;
     const net = toCents(it.amount) + (applied.get(it.id) ?? 0);
-    const outstanding = net - (paidBy.get(it.id) ?? 0);
+    const outstanding = net - (paidBy.get(it.id) ?? 0) - (paidOnLines.get(it.id) ?? 0);
     if (outstanding > 0) open.push({ invoiceId: it.invoiceId, itemId: it.id, outstanding });
   }
   return { invoices, items: open };
@@ -193,6 +196,7 @@ async function verifyInTx(
   if (p.status !== "pending_verification") {
     throw new ServiceError("payment_not_pending", `Payment is ${p.status}, so it cannot be verified.`);
   }
+  await lockStudent(tx, p.studentId); // also for a cash payment, which reaches here without lockPayment
   const now = (opts.now ?? (() => new Date()))();
   const amount = toCents(p.amount);
 

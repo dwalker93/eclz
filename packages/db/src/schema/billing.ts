@@ -407,6 +407,8 @@ export const invoiceItem = pgTable(
       .where(sql`${t.kind} = 'recurring_fee' AND ${t.cancelledAt} IS NULL`),
     index("invoice_item_invoice_idx").on(t.invoiceId),
     index("invoice_item_enrollment_idx").on(t.enrollmentId),
+    // The discount-enrolment trigger (0014) looks discounts up by the item they reduce.
+    index("invoice_item_applies_to_idx").on(t.appliesToItemId),
   ],
 );
 

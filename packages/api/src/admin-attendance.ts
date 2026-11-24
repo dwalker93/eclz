@@ -1,5 +1,5 @@
 import { classSession, course } from "@workspace/db/schema";
-import { requirePermission, requireStudent, ServiceError, type AttendanceService, type Db, type StudentService } from "@workspace/domain";
+import { branchScope, isCalendarDay, normalizeClockTime, requirePermission, requireStudent, ServiceError, type AttendanceService, type Db, type StudentService } from "@workspace/domain";
 import { eq } from "drizzle-orm";
 import type { Hono } from "hono";
 import { z } from "zod";
@@ -7,8 +7,8 @@ import { jsonBody } from "./http";
 import type { Env } from "./session";
 
 const uuid = z.string().uuid();
-const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
-const time = z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/);
+const day = z.string().refine(isCalendarDay, "Use a real calendar date like 2027-03-31.");
+const time = z.string().refine((v) => normalizeClockTime(v) !== null, "Use a real time like 09:00 or 09:00:00.");
 
 const entry = z.object({
   studentId: uuid,
@@ -92,15 +92,17 @@ export function addAttendanceRoutes(app: Hono<Env>, { db, attendance, students }
 
   app.get("/students/:id/attendance", async (c) => {
     const id = uuid.parse(c.req.param("id"));
-    await requireStudent(db, c.get("principal").userId, "attendance.read", id);
+    const user = c.get("principal").userId;
+    await requireStudent(db, user, "attendance.read", id);
     const q = z.object({ courseId: uuid.optional(), from: day.optional(), to: day.optional() }).parse(c.req.query());
-    return c.json(await attendance.studentSummary({ studentId: id, ...q }));
+    // Attendance belongs to the course's branch (I1, I2), not to every branch the student is in: count only the caller's branches.
+    return c.json(await attendance.studentSummary({ studentId: id, ...q, scope: await branchScope(db, user, "attendance.read") }));
   });
 
   app.post("/students/:id/rotate-qr", async (c) => {
     const id = uuid.parse(c.req.param("id"));
     await requireStudent(db, c.get("principal").userId, "students.update", id);
-    await students.get({ studentId: id });
+    await students.get({ studentId: id, scope: "all" }); // existence check only; the caller was authorized above
     return c.json(await attendance.rotateQrToken({ studentId: id }));
   });
 }

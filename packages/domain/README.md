@@ -44,7 +44,7 @@ await payments.recordCashPayment({ studentId, branchId, amount, recordedBy, invo
 const check = await verifyReceipt(db, verificationCode, signer);   // for the public verify page
 ```
 
-What they do, by rule: E3 and E4 (verification and allocation in one transaction, no advance payments), E5 (never more than an item's net outstanding,
+What they do, by rule: E3 and E4 (verification and allocation in one transaction, no advance payments), E5 (never more than an item's net outstanding, where allocations recorded under a linked line count as paid on the root item,
 with invoice rows locked in id order), E7 (default split: oldest due date first, pro rata across payable items with largest-remainder rounding, or explicit
 item lines), E1 and E16 (invoice and installment caches re-derived in the same transaction), E8, E9 (void reverses allocations, voids the receipt),
 E11 (cash), E12 and E13 (one signed receipt per payment, number from the branch counter), J3 (audit rows). Domain errors are `ServiceError` with a `code`.
@@ -167,10 +167,10 @@ Behaviour to know:
 - **Restrict and restore are per enrolment.** Every active or completed enrolment with a fee line on a past-grace invoice whose action includes restrict becomes `restricted`. It is restored only when no such invoice remains unpaid, so paying one of two overdue invoices keeps the restriction. Dropped enrolments are never touched. A restriction is a billing overlay: C8 reads it, nothing else changes.
 - **Verified payment and void.** The hooks run the same reconcile for the payment's student in the same transaction. A verified payment that clears the last overdue invoice restores access straight away (the verifier is the audit actor, which matches "access returns after staff verify the payment"). A void that leaves an invoice unpaid and past grace marks it overdue and restricts again at once. The daily job writes audit rows with no actor.
 - **Statuses go back too.** If an invoice or installment is no longer overdue (grace changed, due date moved) it returns to pending or partial.
-- **Notifications.** One row per recipient, channel and overdue item (invoice, or installment number), event `installment_overdue`, so reruns add nothing. Recipients are the student's portal user and, when the `parent_portal` module is on, guardians with a portal login. Channels are in-app always, plus email, SMS and push only when the module and the channel switch are both on. In-app rows are `sent`, external ones `queued` for the dispatcher (not built yet). A student with no portal login still gets the status and restriction, but no notification (the table needs a user).
+- **Notifications.** One row per recipient, channel and overdue item (invoice, or installment number), event `installment_overdue`, so reruns add nothing. Recipients are the student's portal user and, when the `parent_portal` module is on, guardians with a portal login. Channels are in-app always, plus email, SMS and push only when the module and the channel switch are both on. In-app rows are `sent`, external ones `queued` for the dispatcher (see Notifications below). A student with no portal login still gets the status and restriction, but no notification (the table needs a user).
 - Invoices with no fee line (content only) get the overdue status and notification but restrict nothing.
 - The job reconciles each student in a transaction of their own and reports failures in `errors` rather than stopping.
-- Not covered: the "due soon" reminder (`installment_due`), and the notification dispatcher that actually sends email, SMS and push.
+- The "due soon" reminder (`installment_due`) and the dispatcher that sends the queued email, SMS and push rows are described under Notifications below.
 
 ### Notifications
 
@@ -271,8 +271,10 @@ await exams.finalizeExpiredAttempts();  // every few minutes
 - Answer locking, chosen per exam (`lockAnswers`, default off): off means a student can change or clear an answer until the attempt ends; on means the first choice is final (`answer_locked` on a change or clear; saving the same choice again is accepted, so network retries are safe; a batch with a refused answer saves nothing). The student's paper carries `lockAnswers` so the screen can disable chosen options. Either way every choice should be saved as it is made, so nothing is lost if the connection drops.
 - G5: answers store the option key; grading reads only the snapshot. The student's paper never contains correct flags or explanations.
 - G7: after each finished attempt the result follows the counted attempt (`best`: highest score, earliest on a tie; `latest`: highest attempt number) until it is released or overridden. Paper exams get results only through `enterMarks` (within the total marks).
+- An exam's total marks must fit numeric(8,2) (999999.99): `setQuestions` refuses a larger sum (counting the bank's default marks) before replacing anything, and `publishExam` refuses an older draft that is already over it, both with `exam_invalid`.
+- `getResults` and `enterMarks` take an optional `branchIds`: only results recorded in courses of those branches are returned and counted (or may be written; an entry outside it fails the batch with `forbidden` and nothing is saved). A new result for a student in several attached courses is recorded in an in-scope one. `examResultScope(db, user, code, examId)` gives the set for a caller (`"all"` for the owner and all-branches staff).
 - G8: results are released only for a closed exam. An online exam past its closing time is closed first. A paper exam must be closed by hand. After release, `enterMarks` (paper) and `overrideResult` (online, sets `manual_override`) need a reason and write an audit row (J3).
-- G9: `immediate` shows the score as soon as it exists, marked provisional until released; `after_release` and `manual` show nothing until released. The release job releases `immediate` and `after_release` exams after they close; `manual` ones wait for `releaseResults`.
+- G9: `immediate` shows the score as soon as it exists, marked provisional until released; `after_release` and `manual` show nothing until released. The release job releases `immediate` and `after_release` exams after they close; `manual` ones wait for `releaseResults`. The same rule covers an attempt's own score: `submitAttempt` returns `score: null` and `getAttempt` returns `score: null, scoreHidden: true` while an `after_release` or `manual` result is unreleased (the stored score is unchanged). Student calls (`getAttempt`, `saveAnswers`, `submitAttempt`, `startAttempt`) only ever finalize that student's own attempts; `finalizeExpiredAttempts` is the unrestricted path. `saveAnswers` and `submitAttempt` re-check the deadline under the attempt's lock: an attempt that expired meanwhile is finalized and committed as `expired`, then `saveAnswers` answers `attempt_time_over` and `submitAttempt` returns the expired attempt. `attendance.studentSummary` rejects impossible `from` or `to` days with `invalid_input` (`from` inclusive, `to` exclusive).
 
 ### Content
 
@@ -316,11 +318,12 @@ await guardians.unlink({ studentId, guardianId, actor });                       
 ### Commission rules
 ```ts
 const rules = createCommissionRuleService(db);
-await rules.create({ actor, lecturerId, scope: { courseId } | { subjectId, gradeLevelId? } | {}, calcType, rate, effectiveFrom, effectiveTo });  // -> { rule, warnings }
+await rules.create({ actor, lecturerId, scope: { courseId }, calcType: "percent", rate: "20", effectiveFrom: "2027-01-01", effectiveTo: "2027-12-31" });  // -> { rule, warnings }
 await rules.end({ ruleId, actor, effectiveTo });   // closes or shortens, never extends
 await rules.remove({ ruleId, actor });             // only if no earning used it
 await rules.list({ actor, lecturerId, activeOn });
 ```
+- `scope` is one of `{ courseId }`, `{ subjectId }`, `{ subjectId, gradeLevelId }` or `{}` (every course of the lecturer). `effectiveTo` may be left out for an open-ended rule.
 - Institute-wide, so every call needs `commissions.manage` as an all-branches role. Rules of the same scope never overlap in dates (`rule_overlap`; the database has the same guard).
 - A rate is never edited: end the old rule and create a new one, so past earnings keep their rule (H6). A used rule cannot be deleted (`rule_in_use`).
 - A fixed amount above the lowest current fee of the courses it covers returns a warning (H12). Rules can be prepared while the commissions module is off.
@@ -328,9 +331,10 @@ await rules.list({ actor, lecturerId, activeOn });
 ### Reports (the owner's)
 ```ts
 const reports = createReportService(db);
-await reports.overdue({ actor, branchId?, limit?, offset? });   // unpaid invoices past their due date: totals, aging, per branch, rows with the parent's phone
-await reports.collections({ actor, from, to, branchId? });      // money verified in a period (local dates, at most 366 days): by branch, method and day, plus slips still pending
+await reports.overdue({ actor });                               // unpaid invoices past their due date: totals, aging, per branch, rows with the parent's phone
+await reports.collections({ actor, from: "2027-03-01", to: "2027-03-31" });      // money verified in a period (local dates, at most 366 days): by branch, method and day, plus slips still pending
 ```
+- Optional inputs: `branchId` on both reports (one branch, which must be inside the actor's own), and `limit` and `offset` on `overdue` for paging. Without `branchId` each report covers every branch the actor may read.
 - Needs `reports.read`, and covers only the branches the actor holds it in (all with an all-branches assignment). The root admin has it from the seed; migration 0012 adds it to existing databases.
 - Overdue means unpaid after the due date whatever the stored status says, so it is right before the overdue job runs. Aging buckets are 1 to 30, 31 to 60 and 61 or more days late; a due date of today is not late yet. Totals cover every overdue invoice, the rows are paged.
 - Collected money is by verification date in the organization's time zone; a payment voided later is left out.
@@ -431,3 +435,27 @@ The row locks (`FOR UPDATE`) cannot be exercised by PGlite, which has one connec
 two payments on the same invoice, and two payout creations for one lecturer against a real PostgreSQL database.
 
 Payment arithmetic note: lines linked to an item (discounts, reductions, positive adjustments with `appliesToItemId`) change that item's net once through `linkedTotals` and are not payable items of their own; receipt verification fails as `tampered` if the receipt row's branch differs from the signed payload's.
+
+Lock order: anything that locks a student's invoices takes the student row first (`lockStudent`, `FOR NO KEY UPDATE`), then the invoices in id order (`lockInvoice` does both). Payment verify and void, invoice adjust and cancel, the overdue reconcile and branch membership all follow it.
+
+Commission notes: `accrue` skips voided allocations (`allocation_reversed`); fixed commissions split between co-teachers by largest remainder; `reverse` voids an accrual only while it is still unpaid, else reverses the settled entry.
+
+Promotion notes: a move target must serve the promoted grade (`grade_not_allowed`, no override) and must not be a one-time package class; the old enrolment ends on the effective date and stays billable for unbilled months before it; the generator re-checks each prepared invoice against the locked enrolments before inserting; blocked-item flags are written only to items still in the failed state of a still-draft run; clearing a pinned billing grade is checked for every month it affects.
+
+Attendance notes: `createSession` locks the course row; `markRemainingAbsent` runs in one transaction under the session lock and shares its writing code with `mark`.
+
+Notification notes: provider calls time out after `providerTimeoutMs` (default 15 s) and fail the row; `listInApp` filters and limits in SQL and validates `limit`.
+
+Auth notes: `setUserStatus` deletes the user's sessions when disabling; `setInitialPasswordIn(tx, ...)` is the transactional body of `setInitialPassword`, for callers that commit more with it.
+
+Guardian logins: `findGuardianByPhone` matches any stored phone format; `ensureGuardianLogin` reuses only a bare `parent-<phone>` account (else `phone_taken`); `provisionGuardianLogins` returns `{ provisioned, skipped, duplicates, conflicts }`; usernames starting with `parent-` are reserved in `register`.
+
+Guardians: `link` reuses a guardian by phone only inside the actor's branch scope (else `forbidden`); link changes lock the student row first; `changePhone` locks the number and the guardian row and checks login clashes even without a login; `normalizeGuardianEmail` is the one email rule.
+
+Commission rules: dates must be real calendar days, a fixed rate must fit numeric(12,2), `end` and `remove` lock the rule, `remove` reports `rule_in_use` when an accrual wins the race and `not_found` when the row is already gone; the fixed-rate warning names the commission base and respects a rule's grade.
+
+Students: `get` needs the caller's read `scope` and filters enrolments to those branches; birth dates must be real, not future, and an under-age correction needs a linked guardian.
+
+Notices: edits lock the row and keep fields omitted from a patch from the latest row; removal audits the deleted text; grade and course notices follow the grade and the access window in effect today; staff see role notices only.
+
+Reports: `overdue` aggregates in SQL and pages in SQL (fully paid invoices excluded); both reports read in one read-only repeatable-read transaction; `collections` validates real calendar dates.

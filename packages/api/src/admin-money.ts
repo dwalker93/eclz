@@ -1,5 +1,5 @@
 import { course, enrollment, feeException } from "@workspace/db/schema";
-import { requirePermission, ServiceError, type Db, type FeeExceptionService, type PayoutService, type PromotionService } from "@workspace/domain";
+import { isCalendarDay, requirePermission, ServiceError, type Db, type FeeExceptionService, type PayoutService, type PromotionService } from "@workspace/domain";
 import { eq } from "drizzle-orm";
 import type { Hono } from "hono";
 import { z } from "zod";
@@ -7,7 +7,7 @@ import { jsonBody } from "./http";
 import type { Env } from "./session";
 
 const uuid = z.string().uuid();
-const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+const day = z.string().refine(isCalendarDay, "Use a real calendar date like 2027-03-31.");
 const money = z.string().regex(/^\d{1,10}(\.\d{1,2})?$/);
 const reason = z.string().trim().min(3).max(500);
 
@@ -138,7 +138,8 @@ export function addMoneyRoutes(app: Hono<Env>, { db, feeExceptions, promotion, p
 
   app.post("/payouts/:id/approve", async (c) => {
     await orgWide(c, "payouts.manage");
-    return c.json({ payout: await payouts.approvePayout({ payoutId: uuid.parse(c.req.param("id")), approvedBy: c.get("principal").userId }) });
+    // Same top-level shape as refresh: { payout, pulledReversals }.
+    return c.json(await payouts.approvePayout({ payoutId: uuid.parse(c.req.param("id")), approvedBy: c.get("principal").userId }));
   });
 
   app.post("/payouts/:id/paid", async (c) => {

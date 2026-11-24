@@ -1,6 +1,6 @@
 import type { AuthService } from "@workspace/auth";
 import { contentPurchase, course, courseLecturer } from "@workspace/db/schema";
-import { branchScope, requirePermission, requireResource, ServiceError, type ContentService, type Db } from "@workspace/domain";
+import { branchScope, requireContentWide, requireLecturerPermission, requirePermission, requireResource, ServiceError, type ContentService, type Db } from "@workspace/domain";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -60,6 +60,8 @@ export function createContentRoutes({ db, auth, content, session }: ContentRoute
     const b = await jsonBody(c, createBody);
     const lecturerId = portal === "lecturer" ? p.identity.lecturerId : b.lecturerId;
     if (!lecturerId) throw new ServiceError("invalid_input", "Say which lecturer the content belongs to.");
+    // A lecturer needs the lecturer role's content.manage even for an unlisted item: otherwise they could create what the resource guard then stops them editing.
+    if (portal === "lecturer") await requireLecturerPermission(db, p.userId, "content.manage");
     await checkBranches(c, b.branchIds ?? []);
     const { lecturerId: _drop, ...rest } = b;
     return c.json({ item: await content.createItem({ ...rest, lecturerId }) }, 201);
@@ -75,14 +77,14 @@ export function createContentRoutes({ db, auth, content, session }: ContentRoute
 
   app.patch("/items/:id", async (c) => {
     const contentId = id(c);
-    await requireResource(db, c.get("principal").userId, "content.manage", { type: "content", id: contentId });
+    await requireContentWide(db, c.get("principal").userId, "content.manage", contentId);
     const b = await jsonBody(c, z.object({ title: z.string().trim().min(1).max(200).optional(), description: z.string().max(2000).nullable().optional(), price: price.optional() }));
     return c.json({ item: await content.updateItem({ contentId, ...b }) });
   });
 
   app.post("/items/:id/status", async (c) => {
     const contentId = id(c);
-    await requireResource(db, c.get("principal").userId, "content.manage", { type: "content", id: contentId });
+    await requireContentWide(db, c.get("principal").userId, "content.manage", contentId);
     const b = await jsonBody(c, z.object({ status: z.enum(["published", "archived"]) }));
     return c.json({ item: await content.setStatus({ contentId, ...b }) });
   });
@@ -99,16 +101,20 @@ export function createContentRoutes({ db, auth, content, session }: ContentRoute
   app.post("/courses/:courseId/content", async (c) => {
     const user = c.get("principal").userId;
     const courseId = id(c, "courseId");
-    const b = await jsonBody(c, z.object({ contentId: uuid, sectionId: uuid.optional(), position: z.number().int().min(0).max(1000).optional() }));
+    const b = await jsonBody(c, z.object({ contentId: uuid, sectionId: uuid.nullable().optional(), position: z.number().int().min(0).max(1000).optional() }));
     await requireResource(db, user, "content.manage", { type: "course", id: courseId });
     await requireResource(db, user, "content.manage", { type: "content", id: b.contentId });
     return c.json({ link: await content.attachToCourse({ courseId, ...b }) }, 201);
   });
 
   app.delete("/courses/:courseId/content/:contentId", async (c) => {
+    const user = c.get("principal").userId;
     const courseId = id(c, "courseId");
-    await requireResource(db, c.get("principal").userId, "content.manage", { type: "course", id: courseId });
-    await content.detachFromCourse({ courseId, contentId: id(c, "contentId") });
+    const contentId = id(c, "contentId");
+    // The same two checks as attaching: a co-teacher of the course cannot remove another lecturer's item from it.
+    await requireResource(db, user, "content.manage", { type: "course", id: courseId });
+    await requireResource(db, user, "content.manage", { type: "content", id: contentId });
+    await content.detachFromCourse({ courseId, contentId });
     return c.json({ ok: true });
   });
 
@@ -124,8 +130,8 @@ export function createContentRoutes({ db, auth, content, session }: ContentRoute
     app.get("/handovers", async (c) => {
       const scope = await branchScope(db, c.get("principal").userId, "content.handover");
       if (scope !== "all" && scope.length === 0) throw new ServiceError("forbidden", "You do not have the content.handover permission.");
-      const rows = await content.pendingHandovers();
-      return c.json({ handovers: scope === "all" ? rows : rows.filter((r) => scope.includes(r.purchase.branchId)) });
+      // The branch filter runs in the query, so a scoped request never loads other branches' rows.
+      return c.json({ handovers: await content.pendingHandovers(scope === "all" ? {} : { branchIds: scope }) });
     });
 
     app.post("/purchases/:id/hand-over", async (c) => {

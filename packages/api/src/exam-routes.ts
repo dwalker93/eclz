@@ -1,6 +1,6 @@
 import type { AuthService } from "@workspace/auth";
 import { exam } from "@workspace/db/schema";
-import { requireResource, ServiceError, type Db, type ExamService, type Resource } from "@workspace/domain";
+import { examResultScope, isCalendarDay, requireModule, requireResource, ServiceError, type Db, type ExamService, type Resource } from "@workspace/domain";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -9,11 +9,18 @@ import { requirePortalOf, requireReady, withPrincipal, type Env, type SessionCon
 
 const uuid = z.string().uuid();
 const marks = z.union([z.string().regex(/^\d{1,6}(\.\d{1,2})?$/), z.number().min(0).max(100000)]);
+// Marks that must be above zero (a question's marks, total marks, a weight): the database refuses zero, so it is a 400 here rather than a 500.
+const positiveMarks = marks.refine((v) => Number(v) > 0, "Must be above zero.");
+const day = z.string().refine(isCalendarDay, "Use a real calendar date like 2027-03-31.");
+
+// A timestamp string with an explicit zone (Z or an offset). z.coerce.date() would turn null into 1970-01-01 and a bare number or a zone-less
+// string into a date in the server's zone.
+const instant = z.string().datetime({ offset: true }).transform((v) => new Date(v));
 
 const questionBody = z.object({
   body: z.string().min(1).max(2000),
   options: z.array(z.object({ body: z.string().min(1).max(500), isCorrect: z.boolean() })).min(2).max(26),
-  defaultMarks: marks.optional(),
+  defaultMarks: positiveMarks.optional(),
   explanation: z.string().max(2000).optional(),
   imageFileId: uuid.optional(),
 });
@@ -23,11 +30,11 @@ const examBody = z.object({
   title: z.string().min(1).max(200),
   mode: z.enum(["online_mcq", "paper"]),
   courseIds: z.array(uuid).min(1).max(20),
-  examDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  maxMarks: marks.optional(),
-  weight: marks.optional(),
-  opensAt: z.coerce.date().optional(),
-  closesAt: z.coerce.date().optional(),
+  examDate: day.optional(),
+  maxMarks: positiveMarks.optional(),
+  weight: positiveMarks.optional(),
+  opensAt: instant.optional(),
+  closesAt: instant.optional(),
   timeLimitMinutes: z.number().int().min(1).max(1440).optional(),
   maxAttempts: z.number().int().min(1).max(20).optional(),
   attemptScoring: z.enum(["best", "latest"]).optional(),
@@ -50,7 +57,16 @@ export interface ExamRouteDeps {
  */
 export function createExamRoutes({ db, auth, exams, session }: ExamRouteDeps, portal: "lecturer" | "admin") {
   const app = new Hono<Env>();
-  app.use("*", withPrincipal(auth, session), requireReady(auth), requirePortalOf(auth, portal));
+  // Only the exam and question paths: this app is mounted at /lecturer, whose other children (content, payouts) bring their own guard, so a
+  // wildcard here would load the session and identity a second time on every one of their requests.
+  const guard = [withPrincipal(auth, session), requireReady(auth), requirePortalOf(auth, portal)] as const;
+  // The module check comes after sign-in and the portal, but before any guard that looks a resource up: with the module off every exam route is
+  // 403 module_disabled, never a 404 for a missing exam. The service keeps its own gate for callers that do not come through HTTP.
+  const moduleOn = async (_c: unknown, next: () => Promise<void>) => {
+    await requireModule(db, "online_exams");
+    await next();
+  };
+  for (const path of ["/questions/*", "/exams/*"]) app.use(path, ...guard, moduleOn);
 
   async function need(userId: string, code: "exams.manage" | "exams.release", r: Resource) {
     await requireResource(db, userId, code, r);
@@ -85,7 +101,7 @@ export function createExamRoutes({ db, auth, exams, session }: ExamRouteDeps, po
   app.put("/exams/:id/questions", async (c) => {
     const id = examId(c);
     await need(c.get("principal").userId, "exams.manage", { type: "exam", id });
-    const b = await jsonBody(c, z.object({ questions: z.array(z.object({ questionId: uuid, marks: marks.optional() })).max(500) }));
+    const b = await jsonBody(c, z.object({ questions: z.array(z.object({ questionId: uuid, marks: positiveMarks.optional() })).max(500) }));
     return c.json(await exams.setQuestions({ examId: id, ...b }));
   });
 
@@ -109,7 +125,9 @@ export function createExamRoutes({ db, auth, exams, session }: ExamRouteDeps, po
       c,
       z.object({ entries: z.array(z.object({ studentId: uuid, marks, grade: z.string().max(10).optional(), remarks: z.string().max(300).optional() })).min(1).max(500), reason: z.string().max(300).optional() }),
     );
-    return c.json(await exams.enterMarks({ examId: id, entries: b.entries, actor: p.userId, reason: b.reason }));
+    // A manager of one branch of a shared exam may only enter marks for results recorded in that branch; the owner and all-branches staff are unrestricted.
+    const scope = await examResultScope(db, p.userId, "exams.manage", id);
+    return c.json(await exams.enterMarks({ examId: id, entries: b.entries, actor: p.userId, reason: b.reason, ...(scope === "all" ? {} : { branchIds: scope }) }));
   });
 
   app.post("/exams/:id/release", async (c) => {
@@ -123,7 +141,9 @@ export function createExamRoutes({ db, auth, exams, session }: ExamRouteDeps, po
     await need(c.get("principal").userId, "exams.manage", { type: "exam", id });
     const [e] = await db.select({ id: exam.id }).from(exam).where(eq(exam.id, id));
     if (!e) throw new ServiceError("not_found", "Exam not found.");
-    return c.json(await exams.getResults({ examId: id }));
+    // Rows and aggregates both come from the results in the caller's branches; the owner and all-branches staff see every result.
+    const scope = await examResultScope(db, c.get("principal").userId, "exams.manage", id);
+    return c.json(await exams.getResults({ examId: id, ...(scope === "all" ? {} : { branchIds: scope }) }));
   });
 
   return app;

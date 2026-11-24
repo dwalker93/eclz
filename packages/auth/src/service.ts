@@ -1,20 +1,39 @@
-import { and, eq, lt, ne } from "drizzle-orm";
+import { and, eq, isNull, lt, ne } from "drizzle-orm";
 import { authRateLimit, authSession, guardian, user, userTwoFactor } from "@workspace/db/schema";
 import {
   authorizeAnywhere,
+  canonicalUuid,
+  guardianInScope,
   createAccessControlService,
   isRootAdmin,
   normalizeSriLankaPhone,
   resolveIdentity,
   ServiceError,
+  setInitialPasswordIn,
   writeAudit,
   type Db,
   type Identity,
+  type Tx,
 } from "@workspace/domain";
 import { decrypt, encrypt, newToken, sha256 } from "./crypto";
 import { burnTime, checkPassword, hashPassword, verifyPassword } from "./password";
 import { clear, hit } from "./rate-limit";
 import { newTotpSecret, otpauthUri, verifyTotp } from "./totp";
+
+type Q = Db | Tx;
+type UserRow = typeof user.$inferSelect;
+const PHONE_LIKE = /^[\d\s+()-]{9,}$/;
+
+/**
+ * The sign-in counter key. Phone numbers are canonical, so `0771234567` and `077 1234567` share one counter, the same canonical form the
+ * lookup uses. Emails are case-insensitive; a username keeps its case because username lookup is case-sensitive.
+ */
+export function signInKey(raw: string): string {
+  const id = raw.trim().slice(0, 200);
+  if (id.includes("@")) return `signin:id:${id.toLowerCase()}`;
+  if (PHONE_LIKE.test(id)) return `signin:id:phone:${normalizeSriLankaPhone(id) ?? id.replace(/\D/g, "")}`;
+  return `signin:id:user:${id}`;
+}
 
 export interface AuthOptions {
   /** Server secret (at least 16 characters) that protects stored authenticator secrets. Keep it in the environment, never in the repository. */
@@ -60,6 +79,12 @@ function newRecoveryCode(): string {
   return `${raw.slice(0, 5)}-${raw.slice(5)}`;
 }
 
+function assertReadyPrincipal(principal: Principal): void {
+  if (principal.restriction === "set_password") throw new ServiceError("password_setup_required", "Set a password first.");
+  if (principal.restriction === "mfa") throw new ServiceError("mfa_required", "Enter your authenticator code.");
+  if (principal.restriction === "mfa_setup") throw new ServiceError("mfa_setup_required", "Set up two-step sign-in first.");
+}
+
 export function createAuthService(db: Db, opts: AuthOptions) {
   if (opts.secretKey.length < 16) throw new Error("secretKey must be at least 16 characters.");
   const now = () => (opts.now ?? (() => new Date()))();
@@ -69,21 +94,27 @@ export function createAuthService(db: Db, opts: AuthOptions) {
   const bad = () => new ServiceError("invalid_credentials", "Wrong sign-in details.");
   const noSession = () => new ServiceError("unauthenticated", "Please sign in.");
 
-  async function createSession(userId: string, identity: Identity, meta: { ip?: string | null; userAgent?: string | null }, mfaVerified = false): Promise<{ token: string; expiresAt: Date }> {
+  /**
+   * Issues a session under a lock on the user row, the same lock every credential change takes (set or change password, disable). The
+   * authentication condition is checked again inside the lock: the account must still be active and still hold the password hash the
+   * caller verified (`null` for a first login). If a credential change got in between, no session is issued.
+   */
+  async function createSession(userId: string, meta: { ip?: string | null; userAgent?: string | null }, expectHash: string | null): Promise<SignedIn> {
     const token = newToken();
-    const hours = identity.portals.admin ? (opts.staffSessionHours ?? 12) : (opts.sessionDays ?? 30) * 24;
-    const expiresAt = new Date(now().getTime() + hours * 3_600_000);
-    await db.insert(authSession).values({
-      userId,
-      tokenHash: sha256(token),
-      expiresAt,
-      lastSeenAt: now(),
-      mfaVerifiedAt: mfaVerified ? now() : null,
-      ip: meta.ip ?? null,
-      userAgent: meta.userAgent?.slice(0, 300) ?? null,
+    return db.transaction(async (tx) => {
+      const [u] = await tx.select().from(user).where(eq(user.id, userId)).for("update");
+      if (!u || u.status !== "active" || u.passwordHash !== expectHash) throw bad();
+      const identity = await resolveIdentity(tx, userId);
+      if (!identity?.active) throw bad();
+      const hours = identity.portals.admin ? (opts.staffSessionHours ?? 12) : (opts.sessionDays ?? 30) * 24;
+      const expiresAt = new Date(now().getTime() + hours * 3_600_000);
+      const [s] = await tx
+        .insert(authSession)
+        .values({ userId, tokenHash: sha256(token), expiresAt, lastSeenAt: now(), mfaVerifiedAt: null, ip: meta.ip ?? null, userAgent: meta.userAgent?.slice(0, 300) ?? null })
+        .returning();
+      await tx.update(user).set({ lastLoginAt: now() }).where(eq(user.id, userId));
+      return { token, expiresAt, principal: (await buildPrincipal(tx, s!))! };
     });
-    await db.update(user).set({ lastLoginAt: now() }).where(eq(user.id, userId));
-    return { token, expiresAt };
   }
 
   async function sessionRow(token: string) {
@@ -92,10 +123,10 @@ export function createAuthService(db: Db, opts: AuthOptions) {
     return s;
   }
 
-  async function buildPrincipal(s: typeof authSession.$inferSelect): Promise<Principal | null> {
-    const identity = await resolveIdentity(db, s.userId);
+  async function buildPrincipal(q: Q, s: typeof authSession.$inferSelect): Promise<Principal | null> {
+    const identity = await resolveIdentity(q, s.userId);
     if (!identity?.active) return null;
-    const [tf] = await db.select({ enabledAt: userTwoFactor.enabledAt }).from(userTwoFactor).where(eq(userTwoFactor.userId, s.userId));
+    const [tf] = await q.select({ enabledAt: userTwoFactor.enabledAt }).from(userTwoFactor).where(eq(userTwoFactor.userId, s.userId));
     const enrolled = !!tf?.enabledAt;
     const mfaRequired = identity.portals.admin || enrolled;
     const restriction: Restriction = identity.needsPasswordSetup ? "set_password" : mfaRequired && !s.mfaVerifiedAt ? (enrolled ? "mfa" : "mfa_setup") : null;
@@ -107,32 +138,46 @@ export function createAuthService(db: Db, opts: AuthOptions) {
   async function openSession(token: string) {
     const s = await sessionRow(token);
     if (!s) throw noSession();
-    const principal = await buildPrincipal(s);
+    const principal = await buildPrincipal(db, s);
     if (!principal) throw noSession();
     return { s, principal };
   }
 
-  async function findByIdentifier(raw: string) {
+  /**
+   * Every account the identifier can name. An email names one. A phone-looking identifier names the one active parent account with that
+   * phone and a password, and also the account whose username is exactly that text (a numeric username is legal), so both are tried.
+   */
+  async function findCandidates(raw: string): Promise<UserRow[]> {
     const id = raw.trim();
-    if (!id || id.length > 200) return null;
-    let rows;
-    if (id.includes("@")) rows = await db.select().from(user).where(eq(user.email, id.toLowerCase()));
-    else if (/^[\d\s+()-]{9,}$/.test(id)) {
+    if (!id || id.length > 200) return [];
+    if (id.includes("@")) return db.select().from(user).where(eq(user.email, id.toLowerCase()));
+    const out: UserRow[] = [];
+    if (PHONE_LIKE.test(id)) {
       const phone = normalizeSriLankaPhone(id);
-      if (!phone) return null;
-      rows = await db.select().from(user).where(eq(user.phone, phone));
-      rows = rows.filter((r) => r.status === "active" && r.passwordHash);
-      if (rows.length !== 1) return null;
-    } else rows = await db.select().from(user).where(eq(user.username, id));
-    return rows[0] ?? null;
+      if (phone) {
+        const rows = (await db.select().from(user).where(eq(user.phone, phone))).filter((r) => r.status === "active" && r.passwordHash);
+        if (rows.length === 1) out.push(rows[0]!);
+      }
+    }
+    for (const r of await db.select().from(user).where(eq(user.username, id))) if (!out.some((o) => o.id === r.id)) out.push(r);
+    return out;
   }
 
-  async function revokeOthers(userId: string, keepSessionId: string) {
-    await db.delete(authSession).where(and(eq(authSession.userId, userId), ne(authSession.id, keepSessionId)));
+  async function revokeOthers(q: Q, userId: string, keepSessionId: string) {
+    await q.delete(authSession).where(and(eq(authSession.userId, userId), ne(authSession.id, keepSessionId)));
   }
 
-  function checkCode(secretCipher: string, code: string): boolean {
-    return verifyTotp(decrypt(opts.secretKey, secretCipher), code, now()) !== null;
+  /** Locks the user row and confirms the caller's session still exists, so a credential change cannot outlive the session that asked for it. */
+  async function lockUserAndSession(tx: Tx, userId: string, sessionId: string) {
+    const [u] = await tx.select().from(user).where(eq(user.id, userId)).for("update");
+    const [alive] = await tx.select({ id: authSession.id }).from(authSession).where(eq(authSession.id, sessionId));
+    if (!u || !alive) throw noSession();
+    return u;
+  }
+
+  async function markSessionVerified(tx: Tx, sessionId: string) {
+    const rows = await tx.update(authSession).set({ mfaVerifiedAt: now() }).where(eq(authSession.id, sessionId)).returning({ id: authSession.id });
+    if (rows.length === 0) throw noSession();
   }
 
   return {
@@ -144,20 +189,26 @@ export function createAuthService(db: Db, opts: AuthOptions) {
      * `verifyMfa` (or enrolment) is done: see `principal.restriction`.
      */
     async signIn(input: { identifier: string; password: string; ip?: string | null; userAgent?: string | null }): Promise<SignedIn> {
-      const idKey = `signin:id:${input.identifier.trim().toLowerCase().slice(0, 200)}`;
+      const idKey = signInKey(input.identifier);
       if (input.ip) await hit(db, `signin:ip:${input.ip}`, SIGN_IN_IP, now());
       await hit(db, idKey, SIGN_IN_ID, now());
-      const u = await findByIdentifier(input.identifier);
-      if (!u?.passwordHash || u.status !== "active") {
-        await burnTime(input.password);
+      let matched: UserRow | null = null;
+      let tried = 0;
+      for (const c of await findCandidates(input.identifier)) {
+        if (!c.passwordHash || c.status !== "active") continue;
+        tried++;
+        if (await verifyPassword(input.password, c.passwordHash)) {
+          matched = c;
+          break;
+        }
+      }
+      if (!matched) {
+        if (tried === 0) await burnTime(input.password);
         throw bad();
       }
-      if (!(await verifyPassword(input.password, u.passwordHash))) throw bad();
+      const signedIn = await createSession(matched.id, input, matched.passwordHash);
       await clear(db, idKey);
-      const identity = (await resolveIdentity(db, u.id))!;
-      const { token, expiresAt } = await createSession(u.id, identity, input);
-      const [s] = await db.select().from(authSession).where(eq(authSession.tokenHash, sha256(token)));
-      return { token, expiresAt, principal: (await buildPrincipal(s!))! };
+      return signedIn;
     },
 
     /**
@@ -170,10 +221,7 @@ export function createAuthService(db: Db, opts: AuthOptions) {
       await hit(db, `first:phone:${phone ?? input.phone.replace(/\D/g, "").slice(0, 20)}`, FIRST_PHONE, now());
       const found = await acl.findFirstLoginUser({ phone: input.phone });
       if (!found) throw bad();
-      const identity = (await resolveIdentity(db, found.userId))!;
-      const { token, expiresAt } = await createSession(found.userId, identity, input);
-      const [s] = await db.select().from(authSession).where(eq(authSession.tokenHash, sha256(token)));
-      return { token, expiresAt, principal: (await buildPrincipal(s!))! };
+      return createSession(found.userId, input, null);
     },
 
     /** Who is behind this token, or `unauthenticated`. Check `principal.restriction` and `principal.portals` before serving anything. */
@@ -199,25 +247,34 @@ export function createAuthService(db: Db, opts: AuthOptions) {
       const { s, principal } = await openSession(input.token);
       if (principal.restriction !== "set_password") throw new ServiceError("forbidden", "A password is already set.");
       checkPassword(input.newPassword);
-      await acl.setInitialPassword({ userId: s.userId, passwordHash: await hashPassword(input.newPassword) });
-      await revokeOthers(s.userId, s.id);
-      return (await buildPrincipal(s))!;
+      const passwordHash = await hashPassword(input.newPassword);
+      // The password, its audit row and the end of every other session commit together or not at all.
+      await db.transaction(async (tx) => {
+        await lockUserAndSession(tx, s.userId, s.id);
+        await setInitialPasswordIn(tx, { userId: s.userId, passwordHash });
+        await revokeOthers(tx, s.userId, s.id);
+      });
+      return (await buildPrincipal(db, s))!;
     },
 
     /** Needs the current password. Signs out the account's other sessions. Audited (J3). */
     async changePassword(input: { token: string; currentPassword: string; newPassword: string }): Promise<void> {
       const { s, principal } = await openSession(input.token);
-      if (principal.restriction === "set_password") throw new ServiceError("password_setup_required", "Set a password first.");
+      // A credential change needs a session that is fully signed in: not one still waiting for a first password, an authenticator code or an enrolment.
+      assertReadyPrincipal(principal);
       await hit(db, `pw:${s.userId}`, PASSWORD_TRIES, now());
       const [u] = await db.select().from(user).where(eq(user.id, s.userId));
       if (!u?.passwordHash || !(await verifyPassword(input.currentPassword, u.passwordHash))) throw bad();
       checkPassword(input.newPassword);
       const passwordHash = await hashPassword(input.newPassword);
       await db.transaction(async (tx) => {
+        const cur = await lockUserAndSession(tx, u.id, s.id);
+        // The password verified above must still be the current one, or two changes could both pass on the old password.
+        if (cur.passwordHash !== u.passwordHash) throw bad();
         await tx.update(user).set({ passwordHash }).where(eq(user.id, u.id));
         await writeAudit(tx, { actor: u.id, action: "user.password_changed", entityType: "user", entityId: u.id });
+        await revokeOthers(tx, u.id, s.id);
       });
-      await revokeOthers(u.id, s.id);
     },
 
     /**
@@ -232,6 +289,9 @@ export function createAuthService(db: Db, opts: AuthOptions) {
         const identity = await resolveIdentity(tx, g.userId);
         if (!identity) throw new ServiceError("not_found", "That parent has no login.");
         if (identity.staffAssignments.length > 0 || identity.lecturerId) throw new ServiceError("forbidden", "This account is also staff or a lecturer; reset it another way.");
+        // The same guardian rule as profile and phone updates: all-branches staff, or staff who manage a branch of one of the parent's
+        // children. A parent with no student in a branch can only be reset by an all-branches holder.
+        if (!(await guardianInScope(tx, input.actor, input.guardianId))) throw new ServiceError("forbidden", "You may not reset this parent: none of their students is in your branches.");
         await tx.update(user).set({ passwordHash: null }).where(eq(user.id, g.userId));
         await tx.delete(authSession).where(eq(authSession.userId, g.userId));
         await writeAudit(tx, { actor: input.actor, action: "user.password_reset", entityType: "user", entityId: g.userId });
@@ -244,14 +304,15 @@ export function createAuthService(db: Db, opts: AuthOptions) {
     async beginMfaEnrollment(input: { token: string }): Promise<{ secret: string; uri: string }> {
       const { s, principal } = await openSession(input.token);
       if (principal.restriction === "set_password") throw new ServiceError("password_setup_required", "Set a password first.");
-      const [existing] = await db.select({ enabledAt: userTwoFactor.enabledAt }).from(userTwoFactor).where(eq(userTwoFactor.userId, s.userId));
-      if (existing?.enabledAt) throw new ServiceError("forbidden", "Two-step sign-in is already on.");
       const secret = newTotpSecret();
       const secretCipher = encrypt(opts.secretKey, secret);
-      await db
+      // One conditional write: it replaces an unconfirmed attempt but never an enabled authenticator, whatever runs beside it.
+      const written = await db
         .insert(userTwoFactor)
         .values({ userId: s.userId, secretCipher })
-        .onConflictDoUpdate({ target: userTwoFactor.userId, set: { secretCipher, recoveryHashes: [], createdAt: now() } });
+        .onConflictDoUpdate({ target: userTwoFactor.userId, set: { secretCipher, recoveryHashes: [], lastUsedStep: null, createdAt: now() }, setWhere: isNull(userTwoFactor.enabledAt) })
+        .returning({ userId: userTwoFactor.userId });
+      if (written.length === 0) throw new ServiceError("forbidden", "Two-step sign-in is already on.");
       const [u] = await db.select({ email: user.email, username: user.username }).from(user).where(eq(user.id, s.userId));
       return { secret, uri: otpauthUri({ secret, account: u?.email ?? u?.username ?? s.userId, issuer }) };
     },
@@ -262,11 +323,18 @@ export function createAuthService(db: Db, opts: AuthOptions) {
       await hit(db, `code:${s.userId}`, CODE_TRIES, now());
       const [tf] = await db.select().from(userTwoFactor).where(eq(userTwoFactor.userId, s.userId));
       if (!tf || tf.enabledAt) throw new ServiceError("forbidden", "Start the setup first.");
-      if (!checkCode(tf.secretCipher, input.code)) throw new ServiceError("invalid_code", "That code is wrong or expired.");
+      const step = verifyTotp(decrypt(opts.secretKey, tf.secretCipher), input.code, now());
+      if (step === null) throw new ServiceError("invalid_code", "That code is wrong or expired.");
       const codes = Array.from({ length: RECOVERY_CODES }, newRecoveryCode);
       await db.transaction(async (tx) => {
-        await tx.update(userTwoFactor).set({ enabledAt: now(), recoveryHashes: codes.map((c) => sha256(recoveryNormal(c))) }).where(eq(userTwoFactor.userId, s.userId));
-        await tx.update(authSession).set({ mfaVerifiedAt: now() }).where(eq(authSession.id, s.id));
+        // Enables the exact secret whose code was checked; if the secret was replaced or already enabled meanwhile, nothing is enabled.
+        const enabled = await tx
+          .update(userTwoFactor)
+          .set({ enabledAt: now(), recoveryHashes: codes.map((c) => sha256(recoveryNormal(c))), lastUsedStep: step })
+          .where(and(eq(userTwoFactor.userId, s.userId), isNull(userTwoFactor.enabledAt), eq(userTwoFactor.secretCipher, tf.secretCipher)))
+          .returning({ userId: userTwoFactor.userId });
+        if (enabled.length === 0) throw new ServiceError("forbidden", "The setup changed. Start it again.");
+        await markSessionVerified(tx, s.id);
         await writeAudit(tx, { actor: s.userId, action: "user.mfa_enabled", entityType: "user", entityId: s.userId });
       });
       await clear(db, `code:${s.userId}`);
@@ -277,19 +345,26 @@ export function createAuthService(db: Db, opts: AuthOptions) {
     async verifyMfa(input: { token: string; code: string }): Promise<Principal> {
       const { s } = await openSession(input.token);
       await hit(db, `code:${s.userId}`, CODE_TRIES, now());
+      // Code use, recovery-code use and the session's verified mark commit together: a failure leaves the code available for a retry.
       const ok = await db.transaction(async (tx) => {
         const [tf] = await tx.select().from(userTwoFactor).where(eq(userTwoFactor.userId, s.userId)).for("update");
         if (!tf?.enabledAt) throw new ServiceError("mfa_setup_required", "Set up two-step sign-in first.");
-        if (checkCode(tf.secretCipher, input.code)) return true;
-        const hash = sha256(recoveryNormal(input.code));
-        if (!tf.recoveryHashes.includes(hash)) return false;
-        await tx.update(userTwoFactor).set({ recoveryHashes: tf.recoveryHashes.filter((h) => h !== hash) }).where(eq(userTwoFactor.userId, s.userId));
+        const step = verifyTotp(decrypt(opts.secretKey, tf.secretCipher), input.code, now());
+        if (step !== null) {
+          // Each 30-second step is accepted once (RFC 6238): a code for a step already used, or an older one, is refused.
+          if (tf.lastUsedStep !== null && step <= tf.lastUsedStep) return false;
+          await tx.update(userTwoFactor).set({ lastUsedStep: step }).where(eq(userTwoFactor.userId, s.userId));
+        } else {
+          const hash = sha256(recoveryNormal(input.code));
+          if (!tf.recoveryHashes.includes(hash)) return false;
+          await tx.update(userTwoFactor).set({ recoveryHashes: tf.recoveryHashes.filter((h) => h !== hash) }).where(eq(userTwoFactor.userId, s.userId));
+        }
+        await markSessionVerified(tx, s.id);
         return true;
       });
       if (!ok) throw new ServiceError("invalid_code", "That code is wrong or expired.");
-      await db.update(authSession).set({ mfaVerifiedAt: now() }).where(eq(authSession.id, s.id));
       await clear(db, `code:${s.userId}`);
-      return (await buildPrincipal({ ...s, mfaVerifiedAt: now() }))!;
+      return (await buildPrincipal(db, { ...s, mfaVerifiedAt: now() }))!;
     },
 
     /**
@@ -297,6 +372,8 @@ export function createAuthService(db: Db, opts: AuthOptions) {
      * sign-in. A root administrator cannot do this to themselves. Audited (J3).
      */
     async resetMfa(input: { userId: string; actor: string }): Promise<void> {
+      // Both ids in one spelling first: the database reads upper-case and braced uuids as the same account, a string comparison does not.
+      input = { userId: canonicalUuid(input.userId), actor: canonicalUuid(input.actor) };
       if (input.userId === input.actor) throw new ServiceError("forbidden", "Ask another root administrator to reset your two-step sign-in.");
       if (!(await isRootAdmin(db, input.actor))) throw new ServiceError("forbidden", "Only a root administrator can reset two-step sign-in.");
       await db.transaction(async (tx) => {
@@ -311,9 +388,7 @@ export function createAuthService(db: Db, opts: AuthOptions) {
 
     /** Throws the right error while the session is half signed in (password to set, code to enter, authenticator to enrol). */
     assertReady(principal: Principal): void {
-      if (principal.restriction === "set_password") throw new ServiceError("password_setup_required", "Set a password first.");
-      if (principal.restriction === "mfa") throw new ServiceError("mfa_required", "Enter your authenticator code.");
-      if (principal.restriction === "mfa_setup") throw new ServiceError("mfa_setup_required", "Set up two-step sign-in first.");
+      assertReadyPrincipal(principal);
     },
 
     requirePortal(principal: Principal, portal: keyof Identity["portals"]): void {

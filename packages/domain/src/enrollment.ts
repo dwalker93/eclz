@@ -3,7 +3,7 @@ import { course, courseGradeLevel, enrollment, feeStructure, installmentOption, 
 import { writeAudit, isConstraintError } from "./audit";
 import { addDays, addMonths, buildInstallmentSchedule, percentOf } from "./dates";
 import { insertInvoice, type DraftItem } from "./invoicing";
-import { gradeOn, rateFor, todayFor } from "./lookups";
+import { gradeOn, lockStudent, rateFor, todayFor } from "./lookups";
 import { toCents } from "@workspace/db/money";
 import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
@@ -63,7 +63,7 @@ export async function resolveFeeStructure(
  * and a primary-index conflict would still raise.
  */
 export async function ensureStudentBranch(tx: Tx, studentId: string, branchId: string, joinedOn: string) {
-  await tx.select({ id: student.id }).from(student).where(eq(student.id, studentId)).for("update");
+  await lockStudent(tx, studentId);
   const [anyBranch] = await tx.select({ b: studentBranch.branchId }).from(studentBranch).where(eq(studentBranch.studentId, studentId));
   await tx.insert(studentBranch).values({ studentId, branchId, isPrimary: !anyBranch, joinedOn })
     .onConflictDoNothing({ target: [studentBranch.studentId, studentBranch.branchId] });

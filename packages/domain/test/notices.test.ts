@@ -41,6 +41,10 @@ describe("writing notices", () => {
     await fails("forbidden", () => notices.create({ actor: writer1, branchId: null, title: "x", body: "y" }));
     const nobody = await newUser();
     await fails("forbidden", () => notices.create({ actor: nobody, branchId: b1, title: "x", body: "y" }));
+    // upper-case spellings: the manager's own branch is allowed (and stored in one form), another branch is still refused
+    const upper = await notices.create({ actor: writer1, branchId: b1.toUpperCase(), title: "Upper", body: "own branch" });
+    eq(upper.branchId, b1);
+    await fails("forbidden", () => notices.create({ actor: writer1, branchId: b2.toUpperCase(), title: "x", body: "y" }));
     const ok = await notices.create({ actor: writer1, branchId: b1, title: "Holiday", body: "Closed Monday" });
     eq(ok.targets, [{ type: "all", id: null }]);
     eq((await notices.create({ actor: root, branchId: null, title: "Org", body: "Hello" })).branchId, null);
@@ -90,7 +94,7 @@ describe("who sees a notice", () => {
     const sA = await mkStudent(b1, grade6);
     const sB = await mkStudent(b1, grade7);
     const sC = await mkStudent(b2, grade6);
-    await q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1,$2)`, [course1, sA]);
+    await q(`INSERT INTO enrollment (course_id, student_id, access_starts_on) VALUES ($1,$2,'2026-01-01')`, [course1, sA]);
     const mk = (title: string, extra: Partial<Parameters<typeof notices.create>[0]> = {}) => notices.create({ actor: root, branchId: null, title, body: "b", ...extra });
     await mk("everyone");
     await mk("b1 only", { branchId: b1 });
@@ -126,7 +130,7 @@ describe("who sees a notice", () => {
     clock = new Date("2026-11-20T10:00:00Z");
     const c = await mkCourse(b1);
     const s = await mkStudent(b1, grade6);
-    const e = await id(`INSERT INTO enrollment (course_id, student_id) VALUES ($1,$2)`, [c, s]);
+    const e = await id(`INSERT INTO enrollment (course_id, student_id, access_starts_on) VALUES ($1,$2,'2026-01-01')`, [c, s]);
     await notices.create({ actor: root, branchId: b1, title: "course notice", body: "b", targets: [{ type: "course", id: c }] });
     await notices.create({ actor: root, branchId: null, title: "grade notice", body: "b", targets: [{ type: "grade", id: grade6 }] });
     eq(titles(await notices.listForStudent(s)), ["course notice", "grade notice"]);
@@ -140,5 +144,136 @@ describe("who sees a notice", () => {
     eq(titles(await notices.listForStaff(writer1)), ["all staff"]);
     const plain = await newUser();
     eq(await notices.listForStaff(plain), []);
+  });
+});
+
+// ---- review hardening
+
+/** The same db, but `hook` runs just before the first transaction starts: a rival write landing between a read and a write. */
+function withBefore(hook: () => Promise<void>): typeof db {
+  let fired = false;
+  return new Proxy(db, {
+    get(t, prop) {
+      const v = Reflect.get(t, prop, t);
+      if (prop === "transaction") {
+        return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true;
+            await hook();
+          }
+          return (v as (...a: unknown[]) => unknown).apply(t, args);
+        };
+      }
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  }) as typeof db;
+}
+const racing = (hook: () => Promise<void>) => createNoticeService(withBefore(hook), { now: () => clock });
+const withClock = async (at: string, run: () => Promise<void>) => {
+  const before = clock;
+  clock = new Date(at);
+  try {
+    await run();
+  } finally {
+    clock = before;
+  }
+};
+const triggerOn = async (table: string, event: "UPDATE" | "DELETE", name: string, run: () => Promise<void>) => {
+  await q(`CREATE FUNCTION ${name}() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql`);
+  await q(`CREATE TRIGGER ${name} BEFORE ${event} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${name}()`);
+  try {
+    await run();
+  } finally {
+    await q(`DROP TRIGGER ${name} ON ${table}`);
+    await q(`DROP FUNCTION ${name}()`);
+  }
+};
+
+describe("notice views", () => {
+  test("each notice gets its own targets, in the feed's order; none means an empty list", async () => {
+    const c = await mkCourse(b1);
+    const one = await notices.create({ actor: root, branchId: null, title: "View One", body: "b", targets: [{ type: "grade", id: grade6 }] });
+    const two = await notices.create({ actor: root, branchId: null, title: "View Two", body: "b", targets: [{ type: "grade", id: grade7 }, { type: "course", id: c }] });
+    const bare = await id(`INSERT INTO notice (author_id, title, body, published_at) VALUES ($1, 'View Bare', 'b', $2)`, [root, new Date(clock.getTime() + 1000)]);
+    const feed = await notices.listManaged({ actor: root });
+    const view = (title: string) => feed.find((x) => x.title === title)!;
+    eq(view("View One").targets, [{ type: "grade", id: grade6 }]);
+    eq(view("View Two").targets.map((t) => t.type).sort(), ["course", "grade"]);
+    eq(view("View Bare").targets, [], "no targets, an empty list");
+    const at = (nid: string) => feed.findIndex((x) => x.id === nid);
+    eq(at(bare) < at(one.id) && at(bare) < at(two.id), true, "the later-published notice comes first");
+  });
+});
+
+describe("notice edits under contention", () => {
+  test("a title edit keeps a body that was saved after it read the notice", async () => {
+    const note = await notices.create({ actor: root, branchId: null, title: "T0", body: "B0" });
+    const rival = racing(async () => void (await notices.update({ noticeId: note.id, actor: root, body: "B1" })));
+    const out = await rival.update({ noticeId: note.id, actor: root, title: "T1" });
+    eq([out.title, out.body], ["T1", "B1"], "both edits survive");
+    const audit = await q(`SELECT before_data->>'body' AS b FROM audit_log WHERE entity_id = $1 AND action = 'notice.update' ORDER BY created_at, id`, [note.id]);
+    eq(audit.map((a) => a.b), ["B0", "B1"], "the second edit records the body it saw");
+  });
+
+  test("an update whose notice vanished is not_found, with no audit entry", async () => {
+    const gone = await notices.create({ actor: root, branchId: null, title: "Gone", body: "b" });
+    const rival = racing(async () => void (await notices.remove({ noticeId: gone.id, actor: root })));
+    await fails("not_found", () => rival.update({ noticeId: gone.id, actor: root, title: "Late" }));
+    const kept = await notices.create({ actor: root, branchId: null, title: "Kept", body: "b" });
+    await triggerOn("notice", "UPDATE", "skip_notice_update", () => fails("not_found", () => notices.update({ noticeId: kept.id, actor: root, title: "Skipped" })));
+    eq((await q(`SELECT count(*)::int AS c FROM audit_log WHERE entity_id = $1 AND action = 'notice.update'`, [kept.id]))[0]!.c, 0);
+  });
+
+  test("the removal audit records the deleted text, and a second removal finds nothing", async () => {
+    const note = await notices.create({ actor: root, branchId: null, title: "R0", body: "B0" });
+    const edit = racing(async () => void (await notices.update({ noticeId: note.id, actor: root, title: "R1", body: "B1" })));
+    await edit.remove({ noticeId: note.id, actor: root });
+    const [a] = await q(`SELECT before_data FROM audit_log WHERE entity_id = $1 AND action = 'notice.remove'`, [note.id]);
+    const was = a!.before_data as { title: string; body: string };
+    eq([was.title, was.body], ["R1", "B1"], "the text that was removed");
+
+    const twice = await notices.create({ actor: root, branchId: null, title: "Twice", body: "b" });
+    const rival = racing(async () => void (await notices.remove({ noticeId: twice.id, actor: root })));
+    await fails("not_found", () => rival.remove({ noticeId: twice.id, actor: root }));
+    eq((await q(`SELECT count(*)::int AS c FROM audit_log WHERE entity_id = $1 AND action = 'notice.remove'`, [twice.id]))[0]!.c, 1, "one removal audited");
+
+    const kept = await notices.create({ actor: root, branchId: null, title: "Kept2", body: "b" });
+    await triggerOn("notice", "DELETE", "skip_notice_delete", () => fails("not_found", () => notices.remove({ noticeId: kept.id, actor: root })));
+    eq((await q(`SELECT count(*)::int AS c FROM audit_log WHERE entity_id = $1 AND action = 'notice.remove'`, [kept.id]))[0]!.c, 0, "nothing deleted, nothing audited");
+  });
+});
+
+describe("who sees a notice on the day it takes effect", () => {
+  test("a grade notice follows the grade in effect today, not the grade booked for later", async () => {
+    const s = await id(`INSERT INTO student (student_no, full_name, date_of_birth) VALUES ($1,$2,'2014-05-01')`, [`N${++n}`, `Grader`]);
+    await q(`INSERT INTO student_branch (student_id, branch_id, is_primary) VALUES ($1,$2,true)`, [s, b1]);
+    await q(`INSERT INTO student_level (student_id, grade_level_id, from_date, to_date) VALUES ($1,$2,'2026-01-01','2027-04-01')`, [s, grade6]);
+    await q(`INSERT INTO student_level (student_id, grade_level_id, from_date) VALUES ($1,$2,'2027-04-01')`, [s, grade7]);
+    await notices.create({ actor: root, branchId: null, title: "Old grade", body: "b", targets: [{ type: "grade", id: grade6 }] });
+    await notices.create({ actor: root, branchId: null, title: "New grade", body: "b", targets: [{ type: "grade", id: grade7 }] });
+    const seen = async (at: string) => {
+      let out: string[] = [];
+      await withClock(at, async () => void (out = titles((await notices.listForStudent(s)).filter((x) => x.title.endsWith("grade")))));
+      return out;
+    };
+    eq(await seen("2027-03-10T10:00:00Z"), ["Old grade"], "March: still the old grade");
+    eq(await seen("2027-04-01T10:00:00Z"), ["New grade"], "1 April: only the new grade");
+  });
+
+  test("a course notice reaches an enrolment only while its access window is open", async () => {
+    const c = await mkCourse(b1);
+    const s = await mkStudent(b1);
+    await q(`INSERT INTO enrollment (course_id, student_id, access_starts_on) VALUES ($1,$2,'2027-04-01')`, [c, s]);
+    await notices.create({ actor: root, branchId: b1, title: "Course window", body: "b", targets: [{ type: "course", id: c }] });
+    const sees = async (at: string) => {
+      let out = false;
+      await withClock(at, async () => void (out = (await notices.listForStudent(s)).some((x) => x.title === "Course window")));
+      return out;
+    };
+    eq(await sees("2027-03-10T10:00:00Z"), false, "before access starts");
+    eq(await sees("2027-04-01T10:00:00Z"), true, "from the first day");
+    await q(`UPDATE enrollment SET access_ends_on = '2027-05-01' WHERE course_id = $1 AND student_id = $2`, [c, s]);
+    eq(await sees("2027-04-30T10:00:00Z"), true, "the last day before the end");
+    eq(await sees("2027-05-01T10:00:00Z"), false, "on the end date, as accessState treats it");
   });
 });

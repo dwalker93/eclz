@@ -1,10 +1,13 @@
 import { expect } from "bun:test";
 import { ServiceError, type ServiceErrorCode } from "@workspace/domain";
 
-/** Compares by JSON, so a Date and its ISO string are not told apart. */
+/** `undefined` is written out, so a missing value and an explicit `null` are different (JSON alone would turn both into `null` in an array and drop the key in an object). */
+const show = (v: unknown) => JSON.stringify(v, (_k, x) => (x === undefined ? "__undefined__" : x));
+
+/** Compares by JSON, so a Date and its ISO string are not told apart, but an absent value is never equal to `null`. */
 export function eq<T>(actual: T, expected: T, what = "value") {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`${what}: expected ${JSON.stringify(expected)} but got ${JSON.stringify(actual)}`);
+  if (show(actual) !== show(expected)) {
+    throw new Error(`${what}: expected ${show(expected)} but got ${show(actual)}`);
   }
 }
 

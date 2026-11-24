@@ -116,7 +116,7 @@ CREATE INDEX "commission_entry_lecturer_idx" ON "commission_entry" USING btree (
 CREATE INDEX "commission_entry_allocation_idx" ON "commission_entry" USING btree ("payment_allocation_id");--> statement-breakpoint
 CREATE INDEX "commission_rule_lecturer_idx" ON "commission_rule" USING btree ("lecturer_id");--> statement-breakpoint
 CREATE INDEX "teacher_payout_lecturer_idx" ON "teacher_payout" USING btree ("lecturer_id");--> statement-breakpoint
--- Added NOT VALID so this migration does not scan invoice_item under a lock; 0017 validates it. New rows are checked from here on.
+-- Added NOT VALID so this migration does not scan invoice_item under a lock; 0017 validates it once this one has committed. New rows are checked from here on.
 ALTER TABLE "invoice_item" ADD CONSTRAINT "invoice_item_purchase_invoice_fk" FOREIGN KEY ("content_purchase_id","invoice_id") REFERENCES "public"."content_purchase"("id","invoice_id") ON DELETE no action ON UPDATE no action NOT VALID;--> statement-breakpoint
 CREATE UNIQUE INDEX "invoice_item_content_purchase_uq" ON "invoice_item" USING btree ("content_purchase_id") WHERE "invoice_item"."kind" = 'content' AND "invoice_item"."cancelled_at" IS NULL;--> statement-breakpoint
 -- Phase 1 allowed kind = 'content' with no purchase to point at, and every existing row has a NULL content_purchase_id. Such a line cannot satisfy the

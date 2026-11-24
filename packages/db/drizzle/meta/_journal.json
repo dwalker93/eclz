@@ -169,6 +169,34 @@
       "when": 1795119117670,
       "tag": "0023_validate_content_purchase_paid_invoice",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1795160609844,
+      "tag": "0024_two_factor_last_used_step",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1795160669844,
+      "tag": "0025_validate_finite_money_checks",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1795160729844,
+      "tag": "0026_validate_exception_enrollment_constraints",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1795160789844,
+      "tag": "0027_validate_message_thread_fk",
+      "breakpoints": true
     }
   ]
 }

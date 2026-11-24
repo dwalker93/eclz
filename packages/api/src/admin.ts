@@ -148,7 +148,7 @@ export function createAdminRoutes({ db, auth, acl, payments, content, notices, r
     await requirePermission(db, user, "roles.manage");
     const b = await jsonBody(c, z.object({ status: z.enum(["active", "disabled"]), reason: z.string().max(500).optional() }));
     const row = await acl.setUserStatus({ userId: uuid.parse(c.req.param("id")), actor: user, ...b });
-    if (b.status === "disabled") await auth.signOutEverywhere(row.id);
+    // Disabling deletes the sessions in the same transaction (setUserStatus), so there is nothing to revoke afterwards.
     return c.json({ id: row.id, status: row.status });
   });
 

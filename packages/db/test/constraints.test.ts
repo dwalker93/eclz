@@ -71,6 +71,7 @@ let sched2: string;
 let grp: string;
 let intake1: string;
 let intakeOther: string;
+let intakeSelfPaced: string;
 let intakeOnClass: string;
 let fee1: string;
 let feeOther: string;
@@ -201,6 +202,8 @@ describe("Intakes and enrolments (C2 to C4, D2)", () => {
   beforeAll(async () => {
     intake1 = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'March intake', '2027-03-01')`, [sched]);
     intakeOther = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'Carpentry intake', '2027-03-01')`, [sched2]);
+    // An intake that belongs to the self-paced course itself: the composite foreign key matches, so only the C2 trigger can refuse the enrolment.
+    intakeSelfPaced = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'Online intake', '2027-03-01')`, [selfPaced]);
     intakeOnClass = await id(`INSERT INTO intake (course_id, name, starts_on) VALUES ($1, 'bad', '2027-03-01')`, [cls]);
   });
 
@@ -210,8 +213,8 @@ describe("Intakes and enrolments (C2 to C4, D2)", () => {
     q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [sched, st1])));
   test("C3: the intake must belong to the enrolment's course", () => rejects(/enrollment_intake_course_fk/, () =>
     q(`INSERT INTO enrollment (course_id, student_id, intake_id) VALUES ($1, $2, $3)`, [sched, st1, intakeOther])));
-  test("C2: a self-paced enrolment cannot have an intake", () => rejects(/C2|enrollment_intake_course_fk/, () =>
-    q(`INSERT INTO enrollment (course_id, student_id, intake_id) VALUES ($1, $2, $3)`, [selfPaced, st1, intake1])));
+  test("C2: a self-paced enrolment cannot have an intake", () => rejects(/C2/, () =>
+    q(`INSERT INTO enrollment (course_id, student_id, intake_id) VALUES ($1, $2, $3)`, [selfPaced, st1, intakeSelfPaced])));
   test("scheduled program with its own intake, and self-paced without one", async () => {
     await q(`INSERT INTO enrollment (course_id, student_id, intake_id) VALUES ($1, $2, $3)`, [sched, st1, intake1]);
     await q(`INSERT INTO enrollment (course_id, student_id) VALUES ($1, $2)`, [selfPaced, st1]);
@@ -1225,18 +1228,71 @@ describe("Course changes keep enrolments valid (C2) and money is never NaN", () 
     await q(`UPDATE course SET name = 'renamed' WHERE id = $1`, [d]);
   });
 
+  test("the enrolment trigger reads the course FOR SHARE, so a concurrent course change and enrolment insert wait for each other", async () => {
+    // PGlite has one connection and cannot show the wait itself; this guards the lock clause (the real-PostgreSQL concurrency test is owed)
+    const [fn] = await q(`SELECT pg_get_functiondef('enrollment_check_intake'::regproc) AS def`);
+    if (!/FROM "?course"?\s+WHERE "?id"? = NEW\."?course_id"?\s+FOR SHARE/i.test(String(fn!.def))) throw new Error(`enrollment_check_intake must read the course FOR SHARE:\n${fn!.def}`);
+  });
+
+  test("the discount-enrolment trigger locks the discount and the item it reduces FOR SHARE before it reads, so a concurrent insert and enrolment change wait for each other", async () => {
+    // PGlite has one connection and cannot show the wait itself; this guards the lock clause and its place before the check (the real-PostgreSQL concurrency test is owed)
+    const [fn] = await q(`SELECT pg_get_functiondef('invoice_item_check_discount_enrollment'::regproc) AS def`);
+    const def = String(fn!.def);
+    const lock = def.search(/WHERE "?id"? IN \(NEW\."?id"?, NEW\."?applies_to_item_id"?\)\s+ORDER BY "?id"?\s+FOR SHARE/i);
+    if (lock < 0) throw new Error(`invoice_item_check_discount_enrollment must lock both rows in id order FOR SHARE:\n${def}`);
+    if (lock > def.search(/IF EXISTS/i)) throw new Error("the lock must be taken before the check reads");
+  });
+
+  test("invoice_item is indexed on applies_to_item_id for the discount-enrolment trigger", async () => {
+    const rows = await q(`SELECT indexdef FROM pg_indexes WHERE tablename = 'invoice_item' AND indexname = 'invoice_item_applies_to_idx'`);
+    if (rows.length !== 1 || !/\(applies_to_item_id\)/.test(String(rows[0]!.indexdef))) throw new Error("invoice_item_applies_to_idx on (applies_to_item_id) is missing");
+  });
+
+  test("the payment guard reads the target payment method FOR SHARE, so a concurrent change of its type waits for the payment move", async () => {
+    // PGlite has one connection and cannot show the wait itself; this guards the lock clause (the real-PostgreSQL concurrency test is owed)
+    const [fn] = await q(`SELECT pg_get_functiondef('payment_gateway_method_guard'::regproc) AS def`);
+    if (!/FROM payment_method\s+WHERE id = NEW\.payment_method_id\s+FOR SHARE/i.test(String(fn!.def))) throw new Error(`payment_gateway_method_guard must read the payment method FOR SHARE:\n${fn!.def}`);
+  });
+
   test("NaN is rejected in a money column", () => rejects(/finite_check/, () =>
     q(`INSERT INTO fee_rate (fee_structure_id, amount, effective_from) VALUES ($1, 'NaN', '2030-01-01')`, [fee1])));
 
-  test("every numeric column has a NaN check (add one in the migration for any new numeric column)", async () => {
-    const missing = await q(`
+  /** Numeric columns of `tables` (default: every table) with no check on exactly that column that rejects NaN the way the migration writes it. */
+  const withoutNanCheck = (tables?: string[]) =>
+    q(
+      `
       SELECT c.table_name, c.column_name FROM information_schema.columns c
       WHERE c.table_schema = 'public' AND c.data_type = 'numeric'
         AND c.table_name IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public')
+        AND ($1::text[] IS NULL OR c.table_name = ANY($1::text[]))
         AND NOT EXISTS (
           SELECT 1 FROM pg_constraint k
+          JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attname = c.column_name
           WHERE k.conrelid = format('%I.%I', c.table_schema, c.table_name)::regclass AND k.contype = 'c'
-            AND pg_get_constraintdef(k.oid) LIKE '%NaN%' AND pg_get_constraintdef(k.oid) LIKE '%' || c.column_name || '%')`);
+            -- a check on exactly this column (not one on another column whose name contains it), with the predicate the migration generates
+            AND k.conkey = ARRAY[a.attnum]
+            AND pg_get_constraintdef(k.oid) IN (
+              format('CHECK ((%I <> ''NaN''::numeric))', c.column_name),
+              format('CHECK ((%I <> ''NaN''::numeric)) NOT VALID', c.column_name)))
+      ORDER BY c.table_name, c.column_name`,
+      [tables ?? null],
+    );
+
+  test("every numeric column has a NaN check (add one in the migration for any new numeric column)", async () => {
+    const missing = await withoutNanCheck();
     if (missing.length > 0) throw new Error(`numeric columns without a NaN check: ${missing.map((m) => `${m.table_name}.${m.column_name}`).join(", ")}`);
+  });
+
+  test("the NaN-check search is exact: another column's check, or a check that still allows NaN, does not count", async () => {
+    await q(`CREATE TABLE nan_probe_other (amount numeric, discount_amount numeric, CONSTRAINT p1 CHECK (discount_amount <> 'NaN'::numeric))`);
+    await q(`CREATE TABLE nan_probe_loose (amount numeric, CONSTRAINT p2 CHECK (amount = 'NaN'::numeric OR amount > 0))`);
+    await q(`CREATE TABLE nan_probe_ok (amount numeric, discount_amount numeric, CONSTRAINT p3 CHECK (amount <> 'NaN'::numeric), CONSTRAINT p4 CHECK (discount_amount <> 'NaN'::numeric) NOT VALID)`);
+    try {
+      const rows = await withoutNanCheck(["nan_probe_other", "nan_probe_loose", "nan_probe_ok"]);
+      const got = rows.map((r) => `${r.table_name}.${r.column_name}`);
+      if (JSON.stringify(got) !== JSON.stringify(["nan_probe_loose.amount", "nan_probe_other.amount"])) throw new Error(`unexpected result: ${got.join(", ")}`);
+    } finally {
+      await q(`DROP TABLE nan_probe_other, nan_probe_loose, nan_probe_ok`);
+    }
   });
 });

@@ -216,8 +216,8 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
       });
     },
 
-    /** Puts an item in a course (optionally in one of its sections). Students with effective access in the course can open it (F3a). Attaching twice changes the position only. */
-    async attachToCourse(input: { courseId: string; contentId: string; sectionId?: string; position?: number }) {
+    /** Puts an item in a course (optionally in one of its sections). Students with effective access in the course can open it (F3a). Attaching again changes only what the caller supplies: a new position keeps the section, a new section keeps the position, and `sectionId: null` takes the item out of its section. */
+    async attachToCourse(input: { courseId: string; contentId: string; sectionId?: string | null; position?: number }) {
       return db.transaction(async (tx) => {
         const [c] = await tx.select({ id: course.id }).from(course).where(eq(course.id, input.courseId));
         if (!c) throw new ServiceError("not_found", "Course not found.");
@@ -229,7 +229,15 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
         const [row] = await tx
           .insert(courseContent)
           .values({ courseId: c.id, contentId: input.contentId, sectionId: input.sectionId ?? null, position: input.position ?? 0 })
-          .onConflictDoUpdate({ target: [courseContent.courseId, courseContent.contentId], set: { sectionId: input.sectionId ?? null, position: input.position ?? 0 } })
+          // Only the supplied fields change; an attach with nothing new is a no-op update that still returns the row.
+          .onConflictDoUpdate({
+            target: [courseContent.courseId, courseContent.contentId],
+            set: {
+              ...(input.sectionId !== undefined ? { sectionId: input.sectionId } : {}),
+              ...(input.position !== undefined ? { position: input.position } : {}),
+              ...(input.sectionId === undefined && input.position === undefined ? { courseId: c.id } : {}),
+            },
+          })
           .returning();
         return row!;
       });
@@ -378,22 +386,32 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /** Cancels a pending purchase and its unpaid invoice. Refused once any payment is allocated to the invoice (adjust or void it instead). */
-    async cancelPurchase(input: { purchaseId: string }) {
-      return db.transaction(async (tx) => {
-        const [p] = await tx.select().from(contentPurchase).where(eq(contentPurchase.id, input.purchaseId)).for("update");
-        if (!p) throw new ServiceError("not_found", "Purchase not found.");
-        if (p.status === "cancelled") return p;
-        if (p.status === "paid") throw new ServiceError("content_invalid", "A paid purchase cannot be cancelled.");
-        if (p.invoiceId) {
-          await tx.select().from(invoice).where(eq(invoice.id, p.invoiceId)).for("update");
-          const [n] = await tx.select({ n: sql<number>`count(*)::int` }).from(paymentAllocation).where(and(eq(paymentAllocation.invoiceId, p.invoiceId), isNull(paymentAllocation.reversedAt)));
-          if (n!.n > 0) throw new ServiceError("content_invalid", "Payments are already allocated to this purchase.");
-          await tx.update(invoiceItem).set({ cancelledAt: now() }).where(and(eq(invoiceItem.invoiceId, p.invoiceId), isNull(invoiceItem.cancelledAt)));
-          await tx.update(invoice).set({ status: "cancelled" }).where(eq(invoice.id, p.invoiceId));
-        }
-        const [row] = await tx.update(contentPurchase).set({ status: "cancelled" }).where(eq(contentPurchase.id, p.id)).returning();
-        return row!;
-      });
+    async cancelPurchase(input: { purchaseId: string }): Promise<typeof contentPurchase.$inferSelect> {
+      // Lock order is invoice, then purchase, the same as a payment verification (it locks the invoice in loadOpenItems, then updates the purchase
+      // in its hook), so the two cannot wait for each other. The invoice id comes from an unlocked read and is checked again under both locks.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const [peek] = await db.select({ invoiceId: contentPurchase.invoiceId }).from(contentPurchase).where(eq(contentPurchase.id, input.purchaseId));
+        if (!peek) throw new ServiceError("not_found", "Purchase not found.");
+        const done = await db.transaction(async (tx) => {
+          if (peek.invoiceId) await tx.select({ id: invoice.id }).from(invoice).where(eq(invoice.id, peek.invoiceId)).for("update");
+          const [p] = await tx.select().from(contentPurchase).where(eq(contentPurchase.id, input.purchaseId)).for("update");
+          if (!p) throw new ServiceError("not_found", "Purchase not found.");
+          // The purchase got (or lost) its invoice since the first read: the locks held are the wrong ones, so look again.
+          if (p.invoiceId !== peek.invoiceId) return null;
+          if (p.status === "cancelled") return p;
+          if (p.status === "paid") throw new ServiceError("content_invalid", "A paid purchase cannot be cancelled.");
+          if (p.invoiceId) {
+            const [n] = await tx.select({ n: sql<number>`count(*)::int` }).from(paymentAllocation).where(and(eq(paymentAllocation.invoiceId, p.invoiceId), isNull(paymentAllocation.reversedAt)));
+            if (n!.n > 0) throw new ServiceError("content_invalid", "Payments are already allocated to this purchase.");
+            await tx.update(invoiceItem).set({ cancelledAt: now() }).where(and(eq(invoiceItem.invoiceId, p.invoiceId), isNull(invoiceItem.cancelledAt)));
+            await tx.update(invoice).set({ status: "cancelled" }).where(eq(invoice.id, p.invoiceId));
+          }
+          const [row] = await tx.update(contentPurchase).set({ status: "cancelled" }).where(eq(contentPurchase.id, p.id)).returning();
+          return row!;
+        });
+        if (done) return done;
+      }
+      throw new ServiceError("content_invalid", "The purchase kept changing; try again.");
     },
 
     /** F6: records that a paid physical item was handed over, and who did it. Payment and handover are separate events. */
@@ -409,14 +427,15 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
       });
     },
 
-    /** Paid physical purchases still waiting to be handed over, oldest first, optionally for one branch. */
-    async pendingHandovers(input: { branchId?: string } = {}) {
+    /** Paid physical purchases still waiting to be handed over, oldest first, optionally for one branch or a set of branches (an empty set matches nothing). */
+    async pendingHandovers(input: { branchId?: string; branchIds?: string[] } = {}) {
+      if (input.branchIds && input.branchIds.length === 0) return [];
       return db
         .select({ purchase: contentPurchase, title: contentItem.title, studentName: student.fullName, studentNo: student.studentNo })
         .from(contentPurchase)
         .innerJoin(contentItem, eq(contentItem.id, contentPurchase.contentId))
         .innerJoin(student, eq(student.id, contentPurchase.studentId))
-        .where(and(eq(contentPurchase.status, "paid"), eq(contentPurchase.channel, "physical"), isNull(contentPurchase.handedOverAt), input.branchId ? eq(contentPurchase.branchId, input.branchId) : undefined))
+        .where(and(eq(contentPurchase.status, "paid"), eq(contentPurchase.channel, "physical"), isNull(contentPurchase.handedOverAt), input.branchId ? eq(contentPurchase.branchId, input.branchId) : undefined, input.branchIds ? inArray(contentPurchase.branchId, input.branchIds) : undefined))
         .orderBy(asc(contentPurchase.purchasedAt), asc(contentPurchase.id));
     },
 

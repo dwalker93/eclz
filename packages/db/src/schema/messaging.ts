@@ -78,7 +78,8 @@ export const notificationTemplate = pgTable(
 
 /**
  * One row per (user, event_key, channel). event_key identifies the event and the thing that caused it (an invoice installment,
- * a payment, a session) so a retry cannot send twice (J2). Two events with the same event_key therefore share one row per user and channel,
+ * a payment, a session) so retrying the enqueue does not create a second row (J2). That is enqueue deduplication only: it does not stop a second send of the same
+ * row (a provider can accept a message and the dispatch transaction still roll back before `status = 'sent'` commits, so delivery is at least once). Two events with the same event_key therefore share one row per user and channel,
  * so a key must be unique per event (the installment reminder uses `due:<invoice>:<seq>`). read_at tracks in-app reads.
  */
 export const notification = pgTable(

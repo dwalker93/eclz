@@ -295,6 +295,23 @@ describe("parent first login by phone, then set a password", () => {
     eq(Number((await q(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_set' AND entity_id = $1`, [u]))[0]!.c), 1);
   });
 
+  test("setInitialPassword refuses an account that became staff or a lecturer after the phone-only session opened", async () => {
+    const mk = async (phone: string) => {
+      const u = await id(`INSERT INTO "user" (username, phone) VALUES ('late-${phone}', '${phone}')`);
+      await q(`INSERT INTO guardian (full_name, phone, user_id, portal_enabled) VALUES ('Late', '${phone}', $1, true)`, [u]);
+      return u;
+    };
+    const hash = async (u: string) => (await q(`SELECT password_hash FROM "user" WHERE id = $1`, [u]))[0]!.password_hash;
+    const s = await mk("94771110091");
+    await q(`INSERT INTO staff_role_assignment (user_id, role_id, branch_id) VALUES ($1, (SELECT id FROM role WHERE name = 'root_admin'), NULL)`, [s]);
+    await fails("forbidden", () => acl.setInitialPassword({ userId: s, passwordHash: "x" }));
+    eq(await hash(s), null, "staff: nothing stored");
+    const l = await mk("94771110092");
+    await q(`INSERT INTO lecturer (full_name, user_id) VALUES ('Late Lec', $1)`, [l]);
+    await fails("forbidden", () => acl.setInitialPassword({ userId: l, passwordHash: "x" }));
+    eq(await hash(l), null, "lecturer: nothing stored");
+  });
+
   test("nothing is found for a wrong number, a disabled user, a portal that is off, or the module off", async () => {
     eq(await acl.findFirstLoginUser({ phone: "0700000000" }), null);
     eq(await acl.findFirstLoginUser({ phone: "abc" }), null);

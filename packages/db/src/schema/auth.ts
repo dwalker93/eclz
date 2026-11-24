@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, index, integer, jsonb, pgTable, text, uuid, type AnyPgColumn } from "drizzle-orm/pg-core";
+import { bigint, check, index, integer, jsonb, pgTable, text, uuid, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { user } from "./core";
 import { createdAt, pk, tstz } from "./helpers";
 
@@ -33,6 +33,8 @@ export const userTwoFactor = pgTable("user_two_factor", {
   secretCipher: text("secret_cipher").notNull(),
   enabledAt: tstz("enabled_at"),
   recoveryHashes: jsonb("recovery_hashes").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  /** The newest 30-second TOTP step already accepted. A code for this step or an older one is refused, so each code works once (RFC 6238). */
+  lastUsedStep: bigint("last_used_step", { mode: "number" }),
   createdAt: createdAt(),
 });
 

@@ -1,6 +1,6 @@
 /** Guardians after registration: edit, phone change, link, unlink, primary. */
 import { afterAll, describe, test } from "bun:test";
-import { createAccessControlService, createGuardianService } from "../src";
+import { createAccessControlService, createGuardianService, ensureGuardianLogin } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -118,5 +118,141 @@ describe("guardian details", () => {
     void other;
     await id(`INSERT INTO guardian (full_name, phone) VALUES ('No Login', '94775550077')`); // an old record without a login
     await fails("phone_taken", () => guardians.changePhone({ guardianId: g.guardianId, actor: editor1, phone: "0775550077" }));
+  });
+});
+
+// ---- review hardening
+
+/** The same db, but `hook` runs just before the first transaction starts: a rival write landing between a check and a write. */
+function withBefore(hook: () => Promise<void>): typeof db {
+  let fired = false;
+  return new Proxy(db, {
+    get(t, prop) {
+      const v = Reflect.get(t, prop, t);
+      if (prop === "transaction") {
+        return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true;
+            await hook();
+          }
+          return (v as (...a: unknown[]) => unknown).apply(t, args);
+        };
+      }
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  }) as typeof db;
+}
+const racing = (hook: () => Promise<void>) => createGuardianService(withBefore(hook), { now: () => new Date("2027-03-10T10:00:00Z") });
+const orphan = (phone: string) => id(`INSERT INTO guardian (full_name, phone) VALUES ('Imported', $1)`, [phone]);
+
+describe("changing a phone", () => {
+  test("a number or login name held by another login is refused even when the guardian has no login", async () => {
+    const g = await orphan("94775550201");
+    await q(`INSERT INTO "user" (email, phone) VALUES ('holder@example.com', '94775550202')`);
+    await fails("phone_taken", () => guardians.changePhone({ guardianId: g, actor: root, phone: "0775550202" }));
+    await q(`INSERT INTO "user" (username) VALUES ('parent-94775550203')`);
+    await fails("phone_taken", () => guardians.changePhone({ guardianId: g, actor: root, phone: "0775550203" }));
+    eq((await q(`SELECT phone FROM guardian WHERE id = $1`, [g]))[0]!.phone, "94775550201", "unchanged");
+    eq((await guardians.changePhone({ guardianId: g, actor: root, phone: "0775550204" })).phone, "94775550204", "a free number works");
+  });
+
+  test("a login provisioned after the guardian was first read follows the new number", async () => {
+    const g = await orphan("94775550211");
+    const rival = racing(async () => void (await db.transaction((tx) => ensureGuardianLogin(tx, { id: g }))));
+    await rival.changePhone({ guardianId: g, actor: root, phone: "0775550212" });
+    const [row] = await q(`SELECT g.phone AS gp, u.phone AS up, u.username FROM guardian g JOIN "user" u ON u.id = g.user_id WHERE g.id = $1`, [g]);
+    eq([row!.gp, row!.up, row!.username], ["94775550212", "94775550212", "parent-94775550212"], "login moved with the guardian");
+  });
+
+  test("a rival that claims the number first wins; the second change is refused", async () => {
+    const a = await orphan("94775550221");
+    const b = await orphan("94775550222");
+    const rival = racing(async () => void (await guardians.changePhone({ guardianId: b, actor: root, phone: "0775550223" })));
+    await fails("phone_taken", () => rival.changePhone({ guardianId: a, actor: root, phone: "0775550223" }));
+    eq((await q(`SELECT phone FROM guardian WHERE id = $1`, [a]))[0]!.phone, "94775550221");
+  });
+});
+
+describe("editing details", () => {
+  test("the audit before-image is the row as it was when the edit locked it", async () => {
+    const g = await orphan("94775550231");
+    await guardians.update({ guardianId: g, actor: root, address: "X" });
+    const rival = racing(async () => void (await guardians.update({ guardianId: g, actor: root, address: "Y" })));
+    await rival.update({ guardianId: g, actor: root, address: "Z" });
+    const rows = await q(`SELECT before_data->>'address' AS b, after_data->>'address' AS a FROM audit_log WHERE entity_id = $1 AND action = 'guardian.update' ORDER BY created_at, id`, [g]);
+    eq(rows.map((r) => [r.b, r.a]), [[null, "X"], ["X", "Y"], ["Y", "Z"]], "each edit records what it replaced");
+  });
+
+  test("email is checked the same way on create and edit; blank stays optional", async () => {
+    const kid = await mkStudent(b1);
+    await fails("invalid_input", () => guardians.link({ studentId: kid, actor: root, fullName: "Bad", phone: "0775550241", email: "not-an-email" }));
+    eq((await q(`SELECT count(*)::int AS c FROM guardian WHERE phone = '94775550241'`))[0]!.c, 0, "nothing created");
+    const ok = await guardians.link({ studentId: kid, actor: root, fullName: "Good", phone: "0775550242", email: " Mixed@Example.COM " });
+    eq((await q(`SELECT email FROM guardian WHERE id = $1`, [ok.guardianId]))[0]!.email, "mixed@example.com");
+    await guardians.link({ studentId: kid, actor: root, fullName: "Blank", phone: "0775550243", email: "  " });
+    await fails("invalid_input", () => guardians.update({ guardianId: ok.guardianId, actor: root, email: "not-an-email" }));
+    eq((await guardians.update({ guardianId: ok.guardianId, actor: root, email: "" })).email, null);
+  });
+});
+
+describe("linking across branches", () => {
+  test("reusing a guardian who only has children elsewhere needs a manager of that guardian, not just of the student", async () => {
+    const far = await mkStudent(b2);
+    const g = await guardians.link({ studentId: far, actor: root, fullName: "Far Parent", phone: "0775550251" });
+    const near = await mkStudent(b1);
+    await fails("forbidden", () => guardians.link({ studentId: near, actor: editor1, fullName: "Whoever", phone: "+94 77 555 0251" }));
+    eq(await links(near), [], "no link made");
+    await fails("forbidden", () => guardians.update({ guardianId: g.guardianId, actor: editor1, fullName: "Hijacked" }));
+    eq((await guardians.link({ studentId: near, actor: root, fullName: "Whoever", phone: "0775550251" })).guardianId, g.guardianId, "an all-branches manager may");
+    // now the guardian has a child in b1, so a branch-1 editor can link a sibling
+    const sibling = await mkStudent(b1);
+    eq((await guardians.link({ studentId: sibling, actor: editor1, fullName: "x", phone: "0775550251" })).guardianId, g.guardianId, "verified sibling reuse works");
+    const orphanId = await orphan("94775550252");
+    eq((await guardians.link({ studentId: sibling, actor: editor1, fullName: "x", phone: "0775550252" })).guardianId, orphanId, "a guardian with no student yet can be reused");
+  });
+
+  test("an account that is not a bare guardian login is never attached", async () => {
+    const stuUser = await id(`INSERT INTO "user" (username, phone) VALUES ('parent-94775550261', '94775550261')`);
+    await q(`INSERT INTO student (student_no, full_name, date_of_birth, user_id) VALUES ('GX1','Teen','2008-01-01',$1)`, [stuUser]);
+    const kid = await mkStudent(b1);
+    await fails("phone_taken", () => guardians.link({ studentId: kid, actor: root, fullName: "Parent", phone: "0775550261" }));
+    eq(await links(kid), [], "rolled back");
+    eq((await q(`SELECT count(*)::int AS c FROM guardian WHERE user_id = $1 OR phone = '94775550261'`, [stuUser]))[0]!.c, 0, "no guardian created or bound");
+  });
+});
+
+describe("link changes", () => {
+  test("ids match whatever the letter case", async () => {
+    const kid = await mkStudent(b1);
+    const a = await guardians.link({ studentId: kid, actor: root, fullName: "Alpha", phone: "0775550271" });
+    const b = await guardians.link({ studentId: kid, actor: root, fullName: "Beta", phone: "0775550272" });
+    await guardians.updateLink({ studentId: kid, guardianId: b.guardianId.toUpperCase(), actor: root, relationship: "aunt" });
+    await guardians.unlink({ studentId: kid, guardianId: a.guardianId.toUpperCase(), actor: root });
+    eq((await links(kid)).map((l) => [l.full_name, l.relationship, l.is_primary]), [["Beta", "aunt", true]]);
+  });
+
+  test("a removal that sees only one link keeps it for an underage student", async () => {
+    const kid = await mkStudent(b1);
+    const a = await guardians.link({ studentId: kid, actor: root, fullName: "Alpha", phone: "0775550281" });
+    const b = await guardians.link({ studentId: kid, actor: root, fullName: "Beta", phone: "0775550282" });
+    const rival = racing(async () => void (await guardians.unlink({ studentId: kid, guardianId: b.guardianId, actor: root })));
+    await fails("guardian_required", () => rival.unlink({ studentId: kid, guardianId: a.guardianId, actor: root }));
+    eq((await links(kid)).length, 1, "one guardian remains");
+  });
+
+  test("a primary change whose link disappears fails and keeps the old primary", async () => {
+    const kid = await mkStudent(b1);
+    await guardians.link({ studentId: kid, actor: root, fullName: "Alpha", phone: "0775550291" });
+    const b = await guardians.link({ studentId: kid, actor: root, fullName: "Beta", phone: "0775550292" });
+    await q(`CREATE FUNCTION skip_promotion() RETURNS trigger AS $$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql`);
+    await q(`CREATE TRIGGER skip_promotion BEFORE UPDATE ON student_guardian FOR EACH ROW WHEN (NEW.is_primary AND NOT OLD.is_primary) EXECUTE FUNCTION skip_promotion()`);
+    try {
+      await fails("not_found", () => guardians.updateLink({ studentId: kid, guardianId: b.guardianId, actor: root, isPrimary: true }));
+    } finally {
+      await q(`DROP TRIGGER skip_promotion ON student_guardian`);
+      await q(`DROP FUNCTION skip_promotion()`);
+    }
+    eq((await links(kid)).map((l) => [l.full_name, l.is_primary]), [["Alpha", true], ["Beta", false]], "demotion rolled back");
+    eq((await q(`SELECT count(*)::int AS c FROM audit_log WHERE entity_id = $1 AND action = 'guardian.update_link'`, [kid]))[0]!.c, 0, "no success audited");
   });
 });

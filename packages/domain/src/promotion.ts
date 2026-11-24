@@ -14,7 +14,7 @@ import {
 import { writeAudit } from "./audit";
 import { ensureStudentBranch, resolveFeeStructure } from "./enrollment";
 import { gradeOn, rateFor, todayFor } from "./lookups";
-import { nextMonthStart } from "./dates";
+import { isCalendarDay, nextMonthStart } from "./dates";
 import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
 
@@ -31,7 +31,7 @@ export interface DraftSummary {
 export interface FlaggedItem {
   itemId: string;
   studentId: string;
-  reason: "capacity_full" | "duplicate_enrollment" | "fee_structure_required" | "fee_structure_invalid";
+  reason: "capacity_full" | "duplicate_enrollment" | "fee_structure_required" | "fee_structure_invalid" | "grade_not_allowed";
   message: string;
 }
 
@@ -40,12 +40,13 @@ export type ConfirmResult =
   | { status: "blocked"; runId: string; flagged: FlaggedItem[] };
 
 class Blocked extends Error {
-  constructor(public flagged: FlaggedItem[]) {
+  /** `moves` records the target each flagged item had when the attempt ran, so the flag is only written if the item is still that move. */
+  constructor(public flagged: FlaggedItem[], public moves: Map<string, string | null>) {
     super("promotion blocked");
   }
 }
 
-const BLOCKING_CODES = ["capacity_full", "duplicate_enrollment", "fee_structure_required", "fee_structure_invalid"] as const;
+const BLOCKING_CODES = ["capacity_full", "duplicate_enrollment", "fee_structure_required", "fee_structure_invalid", "grade_not_allowed"] as const;
 
 export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
@@ -64,6 +65,7 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
      * for a student who has none. Nothing changes until `confirm`. The effective date defaults to the first day of the next month (C14).
      */
     async createDraft(input: { performedBy: string; effectiveDate?: string; note?: string }): Promise<DraftSummary> {
+      if (input.effectiveDate !== undefined && !isCalendarDay(input.effectiveDate)) throw new ServiceError("invalid_input", "The date must be a real calendar day like 2027-04-01.");
       return db.transaction(async (tx) => {
         const today = await todayFor(tx, now());
         const effectiveDate = input.effectiveDate ?? nextMonthStart(today);
@@ -145,25 +147,29 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
 
     /** A run with its items and student names, for the review screen. Works for a run in any state. */
     async getRun(input: { runId: string }) {
-      const [run] = await db.select().from(promotionRun).where(eq(promotionRun.id, input.runId));
-      if (!run) throw new ServiceError("not_found", "Promotion run not found.");
-      const items = await db
-        .select({
-          id: promotionItem.id,
-          studentId: promotionItem.studentId,
-          studentName: student.fullName,
-          fromEnrollmentId: promotionItem.fromEnrollmentId,
-          toCourseId: promotionItem.toCourseId,
-          decision: promotionItem.decision,
-          note: promotionItem.note,
-        })
-        .from(promotionItem)
-        .innerJoin(student, eq(student.id, promotionItem.studentId))
-        .where(eq(promotionItem.promotionRunId, run.id))
-        .orderBy(asc(student.fullName), asc(promotionItem.id));
-      const byDecision: Record<Decision, number> = { move: 0, stay: 0, skip: 0, needs_review: 0 };
-      for (const it of items) byDecision[it.decision as Decision]++;
-      return { run, items, byDecision };
+      // One repeatable-read snapshot for the header and the items: a date change and a saved move made between two separate reads would otherwise
+      // show a combination that never existed. A missing run is not_found; a run with no items is a normal answer with an empty list.
+      return db.transaction(async (tx) => {
+        const [run] = await tx.select().from(promotionRun).where(eq(promotionRun.id, input.runId));
+        if (!run) throw new ServiceError("not_found", "Promotion run not found.");
+        const items = await tx
+          .select({
+            id: promotionItem.id,
+            studentId: promotionItem.studentId,
+            studentName: student.fullName,
+            fromEnrollmentId: promotionItem.fromEnrollmentId,
+            toCourseId: promotionItem.toCourseId,
+            decision: promotionItem.decision,
+            note: promotionItem.note,
+          })
+          .from(promotionItem)
+          .innerJoin(student, eq(student.id, promotionItem.studentId))
+          .where(eq(promotionItem.promotionRunId, run.id))
+          .orderBy(asc(student.fullName), asc(promotionItem.id));
+        const byDecision: Record<Decision, number> = { move: 0, stay: 0, skip: 0, needs_review: 0 };
+        for (const it of items) byDecision[it.decision as Decision]++;
+        return { run, items, byDecision };
+      }, { isolationLevel: "repeatable read", accessMode: "read only" });
     },
 
     /** B6: the admin changes one item. `move` needs a target class of the same subject (I3). */
@@ -181,6 +187,16 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
           if (!target || target.kind !== "class" || target.status !== "active") throw new ServiceError("invalid_input", "The target must be an active class.");
           if (target.id === src!.id) throw new ServiceError("invalid_input", "That is the class the student is already in.");
           if (target.subjectId !== src!.subjectId) throw new ServiceError("invalid_input", "The target class must be the same subject.");
+          // C6: the class must serve the grade the student is being promoted to (a class with no grade list serves any).
+          const [level] = await tx.select().from(studentLevel).where(and(eq(studentLevel.studentId, item.studentId), isNull(studentLevel.toDate)));
+          if (level) {
+            const [cur] = await tx.select().from(gradeLevel).where(eq(gradeLevel.id, level.gradeLevelId));
+            const [next] = cur ? await tx.select().from(gradeLevel).where(eq(gradeLevel.ordinal, cur.ordinal + 1)) : [];
+            const served = await tx.select({ id: courseGradeLevel.gradeLevelId }).from(courseGradeLevel).where(eq(courseGradeLevel.courseId, target.id));
+            if (next && served.length > 0 && !served.some((r) => r.id === next.id)) {
+              throw new ServiceError("invalid_input", "The target class does not serve the grade the student is being promoted to.");
+            }
+          }
         } else if (input.decision === "stay" && !item.fromEnrollmentId) {
           // grade-only item: fine
         }
@@ -198,6 +214,7 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
     },
 
     async setEffectiveDate(input: { runId: string; effectiveDate: string }) {
+      if (!isCalendarDay(input.effectiveDate)) throw new ServiceError("invalid_input", "The date must be a real calendar day like 2027-04-01.");
       return db.transaction(async (tx) => {
         await loadDraft(tx, input.runId, true);
         const [row] = await tx.update(promotionRun).set({ effectiveDate: input.effectiveDate }).where(eq(promotionRun.id, input.runId)).returning();
@@ -233,8 +250,16 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
 
           // C14: no enrolment that leaves its class may have been invoiced past the effective date.
           const leaving = items.filter((i) => i.decision === "move" && i.fromEnrollmentId).map((i) => i.fromEnrollmentId!);
+          // The enrolment rows are locked before the invoice check below, and the recurring generator locks them (shared) before it inserts an
+          // invoice and re-checks the period against them. Whichever comes second therefore sees the other's result: no old-class invoice can
+          // be inserted for a period at or after the effective date between this check and the update.
           const fromRows = items.some((i) => i.fromEnrollmentId)
-            ? await tx.select().from(enrollment).where(inArray(enrollment.id, items.filter((i) => i.fromEnrollmentId).map((i) => i.fromEnrollmentId!)))
+            ? await tx
+                .select()
+                .from(enrollment)
+                .where(inArray(enrollment.id, items.filter((i) => i.fromEnrollmentId).map((i) => i.fromEnrollmentId!)))
+                .orderBy(asc(enrollment.id))
+                .for("update")
             : [];
           const enrById = new Map(fromRows.map((e) => [e.id, e]));
           for (const i of items) {
@@ -265,6 +290,7 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
           const byOrdinal = new Map(grades.map((g) => [g.ordinal, g]));
           const gradeById = new Map(grades.map((g) => [g.id, g]));
           const previousGrade = new Map<string, string>();
+          const nextGradeOf = new Map<string, string>();
           let studentsAdvanced = 0;
           for (const [studentId, list] of byStudent) {
             if (list.every((i) => i.decision === "skip")) continue;
@@ -275,10 +301,12 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
             await tx.update(studentLevel).set({ toDate: eff }).where(eq(studentLevel.id, cur.id));
             await tx.insert(studentLevel).values({ studentId, gradeLevelId: next.id, promotionRunId: run.id, fromDate: eff, reason: "promotion" });
             previousGrade.set(studentId, cur.gradeLevelId);
+            nextGradeOf.set(studentId, next.id);
             studentsAdvanced++;
           }
 
-          // Phase A: end every old enrolment that moves, so seats it frees count for the classes behind it.
+          // Phase A: end every old enrolment that moves, so seats it frees count for the classes behind it. It is completed with its access ending on the
+          // effective date, and recurring generation keeps billing a `promoted` enrolment for its unbilled periods before that date.
           for (const i of items) {
             if (i.decision !== "move" || !i.fromEnrollmentId) continue;
             const e = enrById.get(i.fromEnrollmentId)!;
@@ -330,7 +358,17 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
                   .from(enrollment)
                   .where(and(eq(enrollment.studentId, i.studentId), eq(enrollment.courseId, target.id), eq(enrollment.status, "active")));
                 if (dup) throw new ServiceError("duplicate_enrollment", "The student is already in the target class.");
+                // C6: the target must serve the grade the student is promoted to. There is no override here; pick another class or enrol directly with one.
+                const served = await sp.select({ id: courseGradeLevel.gradeLevelId }).from(courseGradeLevel).where(eq(courseGradeLevel.courseId, target.id));
+                const promotedTo = nextGradeOf.get(i.studentId);
+                if (served.length > 0 && (!promotedTo || !served.some((r) => r.id === promotedTo))) {
+                  throw new ServiceError("grade_not_allowed", "The target class does not serve the grade the student is being promoted to.");
+                }
                 const structure = await resolveFeeStructure(sp, target, {});
+                // A one-time package needs its own invoice and access end date, which promotion does not create: enrol the student in it directly.
+                if (structure?.billingType === "one_time_package") {
+                  throw new ServiceError("fee_structure_invalid", "The target class sells a one-time package. Enrol the student in it directly instead of promoting.");
+                }
                 const [created] = await sp
                   .insert(enrollment)
                   .values({
@@ -353,7 +391,7 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
               } else throw err;
             }
           }
-          if (flagged.length > 0) throw new Blocked(flagged); // rolls everything back
+          if (flagged.length > 0) throw new Blocked(flagged, new Map(items.map((x) => [x.id, x.toCourseId]))); // rolls everything back
 
           await tx.update(promotionRun).set({ status: "confirmed", confirmedAt: now() }).where(eq(promotionRun.id, run.id));
           await writeAudit(tx, {
@@ -367,11 +405,30 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
         });
       } catch (err) {
         if (!(err instanceof Blocked)) throw err;
-        // The failed attempt changed nothing. Flag the items so the admin can fix them, then confirm again.
-        await db.transaction(async (tx) => {
-          for (const f of err.flagged) await tx.update(promotionItem).set({ decision: "needs_review", note: f.message }).where(eq(promotionItem.id, f.itemId));
+        // The failed attempt changed nothing. Flag the items so the admin can fix them, then confirm again. The run lock was released with the failed
+        // transaction, so take it again and write a flag only if the run is still a draft and the item is still the move that failed: a newer decision stays.
+        const written = await db.transaction(async (tx) => {
+          await loadDraft(tx, input.runId, true);
+          const kept: FlaggedItem[] = [];
+          for (const f of err.flagged) {
+            const target = err.moves.get(f.itemId);
+            const done = await tx
+              .update(promotionItem)
+              .set({ decision: "needs_review", note: f.message })
+              .where(
+                and(
+                  eq(promotionItem.id, f.itemId),
+                  eq(promotionItem.promotionRunId, input.runId),
+                  eq(promotionItem.decision, "move"),
+                  target ? eq(promotionItem.toCourseId, target) : isNull(promotionItem.toCourseId),
+                ),
+              )
+              .returning({ id: promotionItem.id });
+            if (done.length > 0) kept.push(f);
+          }
+          return kept;
         });
-        return { status: "blocked", runId: input.runId, flagged: err.flagged };
+        return { status: "blocked", runId: input.runId, flagged: written };
       }
     },
 
@@ -381,16 +438,26 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
      */
     async clearBillingGrade(input: { enrollmentId: string; clearedBy: string; reason: string; fromDate?: string }) {
       if (!input.reason.trim()) throw new ServiceError("reason_required", "A reason is required.");
+      if (input.fromDate !== undefined && !isCalendarDay(input.fromDate)) throw new ServiceError("invalid_input", "The date must be a real calendar day like 2027-04-01.");
       return db.transaction(async (tx) => {
         const [enr] = await tx.select().from(enrollment).where(eq(enrollment.id, input.enrollmentId)).for("update");
         if (!enr) throw new ServiceError("not_found", "Enrolment not found.");
         if (!enr.billingGradeLevelId) throw new ServiceError("invalid_input", "This enrolment has no pinned billing grade.");
         if (!enr.feeStructureId) throw new ServiceError("fee_structure_required", "This enrolment has no fee option.");
-        const date = input.fromDate ?? (await todayFor(tx, now()));
-        const grade = await gradeOn(tx, enr.studentId, date);
-        const rate = await rateFor(tx, enr.feeStructureId, grade, date);
-        if (rate === null) {
-          throw new ServiceError("rate_missing", "The class has no fee rate for the student's current grade. Add the rate, give a fee exception, or move the student first.");
+        // The pin is cleared at once, so billing from now on uses the student's grade and the rate for it. Check today and the caller's date, and the
+        // start of every month between them, so a rate that only starts on a later date cannot leave the months before it without one.
+        const today = await todayFor(tx, now());
+        const from = input.fromDate ?? today;
+        const dates = new Set<string>([today, from]);
+        if (from > today) {
+          for (let d = nextMonthStart(today); d < from && dates.size < 40; d = nextMonthStart(d)) dates.add(d);
+        }
+        for (const date of [...dates].sort()) {
+          const grade = await gradeOn(tx, enr.studentId, date);
+          const rate = await rateFor(tx, enr.feeStructureId, grade, date);
+          if (rate === null) {
+            throw new ServiceError("rate_missing", `The class has no fee rate for the student's grade on ${date}. Add the rate, give a fee exception, or move the student first.`);
+          }
         }
         const [row] = await tx.update(enrollment).set({ billingGradeLevelId: null }).where(eq(enrollment.id, enr.id)).returning();
         await writeAudit(tx, {

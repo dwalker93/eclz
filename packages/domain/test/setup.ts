@@ -14,16 +14,23 @@ const migrations = resolve(import.meta.dir, "../../db/drizzle");
 /**
  * An in-process PostgreSQL (PGlite) with every migration of @workspace/db applied and the provisioning seed run
  * (one institution, default branch, 13 grades, starter roles). Each test file creates its own, so files never share state.
- * Close it in `afterAll`.
+ * Close it in `afterAll`. If setup itself fails, the database is closed here and the original error is thrown.
  *
  * `dateOnly` turns every Date in a raw query result into "YYYY-MM-DD", which is what most scenario tests compare against.
  */
-export async function createScenarioDb(opts: { dateOnly?: boolean } = {}) {
+export async function createScenarioDb(opts: { dateOnly?: boolean; migrationsDir?: string } = {}) {
   const pg = new PGlite({ extensions: { btree_gist } });
-  const journal = JSON.parse(readFileSync(join(migrations, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
-  for (const e of journal.entries) await pg.exec(readFileSync(join(migrations, `${e.tag}.sql`), "utf8"));
+  const dir = opts.migrationsDir ?? migrations;
   const db = drizzle(pg, { schema }) as unknown as Db;
-  await seedDefaults(db, { organizationName: "Test Institute", type: "institution" });
+  try {
+    const journal = JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
+    for (const e of journal.entries) await pg.exec(readFileSync(join(dir, `${e.tag}.sql`), "utf8"));
+    await seedDefaults(db, { organizationName: "Test Institute", type: "institution" });
+  } catch (err) {
+    // The caller never receives `close`, so its afterAll cannot run: close here and keep the original error.
+    await pg.close().catch(() => {});
+    throw err;
+  }
   const q = async (text: string, params: unknown[] = []): Promise<Row[]> => {
     const rows = (await pg.query<Row>(text, params)).rows;
     if (!opts.dateOnly) return rows;

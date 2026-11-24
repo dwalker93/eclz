@@ -6,12 +6,12 @@ import { createAuthRoutes } from "./auth-routes";
 import { createContentRoutes } from "./content-routes";
 import { createExamRoutes } from "./exam-routes";
 import { onError } from "./http";
-import { requireTrustedOrigin } from "./origin";
+import { requireTrustedOrigin, trustedCors } from "./origin";
 import { createPortalRoutes } from "./portal";
 import type { SessionConfig } from "./session";
 
 export interface ApiConfig extends Partial<SessionConfig> {
-  /** Origins of our own web apps (CSRF guard). At least one. */
+  /** Origins of our own web apps: the CSRF guard allows their writes and CORS answers their credentialed requests. At least one. */
   trustedOrigins: string[];
 }
 
@@ -40,7 +40,11 @@ export function createApi(deps: ApiDeps) {
   const session: SessionConfig = { cookieName: deps.config.cookieName ?? "sms_session", secureCookie: deps.config.secureCookie ?? true, trustProxy: deps.config.trustProxy ?? false };
   const app = new Hono();
   app.onError(onError);
-  app.use("*", requireTrustedOrigin(deps.config.trustedOrigins));
+  // No route matched: the same JSON envelope as every other error, never Hono's plain-text 404.
+  app.notFound((c) => c.json({ error: { code: "not_found", message: "Route not found" } }, 404));
+  // CORS first (it answers preflights, which the CSRF guard lets through), then the CSRF guard on every write.
+  app.use("*", trustedCors(deps.config.trustedOrigins));
+  app.use("*", requireTrustedOrigin(deps.config.trustedOrigins, { cookieName: session.cookieName }));
   app.get("/health", (c) => c.json({ ok: true }));
   app.route("/auth", createAuthRoutes(deps.auth, session));
   app.route("/admin", createAdminRoutes({ ...deps, session }));

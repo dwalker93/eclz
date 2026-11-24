@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gt, inArray, isNull, lt, sql } from "drizzle-orm";
 import { commissionEntry, file, lecturer, teacherPayout } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
-import { addDays, localDate } from "./dates";
+import { addDays, isCalendarDay, localDate } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { fromCents, toCents } from "@workspace/db/money";
 import { ServiceError } from "./errors";
@@ -10,7 +10,6 @@ import { type Db, type Tx } from "./types";
 type EntryRow = typeof commissionEntry.$inferSelect;
 type PayoutRow = typeof teacherPayout.$inferSelect;
 
-const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 
 export interface PayoutTotals {
   /** Sum of the entries' base, in cents. */
@@ -161,7 +160,7 @@ export function createPayoutService(db: Db, opts: { now?: () => Date } = {}) {
      * Without `periodEnd` it covers every accrued entry of the lecturer.
      */
     async previewPayout(input: { lecturerId: string; periodEnd?: string | null }): Promise<PreviewPayout> {
-      if (input.periodEnd && !ISO_DAY.test(input.periodEnd)) throw new ServiceError("invalid_input", "Dates must look like 2027-03-31.");
+      if (input.periodEnd && !isCalendarDay(input.periodEnd)) throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
       return db.transaction(async (tx) => {
         const org = await requireCommissions(tx);
         const rows = await tx.select().from(commissionEntry).where(eligibleWhere(input.lecturerId, input.periodEnd ?? null, org.timezone));
@@ -177,8 +176,8 @@ export function createPayoutService(db: Db, opts: { now?: () => Date } = {}) {
      * Two payouts of one lecturer cannot have overlapping periods.
      */
     async createPayout(input: CreatePayoutInput): Promise<CreatePayoutResult> {
-      if (!ISO_DAY.test(input.periodEnd) || (input.periodStart && !ISO_DAY.test(input.periodStart))) {
-        throw new ServiceError("invalid_input", "Dates must look like 2027-03-31.");
+      if (!isCalendarDay(input.periodEnd) || (input.periodStart && !isCalendarDay(input.periodStart))) {
+        throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
       }
       return db.transaction(async (tx) => {
         const org = await requireCommissions(tx);
@@ -291,7 +290,7 @@ export function createPayoutService(db: Db, opts: { now?: () => Date } = {}) {
     async markPaid(input: { payoutId: string; paidBy: string; paymentReference: string; paidOn?: string | null; proofFileId?: string | null }) {
       const reference = input.paymentReference.trim();
       if (!reference) throw new ServiceError("invalid_input", "A payment reference is required.");
-      if (input.paidOn && !ISO_DAY.test(input.paidOn)) throw new ServiceError("invalid_input", "Dates must look like 2027-03-31.");
+      if (input.paidOn && !isCalendarDay(input.paidOn)) throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
       return db.transaction(async (tx) => {
         await requireCommissions(tx);
         const p = await lockPayout(tx, input.payoutId);

@@ -100,6 +100,20 @@ describe("pure helpers", () => {
     await bad({ to: "1", body: "x" }).catch((e) => (msg = e.message));
     eq(msg, "text.lk: Invalid token", "error");
   });
+  test("text.lk request carries an abort signal that fires", async () => {
+    let signal: AbortSignal | null | undefined;
+    const hang = createTextLkSms({
+      apiToken: "t",
+      senderId: "I",
+      fetch: (async (_u: string, init: RequestInit) => {
+        signal = init.signal;
+        return new Response(JSON.stringify({ status: "success" }), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    await hang({ to: "1", body: "x" });
+    eq(signal instanceof AbortSignal, true, "signal passed");
+    eq(signal!.aborted, false, "not yet aborted");
+  });
 });
 
 describe("due soon reminders", () => {
@@ -282,6 +296,20 @@ describe("dispatcher", () => {
     eq((await q(`SELECT error FROM notification WHERE user_id = $1 AND channel = 'email'`, [p.userId]))[0]!.error, "user inactive", "reason");
   });
 
+  test("a provider that never answers fails the row instead of holding the lock", async () => {
+    await drain();
+    await setModules({ email: true });
+    await setChannel("email", true);
+    const slow = createNotificationService(db, { now, providerTimeoutMs: 30, providers: { email: () => new Promise<void>(() => {}) } });
+    const p = await person();
+    await queued(p, "2027-03-11");
+    const r = await slow.dispatchQueued();
+    eq(r.failed >= 1, true, "failed");
+    const [row] = await q(`SELECT status, error FROM notification WHERE user_id = $1 AND channel = 'email'`, [p.userId]);
+    eq(row!.status, "failed", "status");
+    eq(String(row!.error).startsWith("provider timed out"), true, "reason");
+  });
+
   test("limit is validated and respected", async () => {
     await fails("invalid_input", () => svc.dispatchQueued({ limit: 0 }));
     await drain();
@@ -308,5 +336,10 @@ describe("in-app inbox", () => {
     eq(await svc.markRead({ userId: p.userId, ids: [list[0]!.id] }), 1, "owner");
     eq(await svc.markRead({ userId: p.userId, ids: [list[0]!.id] }), 0, "already read");
     eq((await svc.listInApp({ userId: p.userId, unreadOnly: true })).map((x) => x.id), [list[1]!.id], "unread");
+    eq((await svc.listInApp({ userId: p.userId, limit: 1 })).map((x) => x.id), [list[0]!.id], "limit applied, newest first");
+    eq((await svc.listInApp({ userId: p.userId, unreadOnly: true, limit: 1 })).map((x) => x.id), [list[1]!.id], "limit after unread filter");
+    await fails("invalid_input", () => svc.listInApp({ userId: p.userId, limit: -1 }));
+    await fails("invalid_input", () => svc.listInApp({ userId: p.userId, limit: 0 }));
+    await fails("invalid_input", () => svc.listInApp({ userId: p.userId, limit: 1.5 }));
   });
 });

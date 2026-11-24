@@ -73,7 +73,7 @@ export async function activeChannels(tx: Tx, org: OrgRow): Promise<string[]> {
 }
 
 export interface QueueItem {
-  /** Identifies the thing that caused it, so a retry cannot send twice (J2). */
+  /** Identifies the thing that caused it, so retrying the enqueue does not create a second row (J2). It does not make delivery exactly once. */
   eventKey: string;
   payload: Record<string, unknown>;
 }
@@ -186,6 +186,9 @@ export function normalizeSriLankaPhone(raw: string): string | null {
   return out;
 }
 
+/** How long one provider call may take before the row is failed. The call runs inside the row-locked transaction, so it must be bounded. */
+export const PROVIDER_TIMEOUT_MS = 15_000;
+
 /** text.lk v3 plain SMS (POST app.text.lk/api/v3/sms/send, bearer token). `fetch` is injectable for tests. */
 export function createTextLkSms(opts: { apiToken: string; senderId: string; fetch?: typeof fetch }): NonNullable<Providers["sms"]> {
   const doFetch = opts.fetch ?? fetch;
@@ -194,6 +197,7 @@ export function createTextLkSms(opts: { apiToken: string; senderId: string; fetc
       method: "POST",
       headers: { Authorization: `Bearer ${opts.apiToken}`, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ recipient: to, sender_id: opts.senderId, type: "plain", message: body }),
+      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
     });
     const json = (await res.json().catch(() => null)) as { status?: string; message?: string } | null;
     if (!res.ok || json?.status !== "success") throw new Error(`text.lk: ${json?.message ?? `HTTP ${res.status}`}`);
@@ -212,9 +216,23 @@ export interface DispatchResult {
 
 const shortError = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 300) || "send failed";
 
-export function createNotificationService(db: Db, opts: { now?: () => Date; providers?: Providers } = {}) {
+export function createNotificationService(db: Db, opts: { now?: () => Date; providers?: Providers; providerTimeoutMs?: number } = {}) {
+  const timeoutMs = opts.providerTimeoutMs ?? PROVIDER_TIMEOUT_MS;
   const now = () => (opts.now ?? (() => new Date()))();
   const providers = opts.providers ?? {};
+
+  /** Bounds any provider call (email, sms, push) so a silent gateway cannot hold the row lock and connection. */
+  async function withTimeout<T>(call: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`provider timed out after ${timeoutMs} ms`)), timeoutMs);
+    });
+    try {
+      return await Promise.race([call, limit]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
   async function sendOne(tx: Tx, row: typeof notification.$inferSelect, org: OrgRow): Promise<void> {
     const ext = EXTERNAL.find((e) => e.channel === row.channel);
@@ -230,12 +248,12 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     if (row.channel === "email") {
       if (!u.email) throw new Error("no email address");
       if (!providers.email) throw new Error("no email provider configured");
-      await providers.email({ to: u.email, subject: msg.subject, body: msg.body });
+      await withTimeout(providers.email({ to: u.email, subject: msg.subject, body: msg.body }));
     } else if (row.channel === "sms") {
       const to = u.phone ? normalizeSriLankaPhone(u.phone) : null;
       if (!to) throw new Error(u.phone ? "invalid phone number" : "no phone number");
       if (!providers.sms) throw new Error("no sms provider configured");
-      await providers.sms({ to, body: msg.body });
+      await withTimeout(providers.sms({ to, body: msg.body }));
     } else {
       const subs = await tx.select().from(pushSubscription).where(eq(pushSubscription.userId, row.userId)).orderBy(asc(pushSubscription.id));
       if (subs.length === 0) throw new Error("no push subscription");
@@ -244,7 +262,7 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       let last = "";
       for (const s of subs) {
         try {
-          await providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body });
+          await withTimeout(providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body }));
           delivered++;
         } catch (e) {
           last = shortError(e);
@@ -307,13 +325,15 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
 
     /** The user's in-app notifications, newest first. */
     async listInApp(input: { userId: string; unreadOnly?: boolean; limit?: number }) {
+      const limit = input.limit ?? 50;
+      if (!Number.isInteger(limit) || limit < 1) throw new ServiceError("invalid_input", "limit must be a positive whole number.");
       const rows = await db
         .select()
         .from(notification)
-        .where(and(eq(notification.userId, input.userId), eq(notification.channel, "in_app")))
-        .orderBy(desc(notification.createdAt), desc(notification.id));
-      const out = rows.filter((r) => !input.unreadOnly || !r.readAt);
-      return out.slice(0, input.limit ?? 50).map((r) => ({ ...r, message: composeMessage(r.event, r.payload as Record<string, unknown> | null) }));
+        .where(and(eq(notification.userId, input.userId), eq(notification.channel, "in_app"), input.unreadOnly ? isNull(notification.readAt) : undefined))
+        .orderBy(desc(notification.createdAt), desc(notification.id))
+        .limit(limit);
+      return rows.map((r) => ({ ...r, message: composeMessage(r.event, r.payload as Record<string, unknown> | null) }));
     },
 
     /** Marks in-app notifications read for their owner only. Already read ones keep their first read time. */

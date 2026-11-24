@@ -1,0 +1,1 @@
+ALTER TABLE "user_two_factor" ADD COLUMN "last_used_step" bigint;

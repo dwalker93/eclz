@@ -2,6 +2,8 @@
  * Yearly promotion: draft, confirm, stay, blocked moves, billing from the effective date (B and C rules).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@workspace/db/schema";
 import {
   createEnrollmentService,
   createInvoicingService,
@@ -11,7 +13,7 @@ import {
 import { eq } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -115,7 +117,13 @@ describe("Yearly promotion", () => {
     eq((await q(`SELECT count(*)::int n FROM promotion_item WHERE student_id = $1`, [ungraded]))[0]!.n, 0);
     eq(await codeOf(async () => promo.confirm({ runId: d.runId, confirmedBy: staff })), "promotion_unresolved");
     const view = await promo.getRun({ runId: d.runId });
-    eq([view.run.status, view.byDecision.move >= 1, view.items.some((i) => i.studentId === a && i.decision === "move" && i.studentName.length > 0)], ["draft", true, true]);
+    const nameOfA = String((await q(`SELECT full_name FROM student WHERE id = $1`, [a]))[0]!.full_name);
+    const itemA = view.items.find((i) => i.studentId === a);
+    eq([view.run.status, itemA?.decision, itemA?.studentName], ["draft", "move", nameOfA], "the item carries the student's own name");
+    for (const decision of ["move", "stay", "skip", "needs_review"] as const) {
+      eq(view.byDecision[decision], view.items.filter((i) => i.decision === decision).length, `the ${decision} count is exactly the ${decision} items`);
+    }
+    eq(Object.values(view.byDecision).reduce((x, y) => x + y, 0), view.items.length, "every item is counted once");
     eq(await codeOf(async () => promo.getRun({ runId: "00000000-0000-0000-0000-000000000000" })), "not_found");
     await promo.discardDraft({ runId: d.runId, discardedBy: staff });
     eq(await codeOf(async () => promo.confirm({ runId: d.runId, confirmedBy: staff })), "promotion_not_draft");
@@ -270,6 +278,123 @@ describe("Yearly promotion", () => {
     eq(await codeOf(async () => promo.updateItem({ runId: d.runId, itemId: it, decision: "skip" })), "promotion_not_draft");
     eq(await codeOf(async () => promo.setEffectiveDate({ runId: d.runId, effectiveDate: "2027-05-01" })), "promotion_not_draft");
   });
+  test("C6: a target class must serve the grade the student is promoted to", async () => {
+    const cls = await classes([g6, g7]);
+    const far = await classes([g8]);
+    const s = await pupil(g6);
+    await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course });
+    const d = await draft();
+    const it = String((await itemOf(d.runId, s)).id);
+    eq(await codeOf(async () => promo.updateItem({ runId: d.runId, itemId: it, decision: "move", toCourseId: far[g8]!.course })), "invalid_input");
+    // a class with no grade list serves any grade
+    const open = await classes([g7]);
+    await q(`DELETE FROM course_grade_level WHERE course_id = $1`, [open[g7]!.course]);
+    eq((await promo.updateItem({ runId: d.runId, itemId: it, decision: "move", toCourseId: open[g7]!.course })).decision, "move");
+    // an item forced onto a class that does not serve the grade is flagged at confirmation and nothing changes
+    await q(`UPDATE promotion_item SET to_course_id = $2 WHERE id = $1`, [it, far[g8]!.course]);
+    const r = await promo.confirm({ runId: d.runId, confirmedBy: staff });
+    eq(r.status, "blocked");
+    eq(r.status === "blocked" ? r.flagged.map((f) => f.reason) : [], ["grade_not_allowed"]);
+    eq((await levels(s)).length, 1);
+  });
+  test("C14: an old enrolment ended by promotion is still billed for its unbilled months before the effective date", async () => {
+    const cls = await classes([g6, g7]);
+    const s = await pupil(g6);
+    const e = (await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course })).enrollment;
+    const d = await draft(); // effective 2027-04-01, confirmed on March 10 before March was invoiced
+    await promo.confirm({ runId: d.runId, confirmedBy: staff });
+    await inv.generateRecurringInvoices({});
+    clock = new Date("2027-04-02T10:00:00Z");
+    await inv.generateRecurringInvoices({});
+    const rows = await q(
+      `SELECT e.course_id, ii.period_start FROM invoice_item ii JOIN enrollment e ON e.id = ii.enrollment_id WHERE e.student_id = $1 AND ii.kind = 'recurring_fee' ORDER BY ii.period_start`,
+      [s],
+    );
+    eq(rows.map((r) => [r.course_id, r.period_start]), [[cls[g6]!.course, "2027-03-01"], [cls[g7]!.course, "2027-04-01"]]);
+    eq((await q(`SELECT status FROM enrollment WHERE id = $1`, [e.id]))[0]!.status, "completed");
+    clock = new Date("2027-03-10T10:00:00Z");
+  });
+  test("C14: a prepared invoice is re-checked against the enrolment before it is inserted", async () => {
+    const cls = await classes([g6]);
+    const s = await pupil(g6);
+    const e = (await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course })).enrollment;
+    await q(`UPDATE enrollment SET access_starts_on = '2027-01-01', enrolled_on = '2027-01-01' WHERE id = $1`, [e.id]);
+    let calls = 0;
+    const racing = new Proxy(db, {
+      get(t, k, r) {
+        if (k !== "transaction") return Reflect.get(t, k, r);
+        return async (...a: unknown[]) => {
+          // the planning transaction has run; a promotion now ends the enrolment on March 1
+          if (++calls === 2) await q(`UPDATE enrollment SET status = 'completed', end_reason = 'promoted', access_ends_on = '2027-03-01' WHERE id = $1`, [e.id]);
+          return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+        };
+      },
+    });
+    const rep = await createInvoicingService(racing, { now }).generateRecurringInvoices({ enrollmentIds: [e.id] });
+    eq(rep.invoicesCreated.map((x) => x.periodStarts), [["2027-01-01", "2027-02-01"]]);
+    eq((await q(`SELECT period_start FROM invoice_item WHERE enrollment_id = $1 ORDER BY period_start`, [e.id])).map((r) => r.period_start), ["2027-01-01", "2027-02-01"]);
+  });
+  test("a one-time package target is flagged, not turned into an enrolment without its invoice", async () => {
+    const cls = await classes([g6, g7]);
+    await q(`UPDATE fee_structure SET billing_type = 'one_time_package', frequency = NULL, access_duration_months = 6 WHERE id = $1`, [cls[g7]!.fee]);
+    const s = await pupil(g6);
+    await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course });
+    const d = await draft();
+    const r = await promo.confirm({ runId: d.runId, confirmedBy: staff });
+    eq(r.status, "blocked");
+    eq(r.status === "blocked" ? r.flagged.map((f) => f.reason) : [], ["fee_structure_invalid"]);
+    eq((await levels(s)).length, 1);
+  });
+  test("a flag is written only if the run is still a draft and the item is still the move that failed", async () => {
+    const blockedRun = async (before: () => Promise<void>, runIdOf: { id?: string }) => {
+      const cls = await classes([g6, g7]);
+      await q(`UPDATE fee_structure SET is_default = false, is_active = false WHERE id = $1`, [cls[g7]!.fee]);
+      const s = await pupil(g6);
+      await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course });
+      const d = await draft();
+      runIdOf.id = d.runId;
+      let calls = 0;
+      const racing = new Proxy(db, {
+        get(t, k, r) {
+          if (k !== "transaction") return Reflect.get(t, k, r);
+          return async (...a: unknown[]) => {
+            if (++calls === 2) await before(); // between the failed attempt and the flag write
+            return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+          };
+        },
+      });
+      return { svc: createPromotionService(racing, { now }), runId: d.runId, student: s };
+    };
+    // a newer decision (stay) is kept
+    const a: { id?: string } = {};
+    const one = await blockedRun(async () => { await q(`UPDATE promotion_item SET decision = 'stay', to_course_id = NULL WHERE promotion_run_id = $1 AND decision = 'move'`, [a.id]); }, a);
+    const r1 = await one.svc.confirm({ runId: one.runId, confirmedBy: staff });
+    eq(r1.status === "blocked" ? r1.flagged.length : -1, 0);
+    eq((await itemOf(one.runId, one.student)).decision, "stay");
+    // a run confirmed in between is left alone
+    const b: { id?: string } = {};
+    const two = await blockedRun(async () => { await q(`UPDATE promotion_run SET status = 'confirmed', confirmed_at = now() WHERE id = $1`, [b.id]); }, b);
+    eq(await codeOf(async () => two.svc.confirm({ runId: two.runId, confirmedBy: staff })), "promotion_not_draft");
+    eq((await itemOf(two.runId, two.student)).decision, "move");
+  });
+  test("B8: clearing a pin checks every month it affects, not only the caller's date", async () => {
+    const cls = await classes([g6]);
+    const s = await pupil(g6);
+    const e = (await enrol.enrollStudent({ studentId: s, courseId: cls[g6]!.course })).enrollment;
+    const d = await draft();
+    await promo.updateItem({ runId: d.runId, itemId: String((await itemOf(d.runId, s)).id), decision: "stay" });
+    await promo.confirm({ runId: d.runId, confirmedBy: staff });
+    clock = new Date("2027-04-02T10:00:00Z");
+    await q(`INSERT INTO fee_rate (fee_structure_id, grade_level_id, amount, effective_from) VALUES ($1,$2,1500,'2027-05-01')`, [cls[g6]!.fee, g7]);
+    // the Grade 7 rate starts on May 1, but the pin would be cleared now and April would have no rate
+    eq(await codeOf(async () => promo.clearBillingGrade({ enrollmentId: e.id, clearedBy: staff, reason: "r", fromDate: "2027-05-01" })), "rate_missing");
+    eq((await q(`SELECT billing_grade_level_id FROM enrollment WHERE id = $1`, [e.id]))[0]!.billing_grade_level_id, g6);
+    // rates for April and for June onward, nothing for May: today and the caller's date both have one, May does not
+    await q(`DELETE FROM fee_rate WHERE fee_structure_id = $1 AND grade_level_id = $2`, [cls[g6]!.fee, g7]);
+    await q(`INSERT INTO fee_rate (fee_structure_id, grade_level_id, amount, effective_from, effective_to) VALUES ($1,$2,1500,'2027-04-01','2027-05-01'), ($1,$2,1600,'2027-06-01',NULL)`, [cls[g6]!.fee, g7]);
+    eq(await codeOf(async () => promo.clearBillingGrade({ enrollmentId: e.id, clearedBy: staff, reason: "r", fromDate: "2027-06-01" })), "rate_missing");
+    clock = new Date("2027-03-10T10:00:00Z");
+  });
   test("a draft goes stale when an enrolment was dropped meanwhile", async () => {
     const cls = await classes([g6, g7]);
     const s = await pupil(g6);
@@ -277,5 +402,36 @@ describe("Yearly promotion", () => {
     const d = await draft();
     await enrol.dropEnrollment({ enrollmentId: e.id });
     eq(await codeOf(async () => promo.confirm({ runId: d.runId, confirmedBy: staff })), "promotion_stale");
+  });
+});
+
+describe("getRun reads one snapshot", () => {
+  test("header and items are read in one repeatable-read transaction", async () => {
+    const d = await promo.createDraft({ performedBy: staff });
+    const sqls: string[] = [];
+    const spy = (target: any): any =>
+      new Proxy(target, {
+        get(t, k) {
+          const v = t[k];
+          if (k === "query") return (text: string, ...a: unknown[]) => (sqls.push(String(text)), t.query(text, ...a));
+          if (k === "transaction") return (cb: (tx: unknown) => unknown) => t.transaction((tx: unknown) => cb(spy(tx)));
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      });
+    const spied = createPromotionService(drizzle(spy(pg), { schema }) as unknown as typeof db, { now });
+    const view = await spied.getRun({ runId: d.runId });
+    eq(view.run.id, d.runId, "run");
+    const iso = sqls.findIndex((t) => /set transaction isolation level repeatable read/i.test(t));
+    const head = sqls.findIndex((t) => /from "promotion_run"/i.test(t));
+    const rows = sqls.findIndex((t) => /from "promotion_item"/i.test(t));
+    eq([iso >= 0, iso < head, head < rows], [true, true, true], "isolation set before both reads");
+    await promo.discardDraft({ runId: d.runId, discardedBy: staff });
+  });
+
+  test("a run with no items is an empty list, a missing run is not_found", async () => {
+    const empty = await id(`INSERT INTO promotion_run (performed_by, status, effective_date) VALUES ($1, 'discarded', '2027-04-01')`, [staff]);
+    const view = await promo.getRun({ runId: empty });
+    eq([view.items, view.byDecision], [[], { move: 0, stay: 0, skip: 0, needs_review: 0 }]);
+    eq(await codeOf(async () => promo.getRun({ runId: "00000000-0000-0000-0000-000000000000" })), "not_found");
   });
 });

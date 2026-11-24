@@ -2,6 +2,7 @@
  * Enrolment, recurring and package invoicing, invoice adjustment and cancellation, fee exceptions (C, D rules).
  */
 import { afterAll, beforeAll, describe, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   createEnrollmentService,
   createFeeExceptionService,
@@ -526,6 +527,30 @@ describe("Fee exceptions (D19 to D21)", () => {
     eq(await codeOf(async () => exc.endFeeException({ exceptionId: ex.id, endedBy: staff, effectiveTo: "2027-05-01" })), "exception_invalid");
     await exc.createFeeException({ ...base, kind: "discount", discountType: "fixed", discountValue: "20", effectiveFrom: "2027-04-01" });
   });
+  test("impossible calendar dates are invalid_input, not a database error", async () => {
+    const { enr } = await recurring({ rate: 1000, start: "2027-03-01" });
+    const base = { enrollmentId: enr, createdBy: staff, reason: "r", kind: "discount" as const, discountType: "fixed" as const, discountValue: "10" };
+    const codeOf = async (fn: () => Promise<unknown>) => { try { await fn(); return "none"; } catch (e) { return (e as ServiceError).code; } };
+    eq(await codeOf(async () => exc.createFeeException({ ...base, effectiveFrom: "2027-02-31" })), "invalid_input");
+    eq(await codeOf(async () => exc.createFeeException({ ...base, effectiveFrom: "2027-03-01", effectiveTo: "2027-13-01" })), "invalid_input");
+    const ex = await exc.createFeeException({ ...base, effectiveFrom: "2027-03-01" });
+    eq(await codeOf(async () => exc.endFeeException({ exceptionId: ex.id, endedBy: staff, effectiveTo: "2027-04-31" })), "invalid_input");
+  });
+  test("K: ending an exception needs the module; the exception keeps applying unchanged while it is off", async () => {
+    const { enr } = await recurring({ rate: 1000, start: "2027-03-01" });
+    const ex = await exc.createFeeException({ enrollmentId: enr, createdBy: staff, reason: "r", kind: "discount", discountType: "fixed", discountValue: "10", effectiveFrom: "2027-03-01" });
+    await offModule();
+    try {
+      let code = "none";
+      try { await exc.endFeeException({ exceptionId: ex.id, endedBy: staff, effectiveTo: "2027-04-01" }); } catch (e) { code = (e as ServiceError).code; }
+      eq(code, "module_disabled");
+      eq((await q(`SELECT effective_to FROM fee_exception WHERE id = $1`, [ex.id]))[0]!.effective_to, null);
+      eq(Number((await q(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'fee_exception.end' AND entity_id = $1`, [ex.id]))[0]!.c), 0);
+    } finally {
+      await onModule();
+    }
+    eq((await exc.endFeeException({ exceptionId: ex.id, endedBy: staff, effectiveTo: "2027-04-01" })).effectiveTo, "2027-04-01");
+  });
 });
 
 describe("Invoice adjustment and cancellation (D8, D23 to D26)", () => {
@@ -623,5 +648,18 @@ describe("Invoice adjustment and cancellation (D8, D23 to D26)", () => {
     eq((await q(`SELECT paid_on FROM payment WHERE id = $1`, [(r as { id?: string; payment?: { id: string } }).id ?? (r as { payment: { id: string } }).payment.id]))[0]!.paid_on, "2027-03-11");
     await q(`UPDATE organization SET timezone = 'UTC'`);
     clock = new Date("2027-03-10T10:00:00Z");
+  });
+});
+
+describe("student row lock", () => {
+  test("lockStudent takes FOR NO KEY UPDATE, so two enrolments of one student do not deadlock on the key-share locks their inserts hold", () => {
+    // Both transactions insert an enrolment (a KEY SHARE lock on the student) before locking the student. FOR UPDATE would conflict with the other's
+    // KEY SHARE and PostgreSQL would abort one valid enrolment; NO KEY UPDATE conflicts only with itself. The two-connection check needs a real server.
+    const src = readFileSync(new URL("../src/lookups.ts", import.meta.url), "utf8");
+    const body = /export async function lockStudent[\s\S]*?\n}/.exec(src)?.[0] ?? "";
+    eq(/\.for\("no key update"\)/.test(body), true);
+    eq(/\.for\("update"\)/.test(body), false);
+    const enrolment = readFileSync(new URL("../src/enrollment.ts", import.meta.url), "utf8");
+    eq(/ensureStudentBranch[\s\S]*?await lockStudent\(tx, studentId\)/.test(enrolment), true);
   });
 });
