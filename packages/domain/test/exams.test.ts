@@ -21,6 +21,7 @@ afterAll(async () => {
 
 await q(`UPDATE organization SET timezone = 'UTC', enabled_modules = '{"parent_portal": true, "online_exams": true}'::jsonb`);
 const b1 = String((await q(`SELECT id FROM branch LIMIT 1`))[0]!.id);
+const b2 = await id(`INSERT INTO branch (organization_id, name) VALUES ((SELECT id FROM organization), 'Kandy')`);
 let clock = new Date("2027-03-10T07:00:00Z");
 const ex = createExamService(db, { now: () => clock });
 const at = (hhmm: string) => (clock = new Date(`2027-03-10T${hhmm}:00Z`));
@@ -35,7 +36,7 @@ async function newStudent(courses: string[], opts: { restricted?: boolean } = {}
   const userId = await id(`INSERT INTO "user" (email) VALUES ($1)`, [`x${++n}@example.com`]);
   const studentId = await id(`INSERT INTO student (user_id, student_no, full_name, date_of_birth) VALUES ($1,$2,$3,'2014-05-01')`, [userId, `X${++n}`, `Student ${String(n).padStart(3, "0")}`]);
   const enrollmentIds: string[] = [];
-  for (const c of courses) enrollmentIds.push(await id(`INSERT INTO enrollment (course_id, student_id, access_status) VALUES ($1,$2,$3)`, [c, studentId, opts.restricted ? "restricted" : "active"]));
+  for (const c of courses) enrollmentIds.push(await id(`INSERT INTO enrollment (course_id, student_id, access_status, access_starts_on) VALUES ($1,$2,$3,'2027-01-01')`, [c, studentId, opts.restricted ? "restricted" : "active"]));
   return { userId, studentId, enrollmentIds };
 }
 const mcq = (body: string, correctIndex = 0, marks: number | string = 2) =>
@@ -207,6 +208,22 @@ describe("taking an exam (G1, G2, G3, G6)", () => {
     eq((await q(`SELECT count(*)::int AS c FROM exam_attempt WHERE exam_id = $1`, [p.exam.id]))[0]!.c, 2, "two attempts");
   });
 
+  test("G1: a running attempt cannot be resumed once the student has no access, and resumes again when access returns", async () => {
+    const p = await publishedExam();
+    const s = await newStudent(p.courses);
+    at("09:00");
+    const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+    await answer(a.paper.attemptId, s.studentId, [[p.q1, "A"]]);
+    await q(`UPDATE enrollment SET access_status = 'restricted' WHERE student_id = $1`, [s.studentId]);
+    await fails("student_not_eligible", () => ex.startAttempt({ examId: p.exam.id, studentId: s.studentId }));
+    const [row] = await q(`SELECT status FROM exam_attempt WHERE id = $1`, [a.paper.attemptId]);
+    eq(row!.status, "in_progress", "attempt untouched");
+    eq(Number((await q(`SELECT count(*)::int AS c FROM attempt_answer WHERE attempt_id = $1 AND selected_option_key = 'A'`, [a.paper.attemptId]))[0]!.c), 1, "answer kept");
+    await q(`UPDATE enrollment SET access_status = 'active' WHERE student_id = $1`, [s.studentId]);
+    const back = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+    eq([back.resumed, back.paper.attemptId], [true, a.paper.attemptId], "resumed after access returned");
+  });
+
   test("starting again resumes the running attempt with saved answers, and the paper hides the answers", async () => {
     const p = await publishedExam();
     const s = await newStudent(p.courses);
@@ -255,7 +272,7 @@ describe("answer locking (per exam)", () => {
   });
 
   test("with locking the first choice is final; the same choice again is accepted; the batch is all or nothing", async () => {
-    const p = await publishedExam({ lockAnswers: true });
+    const p = await publishedExam({ lockAnswers: true, resultsVisibility: "immediate" });
     const s = await newStudent(p.courses);
     at("09:00");
     const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
@@ -289,7 +306,7 @@ describe("answer locking (per exam)", () => {
 
 describe("grading and results (G5, G7)", () => {
   test("submit grades from the snapshot, blanks score zero, and a result appears", async () => {
-    const p = await publishedExam();
+    const p = await publishedExam({ resultsVisibility: "immediate" });
     const s = await newStudent(p.courses);
     at("09:00");
     const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
@@ -426,6 +443,8 @@ describe("release and visibility (G8, G9)", () => {
     eq([r!.marks, r!.source], ["3.00", "manual_override"], "overridden");
     const [log] = await q(`SELECT action, reason, actor_user_id FROM audit_log WHERE action = 'exam_result.edit_after_release' ORDER BY created_at DESC LIMIT 1`);
     eq([log!.reason, log!.actor_user_id], ["Question 2 was ambiguous", staff], "audit row");
+    const [full] = await q(`SELECT before_data, after_data FROM audit_log WHERE action = 'exam_result.edit_after_release' ORDER BY created_at DESC LIMIT 1`);
+    eq(["remarks" in (full!.before_data as object), "remarks" in (full!.after_data as object)], [true, true], "audit keeps remarks before and after");
   });
 
   test("the release job closes and releases automatic exams but leaves manual ones", async () => {
@@ -495,5 +514,175 @@ describe("paper exams (G7, G8)", () => {
     const p = await publishedExam();
     const s = await newStudent(p.courses);
     await fails("exam_invalid", () => ex.enterMarks({ examId: p.exam.id, entries: [{ studentId: s.studentId, marks: 1 }], actor: staff }));
+  });
+});
+
+describe("a question allocation that cannot be published", () => {
+  async function draft() {
+    const c = await newCourse();
+    return ex.createExam({ lecturerId: lec, title: `Big ${++n}`, mode: "online_mcq", courseIds: [c], opensAt: new Date("2027-03-10T08:00:00Z"), closesAt: new Date("2027-03-10T12:00:00Z"), maxAttempts: 1 });
+  }
+  const big = async () => (await mcq(`Big ${++n}`, 0, 100000)).id;
+
+  test("setQuestions refuses a total above numeric(8,2), counting the bank's default marks, and keeps the old allocation", async () => {
+    const e = await draft();
+    const small = await mcq("Small", 0, 1);
+    await ex.setQuestions({ examId: e.id, questions: [{ questionId: small.id }] });
+    const ids = await Promise.all(Array.from({ length: 11 }, big));
+    await fails("exam_invalid", () => ex.setQuestions({ examId: e.id, questions: ids.map((questionId) => ({ questionId })) }));
+    eq(Number((await q(`SELECT count(*)::int AS c FROM exam_question WHERE exam_id = $1`, [e.id]))[0]!.c), 1, "the earlier allocation is kept");
+    eq(await ex.setQuestions({ examId: e.id, questions: ids.slice(0, 9).map((questionId) => ({ questionId })) }), 9, "900000.00 fits");
+    await fails("exam_invalid", () => ex.setQuestions({ examId: e.id, questions: ids.slice(0, 10).map((questionId) => ({ questionId })) }));
+  });
+
+  test("publishExam gives a domain error for an existing draft whose total is out of range", async () => {
+    const e = await draft();
+    const one = await mcq("One", 0, 1);
+    await ex.setQuestions({ examId: e.id, questions: [{ questionId: one.id }] });
+    const ids = await Promise.all(Array.from({ length: 10 }, big));
+    await q(`INSERT INTO exam_question (exam_id, question_id, marks, position) SELECT $1, id, 100000, 1 + row_number() OVER () FROM question WHERE id = ANY($2::uuid[])`, [e.id, ids]);
+    await fails("exam_invalid", () => ex.publishExam({ examId: e.id }));
+    eq(String((await q(`SELECT status FROM exam WHERE id = $1`, [e.id]))[0]!.status), "draft", "still a draft");
+  });
+});
+
+describe("an exam shared by two branches: results and marks are scoped per result", () => {
+  async function shared() {
+    const cA = await newCourse();
+    const cB = await id(`INSERT INTO course (subject_id, branch_id, name, kind, learning_mode, attendance_enabled) VALUES ($1,$2,$3,'class','scheduled',false)`, [subj, b2, `Class B ${++n}`]);
+    const e = await ex.createExam({ lecturerId: lec, title: "Shared paper", mode: "paper", courseIds: [cA, cB], examDate: "2027-03-20", maxMarks: 100 });
+    await ex.publishExam({ examId: e.id });
+    const sA = await newStudent([cA]);
+    const sB = await newStudent([cB]);
+    const both = await newStudent([cA, cB]);
+    return { e, cA, cB, sA, sB, both };
+  }
+  const names = (r: { results: { studentId: string }[] }) => r.results.map((x) => x.studentId).sort();
+
+  test("getResults with a branch set returns only that branch's rows and aggregates", async () => {
+    const t = await shared();
+    await ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.sA.studentId, marks: 80 }, { studentId: t.sB.studentId, marks: 40 }], actor: staff });
+    const all = await ex.getResults({ examId: t.e.id });
+    eq([all.count, all.average, all.highest], [2, "60.00", "80.00"], "everything for the unscoped caller");
+    const a = await ex.getResults({ examId: t.e.id, branchIds: [b1] });
+    eq([names(a), a.count, a.average, a.highest], [[t.sA.studentId], 1, "80.00", "80.00"], "A only, aggregates too");
+    const none = await ex.getResults({ examId: t.e.id, branchIds: [] });
+    eq([none.count, none.average, none.highest], [0, null, null], "an empty set sees nothing");
+  });
+
+  test("enterMarks with a branch set rejects the whole batch when an entry is in another branch, and writes nothing", async () => {
+    const t = await shared();
+    await fails("forbidden", () => ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.sA.studentId, marks: 70 }, { studentId: t.sB.studentId, marks: 60 }], actor: staff, branchIds: [b1] }));
+    eq(Number((await q(`SELECT count(*)::int AS c FROM exam_result WHERE exam_id = $1`, [t.e.id]))[0]!.c), 0, "nothing written, not even the A entry");
+    eq(await ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.sA.studentId, marks: 70 }], actor: staff, branchIds: [b1] }), 1, "in scope");
+    await fails("forbidden", () => ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.sA.studentId, marks: 70 }], actor: staff, branchIds: [] }));
+    const nobody = await newStudent([]);
+    await fails("student_not_enrolled", () => ex.enterMarks({ examId: t.e.id, entries: [{ studentId: nobody.studentId, marks: 1 }], actor: staff, branchIds: [b1] }));
+  });
+
+  test("a student in both branches is recorded in the manager's own branch, and a stored result in another branch cannot be corrected", async () => {
+    const t = await shared();
+    await ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.both.studentId, marks: 50 }], actor: staff, branchIds: [b2] });
+    const [r] = await q(`SELECT course_id FROM exam_result WHERE exam_id = $1 AND student_id = $2`, [t.e.id, t.both.studentId]);
+    eq(String(r!.course_id), t.cB, "recorded in B, the manager's branch");
+    await fails("forbidden", () => ex.enterMarks({ examId: t.e.id, entries: [{ studentId: t.both.studentId, marks: 55 }], actor: staff, branchIds: [b1] }));
+    eq(String((await q(`SELECT marks FROM exam_result WHERE exam_id = $1 AND student_id = $2`, [t.e.id, t.both.studentId]))[0]!.marks), "50.00", "unchanged");
+  });
+});
+
+describe("review hardening", () => {
+  const hiddenRows = (attemptId: string) => q(`SELECT status, score FROM exam_attempt WHERE id = $1`, [attemptId]);
+
+  test("G9: an attempt's score follows the exam's result visibility", async () => {
+    for (const vis of ["after_release", "manual"] as const) {
+      const p = await publishedExam({ resultsVisibility: vis });
+      const s = await newStudent(p.courses);
+      at("09:00");
+      const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+      await answer(a.paper.attemptId, s.studentId, [[p.q1, "A"]]);
+      at("09:10");
+      const sub = await ex.submitAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId });
+      eq([sub.status, sub.score, sub.alreadyFinished], ["graded", null, false], `${vis}: submit hides the score`);
+      const again = await ex.submitAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId });
+      eq([again.score, again.alreadyFinished], [null, true], `${vis}: a second submit too`);
+      const read = await ex.getAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId });
+      eq([read.status, read.score, read.scoreHidden], ["graded", null, true], `${vis}: reading it back`);
+      eq((await hiddenRows(a.paper.attemptId))[0]!.score, "2.00", "the score is stored");
+      // once the result is released the score is visible again
+      await ex.closeExam({ examId: p.exam.id });
+      await q(`UPDATE exam_result SET released_at = now() WHERE exam_id = $1 AND student_id = $2`, [p.exam.id, s.studentId]);
+      const released = await ex.getAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId });
+      eq([released.score, released.scoreHidden], ["2.00", false], `${vis}: released`);
+      eq((await ex.submitAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId })).score, "2.00");
+    }
+    // immediate exams keep their provisional score
+    const p = await publishedExam({ resultsVisibility: "immediate" });
+    const s = await newStudent(p.courses);
+    at("09:00");
+    const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+    await answer(a.paper.attemptId, s.studentId, [[p.q1, "A"]]);
+    eq((await ex.submitAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId })).score, "2.00");
+    eq((await ex.getAttempt({ attemptId: a.paper.attemptId, studentId: s.studentId })).score, "2.00");
+    // a running attempt never shows a score, and is not "hidden" either
+    const p2 = await publishedExam();
+    const s2 = await newStudent(p2.courses);
+    const a2 = await ex.startAttempt({ examId: p2.exam.id, studentId: s2.studentId });
+    const running = await ex.getAttempt({ attemptId: a2.paper.attemptId, studentId: s2.studentId });
+    eq([running.status, running.score, running.scoreHidden], ["in_progress", null, false]);
+  });
+
+  test("a student's call never finalizes another student's overdue attempt; the scheduled job does", async () => {
+    const p = await publishedExam({ timeLimitMinutes: 30 });
+    const owner = await newStudent(p.courses);
+    const other = await newStudent(p.courses);
+    at("09:00");
+    const a = await ex.startAttempt({ examId: p.exam.id, studentId: owner.studentId });
+    await answer(a.paper.attemptId, owner.studentId, [[p.q1, "A"]]);
+    at("09:45");
+    const untouched = async () => eq([(await hiddenRows(a.paper.attemptId))[0]!.status, (await hiddenRows(a.paper.attemptId))[0]!.score], ["in_progress", null], "still running, ungraded");
+    await fails("not_found", () => ex.getAttempt({ attemptId: a.paper.attemptId, studentId: other.studentId }));
+    await untouched();
+    await fails("not_found", () => ex.submitAttempt({ attemptId: a.paper.attemptId, studentId: other.studentId }));
+    await untouched();
+    await fails("not_found", () => answer(a.paper.attemptId, other.studentId, [[p.q1, "B"]]));
+    await untouched();
+    eq((await q(`SELECT count(*)::int AS c FROM exam_result WHERE exam_id = $1`, [p.exam.id]))[0]!.c, 0, "no result written");
+    // the owner's own call still finalizes it, and so does the scheduled job for another overdue attempt
+    eq((await ex.getAttempt({ attemptId: a.paper.attemptId, studentId: owner.studentId })).status, "expired");
+    const p2 = await publishedExam({ timeLimitMinutes: 30 });
+    const s2 = await newStudent(p2.courses);
+    at("09:00");
+    const b = await ex.startAttempt({ examId: p2.exam.id, studentId: s2.studentId });
+    at("09:45");
+    eq(await ex.finalizeExpiredAttempts() >= 1, true);
+    eq((await hiddenRows(b.paper.attemptId))[0]!.status, "expired");
+  });
+
+  test("G6 under the lock: a deadline that passes after the first check expires the attempt, commits it, then refuses", async () => {
+    const p = await publishedExam({ timeLimitMinutes: 30 });
+    const s = await newStudent(p.courses);
+    at("09:00");
+    const a = await ex.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+    await answer(a.paper.attemptId, s.studentId, [[p.q1, "A"]]);
+    // the first look (before the lock) sees 09:29:59, the look under the write lock sees 09:30:01
+    const times = [new Date("2027-03-10T09:29:59Z"), new Date("2027-03-10T09:30:01Z")];
+    const racing = createExamService(db, { now: () => times.shift() ?? clock });
+    await fails("attempt_time_over", () => racing.saveAnswers({ attemptId: a.paper.attemptId, studentId: s.studentId, answers: [{ examQuestionId: p.q2, selectedOptionKey: "B" }] }));
+    const [row] = await q(`SELECT status, score FROM exam_attempt WHERE id = $1`, [a.paper.attemptId]);
+    eq([row!.status, row!.score], ["expired", "2.00"], "finalized and committed");
+    eq((await q(`SELECT selected_option_key FROM attempt_answer WHERE attempt_id = $1 AND exam_question_id = $2`, [a.paper.attemptId, p.q2]))[0]!.selected_option_key, null, "the late answer was not saved");
+    await fails("attempt_time_over", () => answer(a.paper.attemptId, s.studentId, [[p.q2, "B"]])); // a retry sees the finished attempt
+
+    // the same for a submission: it ends the attempt as expired, not graded
+    const p2 = await publishedExam({ timeLimitMinutes: 30 });
+    const s2 = await newStudent(p2.courses);
+    at("09:00");
+    const b = await ex.startAttempt({ examId: p2.exam.id, studentId: s2.studentId });
+    await answer(b.paper.attemptId, s2.studentId, [[p2.q1, "A"]]);
+    const t2 = [new Date("2027-03-10T09:29:59Z"), new Date("2027-03-10T09:30:01Z")];
+    const racing2 = createExamService(db, { now: () => t2.shift() ?? clock });
+    const sub = await racing2.submitAttempt({ attemptId: b.paper.attemptId, studentId: s2.studentId });
+    eq([sub.status, sub.alreadyFinished], ["expired", true]);
+    eq((await hiddenRows(b.paper.attemptId))[0]!.status, "expired");
   });
 });

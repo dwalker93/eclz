@@ -1,5 +1,5 @@
 import { course, enrollment, invoice, invoiceItem, STUDENT_STATUSES } from "@workspace/db/schema";
-import { branchScope, requirePermission, requireStudent, ServiceError, type Db, type EnrollmentService, type StudentService } from "@workspace/domain";
+import { branchScope, isCalendarDay, requirePermission, requireStudent, ServiceError, type Db, type EnrollmentService, type StudentService } from "@workspace/domain";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import type { Hono } from "hono";
 import { z } from "zod";
@@ -7,7 +7,7 @@ import { jsonBody } from "./http";
 import type { Env } from "./session";
 
 const uuid = z.string().uuid();
-const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+const day = z.string().refine(isCalendarDay, "Use a real calendar date like 2027-03-31.");
 const text = (max = 200) => z.string().trim().max(max);
 
 const guardianBody = z.object({
@@ -88,8 +88,9 @@ export function addStudentRoutes(app: Hono<Env>, { db, students, enrollment: enr
 
   app.get("/students/:id", async (c) => {
     const id = uuid.parse(c.req.param("id"));
-    await requireStudent(db, c.get("principal").userId, "students.read", id);
-    return c.json(await students.get({ studentId: id }));
+    const user = c.get("principal").userId;
+    await requireStudent(db, user, "students.read", id);
+    return c.json(await students.get({ studentId: id, scope: await branchScope(db, user, "students.read") }));
   });
 
   app.patch("/students/:id", async (c) => {

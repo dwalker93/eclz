@@ -1,7 +1,7 @@
-import { and, asc, count, eq, ilike, inArray, isNull, or, sql } from "drizzle-orm";
-import { branch, enrollment, guardian, student, studentBranch, studentGuardian, studentLevel, user, gradeLevel, STUDENT_STATUSES } from "@workspace/db/schema";
+import { and, asc, count, eq, ilike, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { branch, course, enrollment, guardian, lecturer, staffRoleAssignment, student, studentBranch, studentGuardian, studentLevel, user, gradeLevel, STUDENT_STATUSES } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
-import { ageOn } from "./dates";
+import { ageOn, isCalendarDay } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { normalizeSriLankaPhone } from "./notifications";
 import { ServiceError } from "./errors";
@@ -25,7 +25,56 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
  * the email when it is given and free, and no password (they cannot sign in until invited and a password is set).
  * This is what lets notifications reach a parent, because notifications belong to users.
  */
-export async function ensureGuardianLogin(tx: Tx, g: { id: string; userId: string | null; phone: string | null; email: string | null }): Promise<string | null> {
+/** A guardian email, trimmed and lowercased; blank means none; anything else must look like an address. One rule for every write path. */
+export function normalizeGuardianEmail(raw: string | null | undefined): string | null {
+  const email = (raw ?? "").trim().toLowerCase();
+  if (!email) return null;
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new ServiceError("invalid_input", "Invalid email address.");
+  return email;
+}
+
+/** The username prefix reserved for guardian logins: a login created through `register` may not use it. */
+export const GUARDIAN_USERNAME_PREFIX = "parent-";
+
+/**
+ * The guardian with this phone number, whatever format it was stored in (`0777000111`, `+94 77 700 0111` and `94777000111` are one number).
+ * When old data holds several, the one that already has a login wins, then the one stored in the normalized form, then the oldest.
+ */
+export async function findGuardianByPhone(tx: Tx, phone: string, excludeId?: string) {
+  // The lookup holds a transaction lock on the number, so two transactions that check and then claim the same number (register, link, change of phone)
+  // run one after the other and the second sees the first's guardian. Always taken before any guardian row lock.
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`guardian-phone:${phone}`}, 0))`);
+  const national = phone.slice(2);
+  const digits = sql`regexp_replace(${guardian.phone}, '[^0-9]', '', 'g')`;
+  const [row] = await tx
+    .select()
+    .from(guardian)
+    .where(and(sql`${digits} IN (${phone}, ${`0${national}`}, ${national})`, excludeId ? ne(guardian.id, excludeId) : undefined))
+    .orderBy(sql`(${guardian.userId} IS NOT NULL) DESC`, sql`(${guardian.phone} = ${phone}) DESC`, asc(guardian.createdAt), asc(guardian.id))
+    .limit(1);
+  return row;
+}
+
+/**
+ * An existing `parent-<phone>` account may be reused only if it is exactly a guardian login for that phone: the matching phone and username,
+ * no other guardian, no student, no lecturer and no staff role on it. Anything else (a student whose username was chosen to look like a parent's)
+ * is somebody else's account and must never become this guardian's login.
+ */
+async function isBareGuardianLogin(tx: Tx, u: { id: string; phone: string | null; username: string | null }, phone: string): Promise<boolean> {
+  if (u.phone !== phone || u.username !== `${GUARDIAN_USERNAME_PREFIX}${phone}`) return false;
+  const used = await Promise.all([
+    tx.select({ id: guardian.id }).from(guardian).where(eq(guardian.userId, u.id)).limit(1),
+    tx.select({ id: student.id }).from(student).where(eq(student.userId, u.id)).limit(1),
+    tx.select({ id: lecturer.id }).from(lecturer).where(eq(lecturer.userId, u.id)).limit(1),
+    tx.select({ id: staffRoleAssignment.id }).from(staffRoleAssignment).where(eq(staffRoleAssignment.userId, u.id)).limit(1),
+  ]);
+  return used.every((r) => r.length === 0);
+}
+
+export async function ensureGuardianLogin(tx: Tx, given: { id: string }): Promise<string | null> {
+  // Reads the guardian again under its row lock, the same lock a change of phone takes: a login that was bound meanwhile is kept, and the phone used is the current one.
+  const [g] = await tx.select().from(guardian).where(eq(guardian.id, given.id)).for("update");
+  if (!g) return null;
   if (g.userId) return g.userId;
   const phone = g.phone ? normalizeSriLankaPhone(g.phone) : null;
   if (!phone) return null;
@@ -34,9 +83,12 @@ export async function ensureGuardianLogin(tx: Tx, g: { id: string; userId: strin
     const [taken] = await tx.select({ id: user.id }).from(user).where(eq(user.email, email));
     if (taken) email = null;
   }
-  const username = `parent-${phone}`;
-  const [existing] = await tx.select({ id: user.id }).from(user).where(eq(user.username, username));
+  const username = `${GUARDIAN_USERNAME_PREFIX}${phone}`;
+  const [existing] = await tx.select({ id: user.id, phone: user.phone, username: user.username }).from(user).where(eq(user.username, username));
   let userId = existing?.id;
+  if (existing && !(await isBareGuardianLogin(tx, existing, phone))) {
+    throw new ServiceError("phone_taken", `The login name ${username} belongs to another account, so it cannot become this guardian's login.`);
+  }
   if (!userId) {
     const [u] = await tx.insert(user).values({ username, email, phone, status: "active" }).returning({ id: user.id });
     userId = u!.id;
@@ -75,7 +127,7 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
     }) {
       const fullName = clean(input.fullName);
       if (!fullName) throw new ServiceError("invalid_input", "The student's name is required.");
-      if (!DAY.test(input.dateOfBirth)) throw new ServiceError("invalid_input", "Date of birth must be YYYY-MM-DD.");
+      if (!isCalendarDay(input.dateOfBirth)) throw new ServiceError("invalid_input", "Date of birth must be a real date written YYYY-MM-DD.");
       const guardians = input.guardians ?? [];
       for (const g of guardians) {
         if (!clean(g.fullName)) throw new ServiceError("guardian_required", "Every guardian needs a name.");
@@ -115,6 +167,9 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
         }
 
         let userId: string | null = null;
+        if (input.login?.username?.trim().toLowerCase().startsWith(GUARDIAN_USERNAME_PREFIX)) {
+          throw new ServiceError("invalid_input", `Usernames starting with "${GUARDIAN_USERNAME_PREFIX}" are reserved for parent logins.`);
+        }
         if (input.login && (input.login.email || input.login.username)) {
           try {
             const [u] = await tx
@@ -145,18 +200,22 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
         if (input.gradeLevelId) await tx.insert(studentLevel).values({ studentId: stu!.id, gradeLevelId: input.gradeLevelId, fromDate: on });
 
         const linked: { guardianId: string; userId: string | null; created: boolean }[] = [];
-        const seen = new Set<string>();
-        const wantPrimary = guardians.findIndex((g) => g.isPrimary);
-        for (const [i, g] of guardians.entries()) {
+        // One entry per person (by normalized phone) before anything is chosen; a repeated number carries its primary flag to the kept entry.
+        const people: { g: GuardianInput; phone: string; primary: boolean }[] = [];
+        for (const g of guardians) {
           const phone = normalizeSriLankaPhone(g.phone)!;
-          if (seen.has(phone)) continue; // the same parent listed twice
-          seen.add(phone);
-          let [row] = await tx.select().from(guardian).where(eq(guardian.phone, phone));
+          const kept = people.find((x) => x.phone === phone);
+          if (kept) kept.primary ||= g.isPrimary === true;
+          else people.push({ g, phone, primary: g.isPrimary === true });
+        }
+        const wantPrimary = Math.max(0, people.findIndex((x) => x.primary));
+        for (const [i, { g, phone }] of people.entries()) {
+          let row = await findGuardianByPhone(tx, phone);
           const created = !row;
           if (!row) {
             [row] = await tx
               .insert(guardian)
-              .values({ fullName: clean(g.fullName), phone, address: clean(g.address) || null, nic: g.nic ?? null, email: g.email ?? null })
+              .values({ fullName: clean(g.fullName), phone, address: clean(g.address) || null, nic: g.nic ?? null, email: normalizeGuardianEmail(g.email) })
               .returning();
           }
           const uid = await ensureGuardianLogin(tx, row!);
@@ -164,7 +223,7 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
             studentId: stu!.id,
             guardianId: row!.id,
             relationship: g.relationship ?? null,
-            isPrimary: wantPrimary >= 0 ? i === wantPrimary : linked.length === 0,
+            isPrimary: i === wantPrimary,
           });
           linked.push({ guardianId: row!.id, userId: uid, created });
         }
@@ -196,8 +255,12 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
       return rows;
     },
 
-    /** One student with guardians, branches and enrolments. The caller has already been checked (see `authorizeStudent`). */
-    async get(input: { studentId: string }) {
+    /**
+     * One student with guardians, branches and enrolments. The caller has already been checked (see `authorizeStudent`). `scope` is the caller's
+     * `students.read` scope from `branchScope`: enrolments are shown only for courses of those branches (`"all"` shows every one), because
+     * a student enrolled in branches A and B is readable by staff of A only for A's part (I1, I2).
+     */
+    async get(input: { studentId: string; scope: "all" | string[] }) {
       const [stu] = await db.select().from(student).where(eq(student.id, input.studentId));
       if (!stu) throw new ServiceError("not_found", "Student not found.");
       const guardians = await db
@@ -210,7 +273,8 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
       const enrolments = await db
         .select({ id: enrollment.id, courseId: enrollment.courseId, status: enrollment.status, accessStatus: enrollment.accessStatus, enrolledOn: enrollment.enrolledOn })
         .from(enrollment)
-        .where(eq(enrollment.studentId, stu.id))
+        .innerJoin(course, eq(course.id, enrollment.courseId))
+        .where(and(eq(enrollment.studentId, stu.id), input.scope === "all" ? undefined : inArray(course.branchId, input.scope)))
         .orderBy(asc(enrollment.enrolledOn), asc(enrollment.id));
       return { student: stu, guardians, branches, enrolments };
     },
@@ -237,7 +301,18 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
           patch.fullName = clean(input.fullName);
         }
         if (input.dateOfBirth !== undefined) {
-          if (!DAY.test(input.dateOfBirth)) throw new ServiceError("invalid_input", "Date of birth must be YYYY-MM-DD.");
+          if (!isCalendarDay(input.dateOfBirth)) throw new ServiceError("invalid_input", "Date of birth must be a real date written YYYY-MM-DD.");
+          const today = await todayFor(tx, now());
+          if (input.dateOfBirth > today) throw new ServiceError("invalid_input", "Date of birth is in the future.");
+          if (input.dateOfBirth !== old.dateOfBirth) {
+            // The same rule as unlinking the last guardian: a student under the age limit keeps one. The student row is locked (as in the
+            // guardian link changes), so the last guardian cannot be removed between this check and the write.
+            const org = await loadOrganization(tx);
+            if (ageOn(input.dateOfBirth, today) < org.guardianRequiredBelowAge) {
+              const [linked] = await tx.select({ id: studentGuardian.guardianId }).from(studentGuardian).where(eq(studentGuardian.studentId, old.id)).limit(1);
+              if (!linked) throw new ServiceError("guardian_required", `A student under ${org.guardianRequiredBelowAge} needs a guardian. Link one first, then correct the date of birth.`);
+            }
+          }
           patch.dateOfBirth = input.dateOfBirth;
         }
         if (input.status !== undefined) {
@@ -263,16 +338,31 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
      * this rule, or by import). Safe to run again. Returns how many were created or linked and which guardians had no usable phone.
      */
     async provisionGuardianLogins() {
-      return db.transaction(async (tx) => {
-        const rows = await tx.select().from(guardian).where(isNull(guardian.userId));
-        let provisioned = 0;
-        const skipped: string[] = [];
-        for (const g of rows) {
-          if (await ensureGuardianLogin(tx, g)) provisioned++;
-          else skipped.push(g.id);
+      const rows = await db.select().from(guardian).where(isNull(guardian.userId)).orderBy(asc(guardian.createdAt), asc(guardian.id));
+      let provisioned = 0;
+      const skipped: string[] = [];
+      const conflicts: string[] = [];
+      const groups = new Map<string, typeof rows>();
+      for (const g of rows) {
+        const phone = g.phone ? normalizeSriLankaPhone(g.phone) : null;
+        if (!phone) skipped.push(g.id);
+        else groups.set(phone, [...(groups.get(phone) ?? []), g]);
+      }
+      // Guardians that share a number are one person entered twice. They need a human to merge them (their students and notices reference
+      // each row), so none of them is provisioned; they are reported and everyone else still is.
+      const duplicates = [...groups.values()].filter((g) => g.length > 1).map((g) => g.map((x) => x.id));
+      for (const [, group] of groups) {
+        if (group.length > 1) continue;
+        const g = group[0]!;
+        try {
+          // Each guardian in its own transaction: one that cannot be provisioned does not undo the rest, and a rerun picks up where this stopped.
+          if (await db.transaction((tx) => ensureGuardianLogin(tx, g))) provisioned++;
+        } catch (e) {
+          if (e instanceof ServiceError && e.code === "phone_taken") conflicts.push(g.id);
+          else throw e;
         }
-        return { provisioned, skipped };
-      });
+      }
+      return { provisioned, skipped, duplicates, conflicts };
     },
   };
 }

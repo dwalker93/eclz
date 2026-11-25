@@ -1,12 +1,14 @@
 import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
+import { isCalendarDay } from "./dates";
 import { branch, guardian, invoice, payment, paymentMethod, student, studentGuardian } from "@workspace/db/schema";
 import { fromCents, toCents } from "@workspace/db/money";
-import { branchScope } from "./authorization";
+import { branchScope, canonicalUuid } from "./authorization";
 import { ServiceError } from "./errors";
 import { loadOrganization, todayFor } from "./lookups";
 import { type Db } from "./types";
 
-const DAY = /^\d{4}-\d{2}-\d{2}$/;
+/** Every report reads inside one transaction that sees a single snapshot, so its parts always add up to the same moment. */
+const SNAPSHOT = { isolationLevel: "repeatable read", accessMode: "read only" } as const;
 const dayNumber = (d: string) => Math.floor(Date.parse(`${d}T00:00:00Z`) / 86_400_000);
 
 export interface OverdueRow {
@@ -56,7 +58,9 @@ export interface CollectionsReport {
 export function createReportService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
 
-  async function scopeOf(actor: string, branchId?: string): Promise<string[] | "all"> {
+  async function scopeOf(actor: string, rawBranchId?: string): Promise<string[] | "all"> {
+    // Branch ids are stored lower-case; an upper-case spelling of the same uuid must compare equal.
+    const branchId = rawBranchId === undefined ? undefined : canonicalUuid(rawBranchId);
     const scope = await branchScope(db, actor, "reports.read");
     if (scope !== "all" && scope.length === 0) throw new ServiceError("forbidden", "You do not have the reports.read permission.");
     if (!branchId) return scope;
@@ -67,95 +71,119 @@ export function createReportService(db: Db, opts: { now?: () => Date } = {}) {
   return {
     async overdue(input: { actor: string; branchId?: string; limit?: number; offset?: number }): Promise<OverdueReport> {
       const scope = await scopeOf(input.actor, input.branchId);
-      const asOf = await todayFor(db, now());
-      const found = await db
-        .select({
-          invoiceId: invoice.id,
-          studentId: student.id,
-          studentNo: student.studentNo,
-          studentName: student.fullName,
-          branchId: invoice.branchId,
-          dueDate: invoice.dueDate,
-          total: invoice.total,
-          paid: invoice.amountPaid,
-        })
-        .from(invoice)
-        .innerJoin(student, eq(student.id, invoice.studentId))
-        .where(and(inArray(invoice.status, ["pending", "partial", "overdue"]), lt(invoice.dueDate, asOf), scope === "all" ? undefined : inArray(invoice.branchId, scope)))
-        .orderBy(asc(invoice.dueDate), asc(invoice.id));
+      const limit = Math.min(input.limit ?? 50, 500);
+      const offset = input.offset ?? 0;
+      return db.transaction(async (tx) => {
+        const asOf = await todayFor(tx, now());
+        // Past due and still owing something: a stale status label with the invoice already paid in full does not count.
+        const open = and(
+          inArray(invoice.status, ["pending", "partial", "overdue"]),
+          lt(invoice.dueDate, asOf),
+          lt(invoice.amountPaid, invoice.total),
+          scope === "all" ? undefined : inArray(invoice.branchId, scope),
+        );
+        const owed = sql`(${invoice.total} - ${invoice.amountPaid})`;
+        const late = sql`(${asOf}::date - ${invoice.dueDate})`;
+        const money = (e: ReturnType<typeof sql>) => sql<string>`coalesce(${e}, 0)::numeric(14,2)::text`;
 
-      const aging = { "1-30": 0, "31-60": 0, "61+": 0 };
-      const perBranch = new Map<string, { count: number; cents: number }>();
-      let total = 0;
-      const all = found.map((r) => {
-        const cents = toCents(r.total) - toCents(r.paid);
-        const days = dayNumber(asOf) - dayNumber(r.dueDate);
-        total += cents;
-        aging[days <= 30 ? "1-30" : days <= 60 ? "31-60" : "61+"] += cents;
-        const b = perBranch.get(r.branchId) ?? { count: 0, cents: 0 };
-        perBranch.set(r.branchId, { count: b.count + 1, cents: b.cents + cents });
-        return { ...r, days, cents };
-      });
+        // Totals, aging and branches are computed by the database; only the requested page of invoices is read.
+        const [t] = await tx
+          .select({
+            count: sql<number>`count(*)::int`,
+            outstanding: money(sql`sum(${owed})`),
+            a1: money(sql`sum(${owed}) filter (where ${late} <= 30)`),
+            a2: money(sql`sum(${owed}) filter (where ${late} > 30 and ${late} <= 60)`),
+            a3: money(sql`sum(${owed}) filter (where ${late} > 60)`),
+          })
+          .from(invoice)
+          .where(open);
+        const byBranch = await tx
+          .select({ branchId: invoice.branchId, branchName: branch.name, count: sql<number>`count(*)::int`, outstanding: money(sql`sum(${owed})`) })
+          .from(invoice)
+          .innerJoin(branch, eq(branch.id, invoice.branchId))
+          .where(open)
+          .groupBy(invoice.branchId, branch.name)
+          .orderBy(desc(sql`sum(${owed})`), asc(branch.name));
+        const page = await tx
+          .select({
+            invoiceId: invoice.id,
+            studentId: student.id,
+            studentNo: student.studentNo,
+            studentName: student.fullName,
+            branchId: invoice.branchId,
+            dueDate: invoice.dueDate,
+            total: invoice.total,
+            paid: invoice.amountPaid,
+            days: sql<number>`${late}::int`,
+            outstanding: money(owed),
+          })
+          .from(invoice)
+          .innerJoin(student, eq(student.id, invoice.studentId))
+          .where(open)
+          .orderBy(asc(invoice.dueDate), asc(invoice.id))
+          .limit(limit)
+          .offset(offset);
+        const kids = [...new Set(page.map((r) => r.studentId))];
+        const parents = kids.length
+          ? await tx
+              .select({ studentId: studentGuardian.studentId, name: guardian.fullName, phone: guardian.phone })
+              .from(studentGuardian)
+              .innerJoin(guardian, eq(guardian.id, studentGuardian.guardianId))
+              .where(and(inArray(studentGuardian.studentId, kids), eq(studentGuardian.isPrimary, true)))
+          : [];
 
-      const page = all.slice(input.offset ?? 0, (input.offset ?? 0) + Math.min(input.limit ?? 50, 500));
-      const kids = [...new Set(page.map((r) => r.studentId))];
-      const parents = kids.length
-        ? await db
-            .select({ studentId: studentGuardian.studentId, name: guardian.fullName, phone: guardian.phone })
-            .from(studentGuardian)
-            .innerJoin(guardian, eq(guardian.id, studentGuardian.guardianId))
-            .where(and(inArray(studentGuardian.studentId, kids), eq(studentGuardian.isPrimary, true)))
-        : [];
-      const branches = perBranch.size ? await db.select({ id: branch.id, name: branch.name }).from(branch).where(inArray(branch.id, [...perBranch.keys()])) : [];
-
-      return {
-        asOf,
-        count: all.length,
-        outstanding: fromCents(total),
-        aging: { "1-30": fromCents(aging["1-30"]), "31-60": fromCents(aging["31-60"]), "61+": fromCents(aging["61+"]) },
-        byBranch: [...perBranch.entries()]
-          .map(([branchId, v]) => ({ branchId, branchName: branches.find((b) => b.id === branchId)?.name ?? "", count: v.count, outstanding: fromCents(v.cents) }))
-          .sort((a, b) => toCents(b.outstanding) - toCents(a.outstanding)),
-        rows: page.map((r) => {
-          const g = parents.find((p) => p.studentId === r.studentId);
-          return {
-            invoiceId: r.invoiceId,
-            studentId: r.studentId,
-            studentNo: r.studentNo,
-            studentName: r.studentName,
-            branchId: r.branchId,
-            guardianName: g?.name ?? null,
-            guardianPhone: g?.phone ?? null,
-            dueDate: r.dueDate,
-            daysOverdue: r.days,
-            total: r.total,
-            paid: r.paid,
-            outstanding: fromCents(r.cents),
-          };
-        }),
-      };
+        return {
+          asOf,
+          count: t!.count,
+          outstanding: t!.outstanding,
+          aging: { "1-30": t!.a1, "31-60": t!.a2, "61+": t!.a3 },
+          byBranch,
+          rows: page.map((r) => {
+            const g = parents.find((p) => p.studentId === r.studentId);
+            return {
+              invoiceId: r.invoiceId,
+              studentId: r.studentId,
+              studentNo: r.studentNo,
+              studentName: r.studentName,
+              branchId: r.branchId,
+              guardianName: g?.name ?? null,
+              guardianPhone: g?.phone ?? null,
+              dueDate: r.dueDate,
+              daysOverdue: r.days,
+              total: r.total,
+              paid: r.paid,
+              outstanding: r.outstanding,
+            };
+          }),
+        };
+      }, SNAPSHOT);
     },
 
     /** Money verified between two local dates (inclusive, at most 366 days), by branch, payment method and day. */
     async collections(input: { actor: string; from: string; to: string; branchId?: string }): Promise<CollectionsReport> {
-      if (!DAY.test(input.from) || !DAY.test(input.to) || input.from > input.to) throw new ServiceError("invalid_input", "Give a period as two dates, from on or before to.");
+      if (!isCalendarDay(input.from) || !isCalendarDay(input.to) || input.from > input.to) throw new ServiceError("invalid_input", "Give a period as two real dates written YYYY-MM-DD, from on or before to.");
       if (dayNumber(input.to) - dayNumber(input.from) > 365) throw new ServiceError("invalid_input", "A period can be at most 366 days.");
       const scope = await scopeOf(input.actor, input.branchId);
-      const tz = (await loadOrganization(db)).timezone;
-      const local = sql<string>`to_char(timezone(${tz}, ${payment.verifiedAt}), 'YYYY-MM-DD')`;
-      const inScope = scope === "all" ? undefined : inArray(payment.branchId, scope);
-      const rows = await db
-        .select({ amount: payment.amount, branchId: payment.branchId, branchName: branch.name, type: paymentMethod.type, label: paymentMethod.label, date: local })
-        .from(payment)
-        .innerJoin(branch, eq(branch.id, payment.branchId))
-        .innerJoin(paymentMethod, eq(paymentMethod.id, payment.paymentMethodId))
-        .where(and(eq(payment.status, "verified"), sql`${local} >= ${input.from} AND ${local} <= ${input.to}`, inScope))
-        .orderBy(asc(local));
-      const pend = await db
-        .select({ amount: payment.amount })
-        .from(payment)
-        .where(and(eq(payment.status, "pending_verification"), inScope));
+      // One read-only snapshot for both reads: a payment verified meanwhile is counted either as pending or as collected, never in neither.
+      const { rows, pend } = await db.transaction(async (tx) => {
+        const tz = (await loadOrganization(tx)).timezone;
+        const local = sql<string>`to_char(timezone(${tz}, ${payment.verifiedAt}), 'YYYY-MM-DD')`;
+        const inScope = scope === "all" ? undefined : inArray(payment.branchId, scope);
+        const rows = await tx
+          .select({ amount: payment.amount, branchId: payment.branchId, branchName: branch.name, type: paymentMethod.type, label: paymentMethod.label, date: local })
+          .from(payment)
+          .innerJoin(branch, eq(branch.id, payment.branchId))
+          .innerJoin(paymentMethod, eq(paymentMethod.id, payment.paymentMethodId))
+          .where(and(eq(payment.status, "verified"), sql`${local} >= ${input.from} AND ${local} <= ${input.to}`, inScope))
+          .orderBy(asc(local));
+        const pend = await tx
+          .select({ amount: payment.amount })
+          .from(payment)
+          .where(and(eq(payment.status, "pending_verification"), inScope));
 
+
+        return { rows, pend };
+      }, SNAPSHOT);
       const group = <K extends string>(key: (r: (typeof rows)[number]) => K) => {
         const m = new Map<K, { count: number; cents: number; r: (typeof rows)[number] }>();
         for (const r of rows) {

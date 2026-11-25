@@ -280,6 +280,14 @@ describe("Discarding drafts and the module gate", () => {
     const [a] = await q(`SELECT reason FROM audit_log WHERE action = 'payout.discard' AND entity_id = $1`, [r.payout.id]);
     eq(a!.reason, "wrong period");
   });
+  test("impossible calendar dates are invalid_input; valid dates that break a business rule keep their own code", async () => {
+    const lec = await lecturerWithRule();
+    eq(await code(() => payouts.previewPayout({ lecturerId: lec, periodEnd: "2027-02-31" })), "invalid_input");
+    eq(await code(() => payouts.createPayout({ lecturerId: lec, periodEnd: "2027-02-31", createdBy: staff })), "invalid_input");
+    eq(await code(() => payouts.createPayout({ lecturerId: lec, periodStart: "2027-13-01", periodEnd, createdBy: staff })), "invalid_input");
+    eq(await code(() => payouts.markPaid({ payoutId: lec, paidBy: staff, paymentReference: "R1", paidOn: "2027-02-30" })), "invalid_input");
+    eq(await code(() => payouts.createPayout({ lecturerId: lec, periodEnd: "2099-12-31", createdBy: staff })), "payout_period_invalid");
+  });
   test("H9: with the commissions module off nothing in the payout service works", async () => {
     const lec = await lecturerWithRule();
     await payIt(await scenario([{ lec, share: 100 }]), "10000");

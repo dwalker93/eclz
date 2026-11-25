@@ -18,7 +18,7 @@ import { accessState } from "./access";
 import { writeAudit, isConstraintError } from "./audit";
 import { loadOrganization, todayFor } from "./lookups";
 import { queueNotifications, resolveRecipients } from "./notifications";
-import { activeLecturerOf, gateModule, isRootAdmin, requireResource } from "./authorization";
+import { gateModule, isRootAdmin, requireLecturerPermission, requireResource } from "./authorization";
 import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
 
@@ -105,6 +105,10 @@ export interface QuestionInput {
   imageFileId?: string;
 }
 
+/** The largest total a numeric(8,2) column can hold, in cents: an exam's total marks are the sum of its question marks. */
+const MAX_TOTAL_CENTS = 99_999_999;
+const totalTooLarge = () => new ServiceError("exam_invalid", "The questions add up to more marks than an exam can hold (999999.99).");
+
 function checkQuestion(input: QuestionInput) {
   if (!input.body?.trim()) throw new ServiceError("question_invalid", "The question text is required.");
   if (input.options.length < 2 || input.options.length > 26) throw new ServiceError("question_invalid", "A question needs 2 to 26 options.");
@@ -160,15 +164,37 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
     else await tx.insert(examResult).values({ examId: ex.id, studentId, ...values });
   }
 
-  /** Ends running attempts that are past their deadline. Its own transaction, so it commits before an operation that then refuses. */
-  async function finalizeLate(attemptId: string) {
+  /** When a running attempt must end now, and at what time it is recorded as ended: past its deadline (the deadline), or the exam closed (now). */
+  function endOf(a: AttemptRow, ex: ExamRow): Date | null {
+    const deadline = attemptDeadline(a.startedAt, ex.timeLimitMinutes, ex.closesAt!);
+    if (now() >= deadline) return deadline;
+    return ex.status === "closed" ? now() : null;
+  }
+
+  /**
+   * Ends a running attempt that is past its deadline. Its own transaction, so it commits before an operation that then refuses. A student's
+   * call passes their id and the attempt is locked and selected by both ids, so another student's attempt is never written to; only the
+   * scheduled job calls it with the attempt id alone.
+   */
+  async function finalizeLate(attemptId: string, studentId?: string) {
     await db.transaction(async (tx) => {
-      const [a] = await tx.select().from(examAttempt).where(eq(examAttempt.id, attemptId)).for("update");
+      const [a] = await tx
+        .select()
+        .from(examAttempt)
+        .where(studentId === undefined ? eq(examAttempt.id, attemptId) : and(eq(examAttempt.id, attemptId), eq(examAttempt.studentId, studentId)))
+        .for("update");
       if (!a || a.status !== "in_progress") return;
       const ex = await loadExam(tx, a.examId);
-      const deadline = attemptDeadline(a.startedAt, ex.timeLimitMinutes, ex.closesAt!);
-      if (now() >= deadline || ex.status === "closed") await finish(tx, a, ex, now() >= deadline ? deadline : now(), "expired");
+      const endedAt = endOf(a, ex);
+      if (endedAt) await finish(tx, a, ex, endedAt, "expired");
     });
+  }
+
+  /** G9 for an attempt: its score is shown on the same terms as the exam result: always for `immediate`, otherwise only once the student's result is released. */
+  async function scoreVisible(tx: Tx, ex: ExamRow, studentId: string): Promise<boolean> {
+    if (ex.resultsVisibility === "immediate") return true;
+    const [r] = await tx.select({ releasedAt: examResult.releasedAt }).from(examResult).where(and(eq(examResult.examId, ex.id), eq(examResult.studentId, studentId)));
+    return !!r?.releasedAt;
   }
 
   function paperFor(ex: ExamRow, attempt: AttemptRow, qs: Awaited<ReturnType<typeof snapshots>>, answers: (typeof attemptAnswer.$inferSelect)[]) {
@@ -193,7 +219,9 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
       return db.transaction(async (tx) => {
         if (input.actor !== null) {
           const [l] = await tx.select({ userId: lecturer.userId }).from(lecturer).where(eq(lecturer.id, input.lecturerId));
-          const own = !!l && l.userId === input.actor && !!(await activeLecturerOf(tx, input.actor));
+          // Ownership alone is not enough: the lecturer role must still carry exams.manage (as updateQuestion requires), so revoking the role closes this
+          // even while the portal flag stays on.
+          const own = !!l && l.userId === input.actor && (await requireLecturerPermission(tx, input.actor, "exams.manage").then(() => true, () => false));
           if (!own && !(await isRootAdmin(tx, input.actor))) throw new ServiceError("forbidden", "Only the lecturer or a root administrator can add their questions.");
         }
         const [l] = await tx.select({ id: lecturer.id }).from(lecturer).where(eq(lecturer.id, input.lecturerId));
@@ -298,6 +326,14 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         if (bank.length !== ids.length) throw new ServiceError("not_found", "A question was not found.");
         if (bank.some((q) => q.lecturerId !== ex.lecturerId)) throw new ServiceError("question_invalid", "A question belongs to another lecturer.");
         const byId = new Map(bank.map((q) => [q.id, q]));
+        // The total, with the bank's defaults for entries that give no marks, must fit before anything is replaced.
+        let total = 0;
+        for (const q of input.questions) {
+          const m = String(q.marks ?? byId.get(q.questionId)!.defaultMarks);
+          if (!(Number(m) > 0)) throw new ServiceError("question_invalid", "Marks must be above zero.");
+          total += toCents(m);
+        }
+        if (total > MAX_TOTAL_CENTS) throw totalTooLarge();
         await tx.delete(examQuestion).where(eq(examQuestion.examId, ex.id));
         for (const [i, q] of input.questions.entries()) {
           const marks = String(q.marks ?? byId.get(q.questionId)!.defaultMarks);
@@ -321,6 +357,8 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         if (ex.mode === "online_mcq") {
           const qs = await tx.select().from(examQuestion).where(eq(examQuestion.examId, ex.id));
           if (qs.length === 0) throw new ServiceError("exam_invalid", "Add at least one question before publishing.");
+          // A draft saved before the total was checked can still be out of range.
+          if (qs.reduce((sum, r) => sum + toCents(r.marks), 0) > MAX_TOTAL_CENTS) throw totalTooLarge();
           let total = 0;
           for (const eq_ of qs) {
             const [q] = await tx.select().from(question).where(eq(question.id, eq_.questionId));
@@ -380,10 +418,11 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         .select({ id: examAttempt.id })
         .from(examAttempt)
         .where(and(eq(examAttempt.examId, input.examId), eq(examAttempt.studentId, input.studentId), eq(examAttempt.status, "in_progress")))
-        .then((rows) => Promise.all(rows.map((r) => finalizeLate(r.id))));
+        .then((rows) => Promise.all(rows.map((r) => finalizeLate(r.id, input.studentId))));
       try {
         return await db.transaction(async (tx) => {
-          const ex = await loadExam(tx, input.examId);
+          // closeExam takes this same lock, so starting and closing serialize.
+          const ex = await loadExam(tx, input.examId, true);
           if (ex.mode !== "online_mcq") throw new ServiceError("exam_invalid", "This is a paper exam.");
           if (ex.status !== "published") throw new ServiceError("exam_not_published", "The exam is not open.");
           const at = now();
@@ -392,6 +431,12 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
           if (!stu) throw new ServiceError("not_found", "Student not found.");
           if (stu.status !== "active") throw new ServiceError("student_not_eligible", "The student is not active.");
 
+          const today = await todayFor(tx, at);
+          const attached = (await tx.select({ id: examCourse.courseId }).from(examCourse).where(eq(examCourse.examId, ex.id))).map((c) => c.id);
+          const enrols = await tx.select().from(enrollment).where(and(eq(enrollment.studentId, stu.id), inArray(enrollment.courseId, attached))).orderBy(asc(enrollment.id));
+          const accessible = enrols.filter((e) => accessState(e, today).allowed);
+          if (accessible.length === 0) throw new ServiceError("student_not_eligible", "The student has no access to any course this exam belongs to.");
+
           const qs = await snapshots(tx, ex.id);
           const [running] = await tx.select().from(examAttempt).where(and(eq(examAttempt.examId, ex.id), eq(examAttempt.studentId, stu.id), eq(examAttempt.status, "in_progress")));
           if (running) {
@@ -399,11 +444,7 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
             return { resumed: true, paper: paperFor(ex, running, qs, answers) };
           }
 
-          const today = await todayFor(tx, at);
-          const attached = (await tx.select({ id: examCourse.courseId }).from(examCourse).where(eq(examCourse.examId, ex.id))).map((c) => c.id);
-          const enrols = await tx.select().from(enrollment).where(and(eq(enrollment.studentId, stu.id), inArray(enrollment.courseId, attached))).orderBy(asc(enrollment.id));
-          const usable = enrols.filter((e) => accessState(e, today).allowed && (!input.enrollmentId || e.id === input.enrollmentId));
-          const enr = usable[0];
+          const enr = accessible.find((e) => !input.enrollmentId || e.id === input.enrollmentId);
           if (!enr) throw new ServiceError("student_not_eligible", "The student has no access to any course this exam belongs to.");
 
           const prior = await tx.select({ n: examAttempt.attemptNo }).from(examAttempt).where(and(eq(examAttempt.examId, ex.id), eq(examAttempt.studentId, stu.id))).orderBy(desc(examAttempt.attemptNo));
@@ -425,24 +466,33 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
 
     /** The student's own view of an attempt (never anyone else's). */
     async getAttempt(input: { attemptId: string; studentId: string }) {
-      await finalizeLate(input.attemptId);
+      await finalizeLate(input.attemptId, input.studentId);
       return db.transaction(async (tx) => {
         const [a] = await tx.select().from(examAttempt).where(and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId)));
         if (!a) throw new ServiceError("not_found", "Attempt not found.");
         const ex = await loadExam(tx, a.examId);
         const answers = await tx.select().from(attemptAnswer).where(eq(attemptAnswer.attemptId, a.id));
-        return { status: a.status, score: a.status === "in_progress" ? null : a.score, paper: paperFor(ex, a, await snapshots(tx, ex.id), answers) };
+        // The score follows the exam's result visibility (G9): hidden while an after_release or manual result is unreleased.
+        const showScore = a.status !== "in_progress" && (await scoreVisible(tx, ex, a.studentId));
+        return { status: a.status, score: showScore ? a.score : null, scoreHidden: a.status !== "in_progress" && !showScore, paper: paperFor(ex, a, await snapshots(tx, ex.id), answers) };
       });
     },
 
     /** Saves answers (G5: the key must exist in the snapshot; null clears). Refused when the attempt is over or time has run out (G6). */
     async saveAnswers(input: { attemptId: string; studentId: string; answers: { examQuestionId: string; selectedOptionKey: string | null }[] }) {
-      await finalizeLate(input.attemptId);
-      return db.transaction(async (tx) => {
+      await finalizeLate(input.attemptId, input.studentId);
+      const saved = await db.transaction(async (tx) => {
         const [a] = await tx.select().from(examAttempt).where(and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId))).for("update");
         if (!a) throw new ServiceError("not_found", "Attempt not found.");
         if (a.status !== "in_progress") throw new ServiceError(a.status === "expired" ? "attempt_time_over" : "attempt_not_running", "This attempt has ended.");
         const ex = await loadExam(tx, a.examId);
+        // G6 again, now that this transaction holds the attempt's lock: the deadline may have passed since the check above. The expiry is
+        // committed with this transaction and the refusal is thrown after it, so a retry sees the finished attempt.
+        const endedAt = endOf(a, ex);
+        if (endedAt) {
+          await finish(tx, a, ex, endedAt, "expired");
+          return "expired" as const;
+        }
         const qs = new Map((await snapshots(tx, a.examId)).map((q) => [q.id, q]));
         for (const ans of input.answers) {
           const q = qs.get(ans.examQuestionId);
@@ -464,21 +514,28 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         }
         return input.answers.length;
       });
+      if (saved === "expired") throw new ServiceError("attempt_time_over", "This attempt has ended.");
+      return saved;
     },
 
     /**
      * Submits an attempt and grades it from the snapshot (G5). The result is recomputed (G7) unless it is released or overridden.
      * Submitting twice returns the same score. An attempt that already ran out of time is returned as it was finalised (`expired`).
      */
-    async submitAttempt(input: { attemptId: string; studentId: string }) {
-      await finalizeLate(input.attemptId);
+    async submitAttempt(input: { attemptId: string; studentId: string }): Promise<{ status: string; score: string | null; alreadyFinished: boolean }> {
+      await finalizeLate(input.attemptId, input.studentId);
       return db.transaction(async (tx) => {
         const [a] = await tx.select().from(examAttempt).where(and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId))).for("update");
         if (!a) throw new ServiceError("not_found", "Attempt not found.");
-        if (a.status !== "in_progress") return { status: a.status, score: a.score!, alreadyFinished: true };
         const ex = await loadExam(tx, a.examId);
+        // The score is returned on the same terms as the exam result (G9): null while an after_release or manual result is unreleased.
+        const shown = async (score: string | null) => ((await scoreVisible(tx, ex, a.studentId)) ? score : null);
+        if (a.status !== "in_progress") return { status: a.status, score: await shown(a.score), alreadyFinished: true };
+        // The deadline may have passed between the check above and this lock: such a submission ends the attempt as expired, not graded.
+        const endedAt = endOf(a, ex);
+        if (endedAt) return { status: "expired", score: await shown(await finish(tx, a, ex, endedAt, "expired")), alreadyFinished: true };
         const score = await finish(tx, a, ex, now(), "graded");
-        return { status: "graded" as const, score, alreadyFinished: false };
+        return { status: "graded", score: await shown(score), alreadyFinished: false };
       });
     },
 
@@ -497,25 +554,37 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
     // ---- results
 
     /** Paper exams (G7): enters or corrects marks. Marks cannot exceed the total. After release a reason is required and the change is audited (G8, J3). */
-    async enterMarks(input: { examId: string; entries: { studentId: string; marks: string | number; grade?: string; remarks?: string }[]; actor: string | null; reason?: string }) {
+    async enterMarks(input: { examId: string; entries: { studentId: string; marks: string | number; grade?: string; remarks?: string }[]; actor: string | null; reason?: string; branchIds?: string[] }) {
+      // `branchIds` limits the batch to results recorded in courses of those branches (a manager of one branch of a shared exam). Any entry outside it
+      // fails the whole batch, which rolls back, so no marks are written.
       if (input.entries.length === 0) throw new ServiceError("invalid_input", "Nothing to enter.");
       return db.transaction(async (tx) => {
         const ex = await loadExam(tx, input.examId, true);
         if (ex.mode !== "paper") throw new ServiceError("exam_invalid", "Online exam results come from attempts.");
         if (ex.status === "draft") throw new ServiceError("exam_not_published", "Publish the exam before entering marks.");
         const attached = (await tx.select({ id: examCourse.courseId }).from(examCourse).where(eq(examCourse.examId, ex.id))).map((c) => c.id);
+        // The attached courses inside the caller's branches: where a new result may be recorded, and what a stored result's course is checked against.
+        const inScope = input.branchIds
+          ? input.branchIds.length === 0
+            ? []
+            : (await tx.select({ id: course.id }).from(course).where(and(inArray(course.id, attached), inArray(course.branchId, input.branchIds)))).map((c) => c.id)
+          : null;
         let written = 0;
         for (const e of input.entries) {
           const cents = toCents(typeof e.marks === "number" ? e.marks : String(e.marks));
           if (cents < 0 || cents > toCents(ex.maxMarks!)) throw new ServiceError("invalid_input", `Marks must be between 0 and ${ex.maxMarks}.`);
-          const [enr] = await tx.select().from(enrollment).where(and(eq(enrollment.studentId, e.studentId), inArray(enrollment.courseId, attached), eq(enrollment.status, "active"))).orderBy(asc(enrollment.id)).limit(1);
-          if (!enr) throw new ServiceError("student_not_enrolled", "A student is not enrolled in a course of this exam.");
           const [existing] = await tx.select().from(examResult).where(and(eq(examResult.examId, ex.id), eq(examResult.studentId, e.studentId))).for("update");
+          const candidates = (courseIds: string[]) =>
+            courseIds.length === 0 ? Promise.resolve([]) : tx.select().from(enrollment).where(and(eq(enrollment.studentId, e.studentId), inArray(enrollment.courseId, courseIds), eq(enrollment.status, "active"))).orderBy(asc(enrollment.id)).limit(1);
+          let [enr] = await candidates(inScope ?? attached);
+          if (!enr && inScope && (await candidates(attached))[0]) throw new ServiceError("forbidden", "A student's result is in a branch you may not manage.");
+          if (!enr) throw new ServiceError("student_not_enrolled", "A student is not enrolled in a course of this exam.");
+          if (input.branchIds && existing?.courseId && !inScope!.includes(existing.courseId)) throw new ServiceError("forbidden", "A student's result is in a branch you may not manage.");
           const values = { marks: fromCents(cents), grade: e.grade ?? null, remarks: e.remarks ?? null, source: "manual", enrollmentId: existing?.enrollmentId ?? enr.id, courseId: existing?.courseId ?? enr.courseId, updatedAt: now() };
           if (existing?.releasedAt) {
             if (!input.reason?.trim()) throw new ServiceError("reason_required", "A reason is required to change a released result.");
             await tx.update(examResult).set(values).where(eq(examResult.id, existing.id));
-            await writeAudit(tx, { actor: input.actor, action: "exam_result.edit_after_release", entityType: "exam_result", entityId: existing.id, before: { marks: existing.marks, grade: existing.grade }, after: { marks: values.marks, grade: values.grade }, reason: input.reason });
+            await writeAudit(tx, { actor: input.actor, action: "exam_result.edit_after_release", entityType: "exam_result", entityId: existing.id, before: { marks: existing.marks, grade: existing.grade, remarks: existing.remarks }, after: { marks: values.marks, grade: values.grade, remarks: values.remarks }, reason: input.reason });
           } else if (existing) {
             await tx.update(examResult).set(values).where(eq(examResult.id, existing.id));
           } else {
@@ -542,7 +611,7 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         const cents = toCents(typeof input.marks === "number" ? input.marks : String(input.marks));
         if (cents < 0 || cents > toCents(ex.maxMarks!)) throw new ServiceError("invalid_input", `Marks must be between 0 and ${ex.maxMarks}.`);
         await tx.update(examResult).set({ marks: fromCents(cents), remarks: input.remarks ?? r.remarks, source: "manual_override", updatedAt: now() }).where(eq(examResult.id, r.id));
-        await writeAudit(tx, { actor: input.actor, action: "exam_result.edit_after_release", entityType: "exam_result", entityId: r.id, before: { marks: r.marks, source: r.source }, after: { marks: fromCents(cents), source: "manual_override" }, reason: input.reason });
+        await writeAudit(tx, { actor: input.actor, action: "exam_result.edit_after_release", entityType: "exam_result", entityId: r.id, before: { marks: r.marks, remarks: r.remarks, source: r.source }, after: { marks: fromCents(cents), remarks: input.remarks ?? r.remarks, source: "manual_override" }, reason: input.reason });
         return fromCents(cents);
       });
     },
@@ -598,14 +667,17 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /** Staff view: every result with the student and whether it is released, plus count, average and highest in marks. */
-    async getResults(input: { examId: string }) {
+    async getResults(input: { examId: string; branchIds?: string[] }) {
+      // `branchIds` keeps only results recorded in courses of those branches, in the rows and in the count, average and highest alike.
       return db.transaction(async (tx) => {
         const ex = await loadExam(tx, input.examId);
+        if (input.branchIds && input.branchIds.length === 0) return { exam: ex, results: [], count: 0, average: null, highest: null };
         const rows = await tx
           .select({ r: examResult, name: student.fullName, studentNo: student.studentNo })
           .from(examResult)
           .innerJoin(student, eq(student.id, examResult.studentId))
-          .where(eq(examResult.examId, ex.id))
+          .leftJoin(course, eq(course.id, examResult.courseId))
+          .where(and(eq(examResult.examId, ex.id), input.branchIds ? inArray(course.branchId, input.branchIds) : undefined))
           .orderBy(asc(student.fullName), asc(student.id));
         const cents = rows.map((x) => toCents(x.r.marks));
         return {

@@ -15,8 +15,14 @@ const migrations = resolve(import.meta.dir, "../drizzle");
  */
 export async function createTestDb() {
   const pg = new PGlite({ extensions: { btree_gist } });
-  const journal = JSON.parse(readFileSync(join(migrations, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
-  for (const e of journal.entries) await pg.exec(readFileSync(join(migrations, `${e.tag}.sql`), "utf8"));
+  try {
+    const journal = JSON.parse(readFileSync(join(migrations, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
+    for (const e of journal.entries) await pg.exec(readFileSync(join(migrations, `${e.tag}.sql`), "utf8"));
+  } catch (err) {
+    // The caller never receives `close`, so close here and keep the original error.
+    await pg.close().catch(() => {});
+    throw err;
+  }
   const db = drizzle(pg, { schema });
   /** Raw SQL, rows as returned by the driver. */
   const q = async (text: string, params: unknown[] = []): Promise<Row[]> => (await pg.query<Row>(text, params)).rows;

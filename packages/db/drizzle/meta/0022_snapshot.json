@@ -4510,6 +4510,21 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "invoice_item_applies_to_idx": {
+          "name": "invoice_item_applies_to_idx",
+          "columns": [
+            {
+              "expression": "applies_to_item_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {

@@ -1,5 +1,6 @@
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
+  authSession,
   contentBranch,
   contentItem,
   course,
@@ -97,7 +98,9 @@ async function assignmentsWith(q: Q, userId: string, code: string, includeLectur
 export async function authorize(q: Q, userId: string, code: PermissionCode, scope: { branchId?: string | null } = {}): Promise<boolean> {
   if (!(await isActive(q, userId))) return false;
   const rows = await assignmentsWith(q, userId, code, false);
-  return rows.some((r) => r.branchId === null || (scope.branchId != null && r.branchId === scope.branchId));
+  // Stored ids are lower case; an upper-case or braced spelling of the same branch is the same branch.
+  const wanted = scope.branchId != null ? canonicalUuid(scope.branchId) : null;
+  return rows.some((r) => r.branchId === null || (wanted !== null && r.branchId === wanted));
 }
 
 export async function requirePermission(q: Q, userId: string, code: PermissionCode, scope: { branchId?: string | null } = {}): Promise<void> {
@@ -116,6 +119,29 @@ export async function branchScope(q: Q, userId: string, code: PermissionCode): P
   const rows = await assignmentsWith(q, userId, code, false);
   if (rows.some((r) => r.branchId === null)) return "all";
   return [...new Set(rows.flatMap((r) => (r.branchId ? [r.branchId] : [])))].sort();
+}
+
+/**
+ * Whether the actor holds `guardians.manage` in all branches, or in a branch of one of the guardian's children. A guardian with no student in
+ * a branch can only be managed by an all-branches holder. Every guardian action (edit, phone change, password reset) uses this one rule.
+ */
+export async function guardianInScope(q: Q, actor: string, guardianId: string): Promise<boolean> {
+  const scope = await branchScope(q, actor, "guardians.manage");
+  if (scope === "all") return true;
+  if (scope.length === 0) return false;
+  const [hit] = await q
+    .select({ b: studentBranch.branchId })
+    .from(studentGuardian)
+    .innerJoin(studentBranch, eq(studentBranch.studentId, studentGuardian.studentId))
+    .where(and(eq(studentGuardian.guardianId, guardianId), inArray(studentBranch.branchId, scope)))
+    .limit(1);
+  return !!hit;
+}
+
+/** The canonical spelling (lower-case, hyphenated) of any form PostgreSQL accepts for a uuid; anything else is returned unchanged. */
+export function canonicalUuid(value: string): string {
+  const h = value.replace(/[{}-]/g, "").toLowerCase();
+  return /^[0-9a-f]{32}$/.test(h) ? `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}` : value;
 }
 
 export async function isRootAdmin(q: Q, userId: string): Promise<boolean> {
@@ -188,6 +214,45 @@ export async function authorizeResource(q: Q, userId: string, code: PermissionCo
 
 export async function requireResource(q: Q, userId: string, code: PermissionCode, resource: Resource): Promise<void> {
   if (!(await authorizeResource(q, userId, code, resource))) throw new ServiceError("forbidden", `You may not do this (${code}).`);
+}
+
+/**
+ * Which branches' results of an exam the user may see or change with `code`: "all" for all-branches staff and for the lecturer who owns the
+ * exam (with the lecturer role's permission and an open portal); otherwise the branches of the user's staff assignments, which the caller
+ * applies to each result's recorded course. An exam shared by branches A and B passes `requireResource` for a manager of A alone, so the
+ * per-result scope is what keeps B's students out. Empty when the user has no standing on the exam at all.
+ */
+export async function examResultScope(q: Q, userId: string, code: PermissionCode, examId: string): Promise<"all" | string[]> {
+  if (!(await isActive(q, userId))) return [];
+  const facts = await resourceFacts(q, { type: "exam", id: examId });
+  const staff = await assignmentsWith(q, userId, code, false);
+  if (staff.some((a) => a.branchId === null)) return "all";
+  const lec = await activeLecturerOf(q, userId);
+  if (lec && facts.lecturerIds.includes(lec.id) && (await assignmentsWith(q, userId, code, true)).some((a) => a.roleName === LECTURER_ROLE)) return "all";
+  return [...new Set(staff.flatMap((a) => (a.branchId && facts.branchIds.includes(a.branchId) ? [a.branchId] : [])))].sort();
+}
+
+/**
+ * For a change that reaches every place a content item is listed (price, archive): staff need the permission in all-branches, or in EVERY
+ * branch the item is currently listed in (an item listed nowhere needs an all-branches assignment). A manager of only one of two listing
+ * branches would otherwise change the other branch's storefront. The owning lecturer, with the lecturer role's permission and an open portal,
+ * still passes, as in `authorizeResource`.
+ */
+export async function requireContentWide(q: Q, userId: string, code: PermissionCode, contentId: string): Promise<void> {
+  if (!(await isActive(q, userId))) throw new ServiceError("forbidden", `You may not do this (${code}).`);
+  const facts = await resourceFacts(q, { type: "content", id: contentId });
+  const staff = await assignmentsWith(q, userId, code, false);
+  if (staff.some((a) => a.branchId === null)) return;
+  if (facts.branchIds.length > 0 && facts.branchIds.every((b) => staff.some((a) => a.branchId === b))) return;
+  const lec = await activeLecturerOf(q, userId);
+  if (lec && facts.lecturerIds.includes(lec.id) && (await assignmentsWith(q, userId, code, true)).some((a) => a.roleName === LECTURER_ROLE)) return;
+  throw new ServiceError("forbidden", `You may not do this (${code}): the item is listed in branches you do not manage.`);
+}
+
+/** A lecturer acting in their own portal: the portal must be open and the `lecturer` role must (still) carry the permission. Revoking the role closes this even while the portal flag stays on. */
+export async function requireLecturerPermission(q: Q, userId: string, code: PermissionCode): Promise<void> {
+  const lec = await activeLecturerOf(q, userId);
+  if (!lec || !(await assignmentsWith(q, userId, code, true)).some((a) => a.roleName === LECTURER_ROLE)) throw new ServiceError("forbidden", `You may not do this (${code}).`);
 }
 
 /**
@@ -281,6 +346,23 @@ export async function canAccessStudent(q: Q, userId: string, studentId: string):
 
 // ---- role management (A4, A7, J3, K)
 
+/**
+ * The body of `setInitialPassword`, for callers that must commit more in the same transaction (the auth package also ends the other
+ * sessions there). Locks the user row, so it serializes with sign-in and other credential changes.
+ */
+export async function setInitialPasswordIn(tx: Tx, input: { userId: string; passwordHash: string }) {
+  const [u] = await tx.select().from(user).where(eq(user.id, input.userId)).for("update");
+  if (!u) throw new ServiceError("not_found", "User not found.");
+  if (u.status !== "active" || u.passwordHash !== null) throw new ServiceError("forbidden", "A password is already set.");
+  // The same exclusion as findFirstLoginUser (A1), repeated after the row lock: a phone-only session opened before staff roles were assigned or a
+  // lecturer record was linked still carries the set_password restriction, and must not store a password on the now-privileged account.
+  const [staff] = await tx.select({ id: staffRoleAssignment.id }).from(staffRoleAssignment).where(eq(staffRoleAssignment.userId, u.id)).limit(1);
+  const [lec] = await tx.select({ id: lecturer.id }).from(lecturer).where(eq(lecturer.userId, u.id)).limit(1);
+  if (staff || lec) throw new ServiceError("forbidden", "This account cannot set a password with a phone number alone.");
+  await tx.update(user).set({ passwordHash: input.passwordHash }).where(eq(user.id, u.id));
+  await writeAudit(tx, { actor: u.id, action: "user.password_set", entityType: "user", entityId: u.id });
+}
+
 export function createAccessControlService(db: Db) {
   async function rootAdmins(tx: Tx, exceptUser?: string) {
     return tx
@@ -355,6 +437,8 @@ export function createAccessControlService(db: Db) {
           }
         }
         const [row] = await tx.update(user).set({ status: input.status }).where(eq(user.id, u.id)).returning();
+        // Disabling ends every session for good: re-enabling the account must need a new sign-in, never revive an old token.
+        if (input.status === "disabled") await tx.delete(authSession).where(eq(authSession.userId, u.id));
         await writeAudit(tx, { actor: input.actor, action: input.status === "disabled" ? "user.disable" : "user.enable", entityType: "user", entityId: u.id, before: { status: u.status }, after: { status: input.status }, reason: input.reason });
         return row!;
       });
@@ -410,13 +494,7 @@ export function createAccessControlService(db: Db) {
 
     /** Saves the first password (already hashed by the auth layer). Only works while there is none; later changes go through the auth package. Audited (J3). */
     async setInitialPassword(input: { userId: string; passwordHash: string }) {
-      return db.transaction(async (tx) => {
-        const [u] = await tx.select().from(user).where(eq(user.id, input.userId)).for("update");
-        if (!u) throw new ServiceError("not_found", "User not found.");
-        if (u.status !== "active" || u.passwordHash !== null) throw new ServiceError("forbidden", "A password is already set.");
-        await tx.update(user).set({ passwordHash: input.passwordHash }).where(eq(user.id, u.id));
-        await writeAudit(tx, { actor: u.id, action: "user.password_set", entityType: "user", entityId: u.id });
-      });
+      return db.transaction((tx) => setInitialPasswordIn(tx, input));
     },
 
     async listAssignments(input: { userId: string }) {

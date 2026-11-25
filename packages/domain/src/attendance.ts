@@ -1,5 +1,7 @@
 import { and, asc, eq, inArray, isNull, or, gt, lte, sql } from "drizzle-orm";
 import { attendance, classSession, course, enrollment, student } from "@workspace/db/schema";
+import { canonicalUuid, requireModule } from "./authorization";
+import { isCalendarDay, normalizeClockTime } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { queueNotifications, resolveGuardianRecipients } from "./notifications";
 import { ServiceError } from "./errors";
@@ -92,6 +94,28 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
     return { changed: before?.status !== e.status, notified };
   }
 
+  /**
+   * Writes the marks of `entries` in the caller's transaction, which has the session locked and checked open. Every student must be enrolled
+   * for the session. Shared by `mark` and `markRemainingAbsent`, so neither depends on `this`.
+   */
+  async function applyMarks(tx: Tx, s: SessionRow, entries: MarkEntry[], actor: string | null) {
+    const ids = entries.map((e) => e.studentId);
+    const org = await loadOrganization(tx);
+    const [c] = await tx.select().from(course).where(eq(course.id, s.courseId));
+    const roster = new Map((await enrolled(tx, s, ids)).map((r) => [r.enr.studentId, r.enr]));
+    let changed = 0;
+    let notified = 0;
+    for (const e of entries) {
+      const enr = roster.get(e.studentId);
+      if (!enr) throw new ServiceError("student_not_enrolled", "A student is not enrolled for this session.");
+      const r = await upsertMark(tx, org, s, c!.name, e, resolveVia(s, e, enr.preferredMode), "manual", actor);
+      if (r.changed) changed++;
+      notified += r.notified;
+    }
+    if (s.status !== "held") await tx.update(classSession).set({ status: "held" }).where(eq(classSession.id, s.id));
+    return { marked: entries.length, changed, notifications: notified };
+  }
+
   return {
     /** Creates a session. The course must have attendance on, the intake (if any) must belong to the course, and the end must be after the start. */
     async createSession(input: {
@@ -104,11 +128,16 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
       deliveryMode?: "physical" | "online" | "hybrid";
       meeting?: { provider: "zoom" | "teams" | "other"; url?: string; ref?: string };
     }) {
-      if (!/^\d{2}:\d{2}(:\d{2})?$/.test(input.startsAt) || !/^\d{2}:\d{2}(:\d{2})?$/.test(input.endsAt) || input.endsAt <= input.startsAt) {
-        throw new ServiceError("session_invalid", "The session must end after it starts (HH:MM).");
+      // Both times in one precision before comparing: 09:00 and 09:00:00 are the same instant, and 09:60 is no time at all.
+      const startsAt = normalizeClockTime(input.startsAt);
+      const endsAt = normalizeClockTime(input.endsAt);
+      if (!startsAt || !endsAt || endsAt <= startsAt) {
+        throw new ServiceError("session_invalid", "The session must end after it starts, with real times (HH:MM).");
       }
+      input = { ...input, startsAt, endsAt };
       return db.transaction(async (tx) => {
-        const [c] = await tx.select().from(course).where(eq(course.id, input.courseId));
+        // Locking the course row serializes concurrent calls for it, so the duplicate check below sees a session the other call just created.
+        const [c] = await tx.select().from(course).where(eq(course.id, input.courseId)).for("update");
         if (!c) throw new ServiceError("not_found", "Course not found.");
         if (!c.attendanceEnabled) throw new ServiceError("attendance_disabled", "Attendance is switched off for this course.");
         const mode = input.deliveryMode ?? (c.deliveryMode as "physical" | "online" | "hybrid");
@@ -190,26 +219,15 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
      */
     async mark(input: { sessionId: string; entries: MarkEntry[]; actor: string | null }) {
       if (input.entries.length === 0) throw new ServiceError("invalid_input", "Nothing to mark.");
+      // One spelling per student before the duplicate check and the roster lookup (the database returns ids in lower case).
+      input = { ...input, entries: input.entries.map((e) => ({ ...e, studentId: canonicalUuid(e.studentId) })) };
       const ids = input.entries.map((e) => e.studentId);
       if (new Set(ids).size !== ids.length) throw new ServiceError("invalid_input", "A student appears twice.");
       for (const e of input.entries) if (!STATUSES.includes(e.status)) throw new ServiceError("invalid_input", `Unknown status: ${e.status}`);
       return db.transaction(async (tx) => {
         const s = await loadSession(tx, input.sessionId, true);
         openForMarking(s, await todayFor(tx, now()));
-        const org = await loadOrganization(tx);
-        const [c] = await tx.select().from(course).where(eq(course.id, s.courseId));
-        const roster = new Map((await enrolled(tx, s, ids)).map((r) => [r.enr.studentId, r.enr]));
-        let changed = 0;
-        let notified = 0;
-        for (const e of input.entries) {
-          const enr = roster.get(e.studentId);
-          if (!enr) throw new ServiceError("student_not_enrolled", "A student is not enrolled for this session.");
-          const r = await upsertMark(tx, org, s, c!.name, e, resolveVia(s, e, enr.preferredMode), "manual", input.actor);
-          if (r.changed) changed++;
-          notified += r.notified;
-        }
-        if (s.status !== "held") await tx.update(classSession).set({ status: "held" }).where(eq(classSession.id, s.id));
-        return { marked: input.entries.length, changed, notifications: notified };
+        return applyMarks(tx, s, input.entries, input.actor);
       });
     },
 
@@ -218,10 +236,16 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
      * (parents notified). Students already marked are untouched.
      */
     async markRemainingAbsent(input: { sessionId: string; actor: string | null }) {
-      const roster = await this.getRoster({ sessionId: input.sessionId });
-      const rest = roster.students.filter((r) => r.status === null).map((r) => ({ studentId: r.studentId, status: "absent" as const }));
-      if (rest.length === 0) return { marked: 0, changed: 0, notifications: 0 };
-      return this.mark({ sessionId: input.sessionId, entries: rest, actor: input.actor });
+      // One transaction under the session lock: reading who is unmarked and writing the absences cannot be separated by a QR scan or a manual mark.
+      return db.transaction(async (tx) => {
+        const s = await loadSession(tx, input.sessionId, true);
+        openForMarking(s, await todayFor(tx, now()));
+        const list = await enrolled(tx, s);
+        const marked = new Set((await tx.select({ studentId: attendance.studentId }).from(attendance).where(eq(attendance.sessionId, s.id))).map((m) => m.studentId));
+        const rest = list.filter((r) => !marked.has(r.enr.studentId)).map((r) => ({ studentId: r.enr.studentId, status: "absent" as const }));
+        if (rest.length === 0) return { marked: 0, changed: 0, notifications: 0 };
+        return applyMarks(tx, s, rest, input.actor);
+      });
     },
 
     /**
@@ -257,6 +281,8 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
 
     /** Issues a new QR token for a student, for example after a lost card. The old card stops working at once. */
     async rotateQrToken(input: { studentId: string }) {
+      // K: issuing a token needs the module as well as scanning one; with it off the current card stays valid.
+      await requireModule(db, "qr_attendance");
       const [row] = await db
         .update(student)
         .set({ qrToken: sql`replace(gen_random_uuid()::text, '-', '')` })
@@ -267,14 +293,27 @@ export function createAttendanceService(db: Db, opts: { now?: () => Date } = {})
     },
 
     /** One student's counts and attendance rate, optionally for one course and a date range (from inclusive, to exclusive). Cancelled sessions are ignored. */
-    async studentSummary(input: { studentId: string; courseId?: string; from?: string; to?: string }) {
+    async studentSummary(input: { studentId: string; courseId?: string; from?: string; to?: string; scope?: "all" | string[] }) {
+      for (const d of [input.from, input.to]) if (d !== undefined && !isCalendarDay(d)) throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
+      // Staff pass their attendance.read scope: only sessions of courses in those branches count, and a course outside them is refused.
+      // The student and parent portals pass none (the person sees their own whole record).
+      const scope = input.scope;
+      if (scope !== undefined && scope !== "all") {
+        if (input.courseId) {
+          const [c] = await db.select({ branchId: course.branchId }).from(course).where(eq(course.id, input.courseId));
+          if (!c) throw new ServiceError("not_found", "Course not found.");
+          if (!scope.includes(c.branchId)) throw new ServiceError("forbidden", "You do not have the attendance.read permission in that course's branch.");
+        }
+      }
       const rows = await db
         .select({ status: attendance.status })
         .from(attendance)
         .innerJoin(classSession, eq(classSession.id, attendance.sessionId))
+        .innerJoin(course, eq(course.id, classSession.courseId))
         .where(
           and(
             eq(attendance.studentId, input.studentId),
+            scope !== undefined && scope !== "all" ? (scope.length ? inArray(course.branchId, scope) : sql`false`) : undefined,
             sql`${classSession.status} <> 'cancelled'`,
             input.courseId ? eq(classSession.courseId, input.courseId) : undefined,
             input.from ? sql`${classSession.sessionDate} >= ${input.from}` : undefined,

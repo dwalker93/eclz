@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { commissionEntry, commissionRule, course, courseLecturer, enrollment, invoiceItem, paymentAllocation } from "@workspace/db/schema";
 import { linkedTotals } from "./allocation";
 import { percentOf } from "./dates";
@@ -59,7 +59,7 @@ export function splitByShare(cents: number, shares: number[]): number[] {
 export interface AccrualSummary {
   created: { entryId: string; lecturerId: string; base: string; commission: string; capped: boolean }[];
   /** Allocations that accrued nothing, with the reason, so an admin can find gaps (for example a missing rule). */
-  skipped: { allocationId: string; lecturerId?: string; reason: "module_off" | "not_a_fee_item" | "no_lecturer" | "no_rule" | "no_net_amount" | "already_accrued" }[];
+  skipped: { allocationId: string; lecturerId?: string; reason: "module_off" | "not_a_fee_item" | "no_lecturer" | "no_rule" | "no_net_amount" | "already_accrued" | "allocation_reversed" }[];
 }
 
 export interface ReversalSummary {
@@ -80,13 +80,20 @@ export function createCommissionService(opts: { now?: () => Date } = {}) {
     const date = await todayFor(tx, now());
 
     for (const alloc of event.allocations) {
+      // A voided allocation never accrues: its payment was not kept, and an earlier accrual for it may have been voided, which the duplicate check below ignores.
+      // The row is re-read, because the caller's copy can be stale.
+      const [current] = await tx.select({ reversedAt: paymentAllocation.reversedAt }).from(paymentAllocation).where(eq(paymentAllocation.id, alloc.id));
+      if (alloc.reversedAt || !current || current.reversedAt) {
+        summary.skipped.push({ allocationId: alloc.id, reason: "allocation_reversed" });
+        continue;
+      }
       const [item] = await tx.select().from(invoiceItem).where(eq(invoiceItem.id, alloc.invoiceItemId));
       if (!item || !["recurring_fee", "package_fee"].includes(item.kind) || !item.enrollmentId) {
         summary.skipped.push({ allocationId: alloc.id, reason: "not_a_fee_item" }); // H11
         continue;
       }
       const [enr] = await tx.select().from(enrollment).where(eq(enrollment.id, item.enrollmentId));
-      const lecturers = await tx.select().from(courseLecturer).where(eq(courseLecturer.courseId, enr!.courseId));
+      const lecturers = await tx.select().from(courseLecturer).where(eq(courseLecturer.courseId, enr!.courseId)).orderBy(asc(courseLecturer.lecturerId));
       if (lecturers.length === 0) {
         summary.skipped.push({ allocationId: alloc.id, reason: "no_lecturer" });
         continue;
@@ -143,7 +150,8 @@ export function createCommissionService(opts: { now?: () => Date } = {}) {
           commission = percentOf(base, rule.commissionRate); // H5
         } else {
           // H5: a fixed amount per student per month, split by share, accrued in proportion to what is paid.
-          const entitled = Math.round((toCents(rule.commissionRate) * Number(lec.sharePercent)) / 100);
+          // Largest-remainder split in a fixed lecturer order, so the shares add back to the rate (1.01 between two 50% lecturers is 0.51 and 0.50).
+          const entitled = splitByShare(toCents(rule.commissionRate), lecturers.map((l) => Number(l.sharePercent)))[idx]!;
           const [prior] = await tx
             .select({ total: sql<string>`coalesce(sum(${commissionEntry.commissionAmount}), 0)::text` })
             .from(commissionEntry)
@@ -201,9 +209,16 @@ export function createCommissionService(opts: { now?: () => Date } = {}) {
       .where(and(inArray(commissionEntry.paymentAllocationId, ids), eq(commissionEntry.entryType, "accrual"), ne(commissionEntry.status, "void")));
     for (const e of entries) {
       if (e.status === "accrued") {
-        await tx.update(commissionEntry).set({ status: "void" }).where(eq(commissionEntry.id, e.id));
-        summary.voided.push(e.id);
-        continue;
+        // Only while it is still an unpaid accrual: a payout may have settled the entry since it was read, and then the reversal below handles it.
+        const voided = await tx
+          .update(commissionEntry)
+          .set({ status: "void" })
+          .where(and(eq(commissionEntry.id, e.id), eq(commissionEntry.status, "accrued"), isNull(commissionEntry.payoutId)))
+          .returning({ id: commissionEntry.id });
+        if (voided.length > 0) {
+          summary.voided.push(e.id);
+          continue;
+        }
       }
       const [done] = await tx.select({ id: commissionEntry.id }).from(commissionEntry).where(eq(commissionEntry.reversesEntryId, e.id));
       if (done) continue;

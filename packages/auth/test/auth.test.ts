@@ -2,8 +2,8 @@
  * Sign-in: passwords, parent first login, sessions, staff authenticator codes, rate limits, resets.
  */
 import { afterAll, describe, test } from "bun:test";
-import { createAccessControlService, resolveIdentity, ServiceError } from "@workspace/domain";
-import { createAuthService, hashPassword, totp, verifyTotp } from "../src";
+import { createAccessControlService, createGuardianService, resolveIdentity, ServiceError } from "@workspace/domain";
+import { createAuthService, hashPassword, signInKey, totp, verifyTotp } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -30,6 +30,15 @@ async function newUser(opts: { email?: string; username?: string; phone?: string
   ]);
 }
 const count = async (sqlText: string, params: unknown[] = []) => Number((await q(sqlText, params))[0]!.c);
+
+/** A student linked to the guardian, enrolled in the given branches (none: a student in no branch). */
+let kids = 0;
+async function childOf(guardianId: string, branches: string[]) {
+  const stu = await id(`INSERT INTO student (student_no, full_name, date_of_birth) VALUES ($1,'Kid','2014-01-01')`, [`AK${++kids}`]);
+  await q(`INSERT INTO student_guardian (student_id, guardian_id) VALUES ($1,$2)`, [stu, guardianId]);
+  for (const [i, b] of branches.entries()) await q(`INSERT INTO student_branch (student_id, branch_id, is_primary) VALUES ($1,$2,$3)`, [stu, b, i === 0]);
+  return stu;
+}
 
 const root = await newUser({ email: "root@example.com" });
 await acl.assignRole({ userId: root, roleName: "root_admin", actor: root });
@@ -123,9 +132,13 @@ describe("sessions", () => {
     await acl.setUserStatus({ userId: lecUser, status: "disabled", actor: root });
     await fails("unauthenticated", () => auth.authenticate(again.token));
     await acl.setUserStatus({ userId: lecUser, status: "active", actor: root });
-    await auth.authenticate(again.token);
-    await auth.signOutEverywhere(lecUser);
+    // Disabling ended the session for good: re-enabling does not revive the old token.
     await fails("unauthenticated", () => auth.authenticate(again.token));
+    eq(await count(`SELECT count(*)::int AS c FROM auth_session WHERE user_id = $1`, [lecUser]), 0, "sessions deleted at disable");
+    const fresh = await auth.signIn({ identifier: "lec@example.com", password: GOOD });
+    await auth.authenticate(fresh.token);
+    await auth.signOutEverywhere(lecUser);
+    await fails("unauthenticated", () => auth.authenticate(fresh.token));
   });
 
   test("purgeExpired removes only expired sessions", async () => {
@@ -147,6 +160,9 @@ describe("staff second step", () => {
     eq([s.principal.restriction, s.principal.portals.admin], ["mfa_setup", false]);
     await fails("mfa_setup_required", async () => auth.assertReady(s.principal));
     await fails("mfa_setup_required", () => auth.verifyMfa({ token: s.token, code: "123456" }));
+    // A session still waiting for enrolment cannot change the password, even with the right current one.
+    await fails("mfa_setup_required", () => auth.changePassword({ token: s.token, currentPassword: GOOD, newPassword: "a brand new password" }));
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_changed' AND entity_id = $1`, [u]), 0, "nothing changed");
 
     const { secret, uri } = await auth.beginMfaEnrollment({ token: s.token });
     eq(uri.startsWith("otpauth://totp/"), true);
@@ -166,6 +182,8 @@ describe("staff second step", () => {
     s = await auth.signIn({ identifier: "counselor@example.com", password: GOOD });
     eq([s.principal.restriction, s.principal.portals.admin], ["mfa", false]);
     await fails("mfa_required", async () => auth.assertReady(s.principal));
+    await fails("mfa_required", () => auth.changePassword({ token: s.token, currentPassword: GOOD, newPassword: "a brand new password" }));
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_changed' AND entity_id = $1`, [u]), 0, "still unchanged");
     await fails("invalid_code", () => auth.verifyMfa({ token: s.token, code: "000000" }));
     const ok = await auth.verifyMfa({ token: s.token, code: totp(secret, new Date(clock.getTime() + 30_000)) });
     eq([ok.restriction, ok.portals.admin], [null, true]);
@@ -209,6 +227,10 @@ describe("staff second step", () => {
     const outsider = await newUser();
     await fails("forbidden", () => auth.resetMfa({ userId: u, actor: outsider }));
     await fails("forbidden", () => auth.resetMfa({ userId: root, actor: root }));
+    // upper-case spellings are the same accounts for the database, so they are the same accounts for the self-reset rule too
+    await fails("forbidden", () => auth.resetMfa({ userId: root.toUpperCase(), actor: root }));
+    await fails("forbidden", () => auth.resetMfa({ userId: `{${root.toUpperCase()}}`, actor: root }));
+    await fails("forbidden", () => auth.resetMfa({ userId: root, actor: root.toUpperCase() }));
     await auth.resetMfa({ userId: u, actor: root });
     await fails("unauthenticated", () => auth.authenticate(s.token));
     await fails("not_found", () => auth.resetMfa({ userId: u, actor: root }));
@@ -289,7 +311,9 @@ describe("changing and resetting passwords", () => {
     const g = await id(`INSERT INTO guardian (full_name, phone, user_id, portal_enabled) VALUES ('Forgetful', '94771230010', $1, true)`, [pu]);
     const s = await auth.signIn({ identifier: "0771230010", password: GOOD });
     const counselor = await newUser();
-    await acl.assignRole({ userId: counselor, roleName: "student_counselor", branchId: String((await q(`SELECT id FROM branch LIMIT 1`))[0]!.id), actor: root });
+    const mainBranch = String((await q(`SELECT id FROM branch ORDER BY created_at, id LIMIT 1`))[0]!.id);
+    await acl.assignRole({ userId: counselor, roleName: "student_counselor", branchId: mainBranch, actor: root });
+    await childOf(g, [mainBranch]);
     const nobody = await newUser();
     await fails("forbidden", () => auth.resetParentPassword({ guardianId: g, actor: nobody }));
     await auth.resetParentPassword({ guardianId: g, actor: counselor });
@@ -319,5 +343,291 @@ describe("construction", () => {
       err = e;
     }
     eq(err instanceof Error && !(err instanceof ServiceError), true);
+  });
+});
+
+// ---- review hardening
+
+/** The same db, but `hook` runs just before the first transaction starts: a rival write that lands in the gap between a check and a write. */
+function withBefore(hook: () => Promise<void>): typeof db {
+  let fired = false;
+  return new Proxy(db, {
+    get(t, prop) {
+      const v = Reflect.get(t, prop, t);
+      if (prop === "transaction") {
+        return async (...args: unknown[]) => {
+          if (!fired) {
+            fired = true;
+            await hook();
+          }
+          return (v as (...a: unknown[]) => unknown).apply(t, args);
+        };
+      }
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  }) as typeof db;
+}
+const raced = (hook: () => Promise<void>) => createAuthService(withBefore(hook), { secretKey: "test-secret-key-0123456789", now: () => clock });
+const sessions = (userId: string) => count(`SELECT count(*)::int AS c FROM auth_session WHERE user_id = $1`, [userId]);
+
+async function parent(phone: string) {
+  const u = await newUser({ username: `p-${phone}`, phone, password: null });
+  const g = await id(`INSERT INTO guardian (full_name, phone, user_id, portal_enabled) VALUES ('P', $1, $2, true)`, [phone, u]);
+  return { u, g };
+}
+async function staffWithMfa(email: string) {
+  const u = await newUser({ email });
+  await acl.assignRole({ userId: u, roleName: "student_counselor", actor: root });
+  const s = await auth.signIn({ identifier: email, password: GOOD });
+  const { secret } = await auth.beginMfaEnrollment({ token: s.token });
+  const { recoveryCodes } = await auth.confirmMfaEnrollment({ token: s.token, code: totp(secret, clock) });
+  return { u, secret, recoveryCodes, email };
+}
+
+describe("session issuance is serialized with credential changes", () => {
+  test("a password changed between the check and the insert issues no session", async () => {
+    const u = await newUser({ email: "race1@example.com" });
+    const rival = raced(async () => void (await q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [u, await hashPassword("a different password!!")])));
+    await fails("invalid_credentials", () => rival.signIn({ identifier: "race1@example.com", password: GOOD }));
+    eq(await sessions(u), 0, "no session escaped");
+  });
+
+  test("a user disabled between the check and the insert issues no session", async () => {
+    const u = await newUser({ email: "race2@example.com" });
+    const rival = raced(async () => void (await q(`UPDATE "user" SET status = 'disabled' WHERE id = $1`, [u])));
+    await fails("invalid_credentials", () => rival.signIn({ identifier: "race2@example.com", password: GOOD }));
+    eq(await sessions(u), 0);
+  });
+
+  test("a first login that loses to setPassword issues no session", async () => {
+    const { u } = await parent("94771230101");
+    const rival = raced(async () => void (await q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [u, goodHash])));
+    await fails("invalid_credentials", () => rival.firstLogin({ phone: "0771230101" }));
+    eq(await sessions(u), 0, "no unrestricted parent session without a password sign-in");
+  });
+
+  test("with no interference valid credentials still give a session", async () => {
+    const u = await newUser({ email: "calm@example.com" });
+    eq((await auth.signIn({ identifier: "calm@example.com", password: GOOD })).principal.userId, u);
+  });
+
+  test("two password changes on the same old password: only one wins", async () => {
+    const u = await newUser({ email: "twice@example.com" });
+    const a = await auth.signIn({ identifier: "twice@example.com", password: GOOD });
+    const rival = raced(async () => void (await q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [u, await hashPassword("someone else got here first")])));
+    await fails("invalid_credentials", () => rival.changePassword({ token: a.token, currentPassword: GOOD, newPassword: "a brand new password" }));
+    await auth.signIn({ identifier: "twice@example.com", password: "someone else got here first" });
+  });
+});
+
+describe("numeric usernames and canonical throttling", () => {
+  test("a numeric username signs in, even beside a phone account with the same digits", async () => {
+    const byName = await newUser({ username: "123456789" });
+    await auth.signIn({ identifier: "123456789", password: GOOD }).then((r) => eq(r.principal.userId, byName, "numeric username"));
+    const otherHash = await hashPassword("another long passphrase");
+    const byPhone = await id(`INSERT INTO "user" (username, phone, password_hash) VALUES ('parent-94123456789', '94123456789', $1)`, [otherHash]);
+    eq((await auth.signIn({ identifier: "123456789", password: GOOD })).principal.userId, byName, "username still works");
+    eq((await auth.signIn({ identifier: "123456789", password: "another long passphrase" })).principal.userId, byPhone, "phone account too");
+    await fails("invalid_credentials", () => auth.signIn({ identifier: "123456789", password: "not either of them!!" }));
+  });
+
+  test("phone spellings share one counter; usernames keep their case", async () => {
+    eq(signInKey("0771239999"), signInKey(" 077 123 9999 "), "spacing");
+    eq(signInKey("+94 77 123 9999"), signInKey("0771239999"), "international");
+    eq(signInKey("A@Example.com"), signInKey("a@example.com"), "email case");
+    eq(signInKey("Bob") === signInKey("bob"), false, "username case");
+    await newUser({ username: "parent-94771239999", phone: "94771239999" });
+    for (let i = 0; i < 5; i++) await fails("invalid_credentials", () => auth.signIn({ identifier: "0771239999", password: "wrong password!!" }));
+    for (let i = 0; i < 5; i++) await fails("invalid_credentials", () => auth.signIn({ identifier: "077 123 9999", password: "wrong password!!" }));
+    await fails("rate_limited", () => auth.signIn({ identifier: "+94771239999", password: GOOD }));
+  });
+});
+
+describe("credential changes commit with their side effects", () => {
+  const breakDeletes = () => q(`CREATE FUNCTION no_session_delete() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'session delete refused'; END $$ LANGUAGE plpgsql`).then(() => q(`CREATE TRIGGER no_session_delete BEFORE DELETE ON auth_session FOR EACH ROW EXECUTE FUNCTION no_session_delete()`));
+  const fixDeletes = async () => {
+    await q(`DROP TRIGGER no_session_delete ON auth_session`);
+    await q(`DROP FUNCTION no_session_delete()`);
+  };
+
+  test("changePassword: a failed session cleanup rolls back the password and audit row", async () => {
+    const u = await newUser({ email: "atomic1@example.com" });
+    const a = await auth.signIn({ identifier: "atomic1@example.com", password: GOOD });
+    const b = await auth.signIn({ identifier: "atomic1@example.com", password: GOOD });
+    await breakDeletes();
+    try {
+      let threw = false;
+      await auth.changePassword({ token: a.token, currentPassword: GOOD, newPassword: "a brand new password" }).catch(() => (threw = true));
+      eq(threw, true, "changePassword failed");
+    } finally {
+      await fixDeletes();
+    }
+    eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND password_hash = $2`, [u, goodHash]), 1, "old password kept");
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_changed' AND entity_id = $1`, [u]), 0, "no audit row");
+    await auth.authenticate(b.token);
+  });
+
+  test("setPassword: a failed session cleanup leaves the account without a password and the other session intact", async () => {
+    const { u } = await parent("94771230102");
+    const one = await auth.firstLogin({ phone: "0771230102" });
+    const two = await auth.firstLogin({ phone: "0771230102" });
+    await breakDeletes();
+    try {
+      let threw = false;
+      await auth.setPassword({ token: one.token, newPassword: "my first password!" }).catch(() => (threw = true));
+      eq(threw, true, "setPassword failed");
+    } finally {
+      await fixDeletes();
+    }
+    eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND password_hash IS NULL`, [u]), 1, "still no password");
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_set' AND entity_id = $1`, [u]), 0, "no audit row");
+    eq((await auth.authenticate(two.token)).restriction, "set_password", "retry is still possible");
+    await auth.setPassword({ token: one.token, newPassword: "my first password!" });
+    await fails("unauthenticated", () => auth.authenticate(two.token));
+  });
+
+  test("verifyMfa: a failed session update keeps the recovery code and the TOTP step available", async () => {
+    const t = await staffWithMfa("atomic3@example.com");
+    const s = await auth.signIn({ identifier: t.email, password: GOOD });
+    await q(`CREATE FUNCTION no_verify() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'verify refused'; END $$ LANGUAGE plpgsql`);
+    await q(`CREATE TRIGGER no_verify BEFORE UPDATE ON auth_session FOR EACH ROW WHEN (NEW.mfa_verified_at IS NOT NULL) EXECUTE FUNCTION no_verify()`);
+    const before = ((await q(`SELECT jsonb_array_length(recovery_hashes) AS n, last_used_step FROM user_two_factor WHERE user_id = $1`, [t.u]))[0]!);
+    try {
+      let threw = 0;
+      await auth.verifyMfa({ token: s.token, code: t.recoveryCodes[0]! }).catch(() => threw++);
+      await auth.verifyMfa({ token: s.token, code: totp(t.secret, new Date(clock.getTime() + 30_000)) }).catch(() => threw++);
+      eq(threw, 2, "both attempts failed");
+    } finally {
+      await q(`DROP TRIGGER no_verify ON auth_session`);
+      await q(`DROP FUNCTION no_verify()`);
+    }
+    eq((await q(`SELECT jsonb_array_length(recovery_hashes) AS n, last_used_step FROM user_two_factor WHERE user_id = $1`, [t.u]))[0], before, "nothing consumed");
+    await auth.verifyMfa({ token: s.token, code: t.recoveryCodes[0]! });
+  });
+});
+
+describe("authenticator codes work once", () => {
+  test("a code accepted in one session is refused in another, and so is the enrolment code", async () => {
+    const t = await staffWithMfa("replay@example.com");
+    const next = totp(t.secret, new Date(clock.getTime() + 30_000));
+    const s1 = await auth.signIn({ identifier: t.email, password: GOOD });
+    const s2 = await auth.signIn({ identifier: t.email, password: GOOD });
+    await fails("invalid_code", () => auth.verifyMfa({ token: s1.token, code: totp(t.secret, clock) }));
+    await auth.verifyMfa({ token: s1.token, code: next });
+    await fails("invalid_code", () => auth.verifyMfa({ token: s2.token, code: next }));
+    eq((await auth.authenticate(s2.token)).restriction, "mfa", "still restricted");
+    advance(60_000);
+    await auth.verifyMfa({ token: s2.token, code: totp(t.secret, clock) });
+  });
+});
+
+describe("authenticator enrolment", () => {
+  test("beginning enrolment never replaces an enabled secret", async () => {
+    const t = await staffWithMfa("keep@example.com");
+    const cipher = async () => (await q(`SELECT secret_cipher FROM user_two_factor WHERE user_id = $1`, [t.u]))[0]!.secret_cipher;
+    const before = await cipher();
+    const s = await auth.signIn({ identifier: t.email, password: GOOD });
+    await fails("forbidden", () => auth.beginMfaEnrollment({ token: s.token }));
+    eq(await cipher(), before, "secret untouched");
+    eq(await count(`SELECT jsonb_array_length(recovery_hashes)::int AS c FROM user_two_factor WHERE user_id = $1`, [t.u]), 8, "recovery codes untouched");
+  });
+
+  test("a confirmation never enables a secret other than the one it verified", async () => {
+    const u = await newUser({ email: "swap@example.com" });
+    await acl.assignRole({ userId: u, roleName: "student_counselor", actor: root });
+    const s = await auth.signIn({ identifier: "swap@example.com", password: GOOD });
+    const { secret } = await auth.beginMfaEnrollment({ token: s.token });
+    const rival = raced(async () => void (await auth.beginMfaEnrollment({ token: s.token })));
+    await fails("forbidden", () => rival.confirmMfaEnrollment({ token: s.token, code: totp(secret, clock) }));
+    eq(await count(`SELECT count(*)::int AS c FROM user_two_factor WHERE user_id = $1 AND enabled_at IS NULL`, [u]), 1, "the replacement secret is not enabled");
+    eq((await auth.authenticate(s.token)).restriction, "mfa_setup", "session not marked verified");
+  });
+});
+
+describe("disabling a user ends their sessions for good", () => {
+  test("the domain disable deletes sessions in its own transaction", async () => {
+    const u = await newUser({ email: "gone@example.com" });
+    const a = await auth.signIn({ identifier: "gone@example.com", password: GOOD });
+    await acl.setUserStatus({ userId: u, status: "disabled", actor: root });
+    eq(await sessions(u), 0);
+    await acl.setUserStatus({ userId: u, status: "active", actor: root });
+    await fails("unauthenticated", () => auth.authenticate(a.token));
+  });
+});
+
+describe("disable and session revocation commit together", () => {
+  test("a failed session deletion rolls the disable back, so a retry starts from the same state", async () => {
+    const u = await newUser({ email: "rollback-disable@example.com" });
+    const a = await auth.signIn({ identifier: "rollback-disable@example.com", password: GOOD });
+    await q(`CREATE FUNCTION no_session_delete2() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'session delete refused'; END $$ LANGUAGE plpgsql`);
+    await q(`CREATE TRIGGER no_session_delete2 BEFORE DELETE ON auth_session FOR EACH ROW EXECUTE FUNCTION no_session_delete2()`);
+    try {
+      let threw = false;
+      await acl.setUserStatus({ userId: u, status: "disabled", actor: root }).catch(() => (threw = true));
+      eq(threw, true, "the disable failed");
+    } finally {
+      await q(`DROP TRIGGER no_session_delete2 ON auth_session`);
+      await q(`DROP FUNCTION no_session_delete2()`);
+    }
+    eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND status = 'active'`, [u]), 1, "still active");
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.disable' AND entity_id = $1`, [u]), 0, "no audit row");
+    await auth.authenticate(a.token);
+    await acl.setUserStatus({ userId: u, status: "disabled", actor: root });
+    eq(await sessions(u), 0);
+    await acl.setUserStatus({ userId: u, status: "active", actor: root });
+    await fails("unauthenticated", () => auth.authenticate(a.token));
+  });
+});
+
+describe("parent password reset is scoped to branches", () => {
+  test("every branch of the parent's students must be covered; an all-branches holder may reset anyone", async () => {
+    const main = String((await q(`SELECT id FROM branch ORDER BY created_at, id LIMIT 1`))[0]!.id);
+    const other = await id(`INSERT INTO branch (organization_id, name) VALUES ((SELECT id FROM organization), 'Kandy')`);
+    const local = await newUser();
+    await acl.assignRole({ userId: local, roleName: "student_counselor", branchId: main, actor: root });
+
+    const inMain = await parent("94771230201");
+    await childOf(inMain.g, [main]);
+    const inOther = await parent("94771230202");
+    await childOf(inOther.g, [other]);
+    const both = await parent("94771230203");
+    await childOf(both.g, [main]);
+    await childOf(both.g, [other]);
+    const noKids = await parent("94771230204");
+    const noBranch = await parent("94771230205");
+    await childOf(noBranch.g, []);
+
+    for (const p of [inMain, inOther, both, noKids, noBranch]) await q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [p.u, goodHash]);
+    const sess = await auth.signIn({ identifier: "0771230202", password: GOOD });
+
+    await fails("forbidden", () => auth.resetParentPassword({ guardianId: inOther.g, actor: local }));
+    await fails("forbidden", () => auth.resetParentPassword({ guardianId: noKids.g, actor: local }));
+    await fails("forbidden", () => auth.resetParentPassword({ guardianId: noBranch.g, actor: local }));
+    eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND password_hash IS NOT NULL`, [inOther.u]), 1, "password kept");
+    await auth.authenticate(sess.token);
+
+    await auth.resetParentPassword({ guardianId: inMain.g, actor: local });
+    await auth.resetParentPassword({ guardianId: inOther.g, actor: root });
+    await fails("unauthenticated", () => auth.authenticate(sess.token));
+    await auth.resetParentPassword({ guardianId: noKids.g, actor: root });
+
+    // A branch of one of the children is enough (the same rule as guardian edits), so the parent with children in both branches is reachable.
+    await auth.resetParentPassword({ guardianId: both.g, actor: local });
+    await fails("forbidden", () => auth.resetParentPassword({ guardianId: inOther.g, actor: local }));
+  });
+
+  test("the reset follows the guardian service's scope rule exactly", async () => {
+    const main = String((await q(`SELECT id FROM branch ORDER BY created_at, id LIMIT 1`))[0]!.id);
+    const other = await id(`INSERT INTO branch (organization_id, name) VALUES ((SELECT id FROM organization), 'Galle')`);
+    const local = await newUser();
+    await acl.assignRole({ userId: local, roleName: "student_counselor", branchId: other, actor: root });
+    const p = await parent("94771230211");
+    await childOf(p.g, [main, other]);
+    await q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [p.u, goodHash]);
+    const guardians = createGuardianService(db);
+    // whatever the guardian service lets the actor edit, the reset allows, and the reverse
+    await guardians.update({ guardianId: p.g, actor: local, fullName: "Scoped Parent" });
+    await auth.resetParentPassword({ guardianId: p.g, actor: local });
+    eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND password_hash IS NULL`, [p.u]), 1);
   });
 });

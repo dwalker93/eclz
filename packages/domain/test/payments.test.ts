@@ -9,6 +9,7 @@ import {
   linkedTotals,
   verifyReceipt,
 } from "../src";
+import { lockInvoice, lockStudent } from "../src/lookups";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -311,6 +312,19 @@ describe("Linked positive adjustments count once (D23)", () => {
     await adjustment(inv, 2000, item);
     await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "12100.00", recordedBy: staff, invoiceIds: [inv] });
   }));
+  test("an allocation recorded under a linked adjustment counts as paid on its root: 20 paid on the adjustment leaves 100, not 120", async () => {
+    const inv = await mkInvoice(st2, b1, "2027-05-01", 12000);
+    const item = await mkItem(inv, enr2, 10000);
+    const adj = await adjustment(inv, 2000, item);
+    // the 20 was paid while the adjustment still stood alone, so the allocation row is under the adjustment's id
+    const other = await mkInvoice(st2, b1, "2027-05-01", 2000);
+    await mkItem(other, enr2, 2000);
+    const earlier = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "2000.00", recordedBy: staff, invoiceIds: [other] });
+    await q(`UPDATE payment_allocation SET invoice_id = $2, invoice_item_id = $3 WHERE payment_id = $1`, [earlier.payment.id, inv, adj]);
+    await fails("allocation_mismatch", () => svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "10100.00", recordedBy: staff, invoiceIds: [inv] }));
+    const ev = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "10000.00", recordedBy: staff, invoiceIds: [inv] });
+    eq(ev.allocations.map((a) => [a.invoiceItemId, a.amount]), [[item, "10000.00"]]);
+  });
   test("a standalone positive adjustment is still its own payable item", async () => {
     const inv = await mkInvoice(st2, b1, "2027-05-01", 10500);
     const item = await mkItem(inv, enr2, 10000);
@@ -318,6 +332,18 @@ describe("Linked positive adjustments count once (D23)", () => {
     const ev = await svc.recordCashPayment({ studentId: st2, branchId: b1, amount: "10500.00", recordedBy: staff, invoiceIds: [inv] });
     eq(new Map(ev.allocations.map((a) => [a.invoiceItemId, a.amount])).get(solo), "500.00");
     eq(new Map(ev.allocations.map((a) => [a.invoiceItemId, a.amount])).get(item), "10000.00");
+  });
+});
+
+describe("One lock order: student, then invoices", () => {
+  test("lockInvoice takes the student first and returns the locked invoice; an unknown invoice gives nothing", async () => {
+    const inv = await mkInvoice(st1, b1, "2027-06-01", 10);
+    await db.transaction(async (tx) => {
+      await lockStudent(tx, st1);
+      const row = await lockInvoice(tx, inv);
+      eq(row?.id, inv);
+      eq(await lockInvoice(tx, "00000000-0000-0000-0000-000000000000"), undefined);
+    });
   });
 });
 

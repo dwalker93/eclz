@@ -1,8 +1,8 @@
 import type { AuthService } from "@workspace/auth";
 import { guardian, student, studentGuardian } from "@workspace/db/schema";
 import { contentPurchase } from "@workspace/db/schema";
-import { canAccessStudent, ServiceError, type AttendanceService, type ContentService, type Db, type ExamService, type NoticeService, type PayoutService } from "@workspace/domain";
-import { eq } from "drizzle-orm";
+import { isCalendarDay, ServiceError, type AttendanceService, type ContentService, type Db, type ExamService, type NoticeService, type PayoutService } from "@workspace/domain";
+import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import { jsonBody } from "./http";
@@ -42,7 +42,7 @@ export function createPortalRoutes({ db, auth, content, notices, attendance, exa
   });
 
   const me = (c: { get: (k: "principal") => { identity: { studentId: string | null } } }) => c.get("principal").identity.studentId!;
-  const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+  const day = z.string().refine(isCalendarDay, "Use a real calendar date like 2027-03-31.");
   const range = z.object({ courseId: z.string().uuid().optional(), from: day.optional(), to: day.optional() });
 
   student_.get("/attendance", async (c) => c.json(await attendance.studentSummary({ studentId: me(c), ...range.parse(c.req.query()) })));
@@ -70,14 +70,20 @@ export function createPortalRoutes({ db, auth, content, notices, attendance, exa
       .where(eq(guardian.id, guardianId));
     return c.json({ children: rows });
   });
-  parent.get("/children/:id/content", async (c) => {
+  /**
+   * The child must be linked to the signed-in guardian, exactly as /children lists them. Staff scope does not count here: a guardian who is
+   * also staff reads an unrelated student through the staff routes, not through the parent portal.
+   */
+  async function ownChild(c: { get: (k: "principal") => { identity: { guardianId: string | null } }; req: { param: (n: string) => string } }): Promise<string> {
     const studentId = z.string().uuid().parse(c.req.param("id"));
-    if (!(await canAccessStudent(db, c.get("principal").userId, studentId))) throw new ServiceError("forbidden", "That is not your child.");
-    return c.json(await content.listForStudent({ studentId }));
-  });
+    const guardianId = c.get("principal").identity.guardianId!;
+    const [link] = await db.select({ s: studentGuardian.studentId }).from(studentGuardian).where(and(eq(studentGuardian.guardianId, guardianId), eq(studentGuardian.studentId, studentId)));
+    if (!link) throw new ServiceError("forbidden", "That is not your child.");
+    return studentId;
+  }
+  parent.get("/children/:id/content", async (c) => c.json(await content.listForStudent({ studentId: await ownChild(c) })));
   parent.get("/children/:id/attendance", async (c) => {
-    const studentId = z.string().uuid().parse(c.req.param("id"));
-    if (!(await canAccessStudent(db, c.get("principal").userId, studentId))) throw new ServiceError("forbidden", "That is not your child.");
+    const studentId = await ownChild(c);
     return c.json(await attendance.studentSummary({ studentId, ...range.parse(c.req.query()) }));
   });
   // lecturer statements: only their own, and only once approved (a draft is still the institute's working copy)

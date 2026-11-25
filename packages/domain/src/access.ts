@@ -8,7 +8,7 @@ import {
 } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
 import { addDays } from "./dates";
-import { loadOrganization, todayFor } from "./lookups";
+import { loadOrganization, lockStudent, todayFor } from "./lookups";
 import { queueNotifications, resolveRecipients } from "./notifications";
 import { fromCents, toCents } from "@workspace/db/money";
 import type { VerifiedEvent, VoidedEvent } from "./payments";
@@ -108,7 +108,7 @@ interface OverdueNote {
   payload: Record<string, unknown>;
 }
 
-/** J1, J2: one notification per recipient, channel and overdue item. Disabled external channels create no rows, and a retry creates none twice. */
+/** J1, J2: one notification per recipient, channel and overdue item. Disabled external channels create no rows, and retrying the enqueue creates no second row. */
 async function queueOverdueNotifications(tx: Tx, org: OrgRow, studentId: string, notes: OverdueNote[], at: Date): Promise<number> {
   if (notes.length === 0) return 0;
   const { userIds, studentName } = await resolveRecipients(tx, org, studentId);
@@ -137,6 +137,9 @@ export async function reconcileStudent(
   ctx: { today: string; org: OrgRow; actor: string | null; at: Date },
 ): Promise<ReconcileSummary> {
   const summary: ReconcileSummary = { markedOverdue: [], clearedOverdue: [], restricted: [], restored: [], notifications: 0 };
+  // The student lock comes before any invoice lock, the same order payment verify and void and invoice changes use. It also holds the student's
+  // payments and invoices still while the enrolments are read below, so the restore decision cannot rest on invoice state that a void has since changed.
+  await lockStudent(tx, studentId);
   const invoices = await tx
     .select()
     .from(invoice)

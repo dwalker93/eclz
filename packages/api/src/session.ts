@@ -21,9 +21,26 @@ export const clearSessionCookie = (c: Context, cfg: SessionConfig) => deleteCook
 
 export const sessionToken = (c: Context, cfg: SessionConfig) => getCookie(c, cfg.cookieName) ?? null;
 
+/**
+ * The address the per-address sign-in limit counts. Forwarded headers are read only with `trustProxy` (a proxy you control that overwrites them).
+ * Otherwise, and when such a proxy sent none, it is the peer address the server adapter handed to `fetch` (see `withPeerAddress`), so a direct
+ * Bun setup keeps the limit; with neither, there is no address and only the identifier limit applies.
+ */
 export function clientIp(c: Context, cfg: SessionConfig): string | null {
-  if (!cfg.trustProxy) return null;
-  return c.req.header("x-forwarded-for")?.split(",")[0]?.trim() || null;
+  if (cfg.trustProxy) {
+    const forwarded = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
+    if (forwarded) return forwarded;
+  }
+  const peer = (c.env as { peerAddress?: unknown } | undefined)?.peerAddress;
+  return typeof peer === "string" && peer ? peer : null;
+}
+
+/**
+ * For `Bun.serve` without a proxy: `Bun.serve({ fetch: withPeerAddress(api) })`. The socket's peer address goes to the app as `c.env.peerAddress`,
+ * never from a request header, so it cannot be forged by the client.
+ */
+export function withPeerAddress(app: { fetch: (req: Request, env?: unknown) => Response | Promise<Response> }) {
+  return (req: Request, server: { requestIP(req: Request): { address: string } | null }) => app.fetch(req, { peerAddress: server.requestIP(req)?.address ?? null });
 }
 
 /** Puts the principal on the context, or answers 401. The session may still be half signed in (see `restriction`). */

@@ -1,8 +1,9 @@
 import { and, desc, eq, inArray, isNull, or, gt, lte, sql } from "drizzle-orm";
 import { branch, course, enrollment, gradeLevel, notice, noticeTarget, role, staffRoleAssignment, student, studentBranch, studentGuardian, studentLevel } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
-import { branchScope, requirePermission } from "./authorization";
+import { branchScope, canonicalUuid, requirePermission } from "./authorization";
 import { ServiceError } from "./errors";
+import { todayFor } from "./lookups";
 import { type Db, type Tx } from "./types";
 
 export type NoticeTargetInput =
@@ -62,6 +63,13 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
   async function withTargets(rows: (typeof notice.$inferSelect)[], q: Db | Tx = db): Promise<NoticeView[]> {
     if (rows.length === 0) return [];
     const ts = await q.select().from(noticeTarget).where(inArray(noticeTarget.noticeId, rows.map((r) => r.id)));
+    // One pass groups the targets by notice, so a long feed costs its size and not size squared.
+    const byNotice = new Map<string, { type: string; id: string | null }[]>();
+    for (const t of ts) {
+      const list = byNotice.get(t.noticeId) ?? [];
+      list.push({ type: t.targetType, id: t.targetId });
+      byNotice.set(t.noticeId, list);
+    }
     return rows.map((r) => ({
       id: r.id,
       authorId: r.authorId,
@@ -70,7 +78,7 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
       body: r.body,
       publishedAt: r.publishedAt,
       expiresAt: r.expiresAt,
-      targets: ts.filter((t) => t.noticeId === r.id).map((t) => ({ type: t.targetType, id: t.targetId })),
+      targets: byNotice.get(r.id) ?? [],
     }));
   }
 
@@ -78,10 +86,20 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
   async function visibleTo(studentIds: string[]): Promise<NoticeView[]> {
     if (studentIds.length === 0) return [];
     const at = now();
+    // The organization's local day, from the same clock as `at`, decides which grade and which course access are in effect (as access.ts does).
+    const today = await todayFor(db, at);
     const [branches, courses, levels] = await Promise.all([
       db.select({ s: studentBranch.studentId, b: studentBranch.branchId }).from(studentBranch).where(inArray(studentBranch.studentId, studentIds)),
-      db.select({ s: enrollment.studentId, c: enrollment.courseId }).from(enrollment).where(and(inArray(enrollment.studentId, studentIds), eq(enrollment.status, "active"))),
-      db.select({ s: studentLevel.studentId, g: studentLevel.gradeLevelId }).from(studentLevel).where(and(inArray(studentLevel.studentId, studentIds), isNull(studentLevel.toDate))),
+      // A course notice reaches an enrolment whose access has started and not ended; a confirmed move starts its new enrolment on a later day.
+      db
+        .select({ s: enrollment.studentId, c: enrollment.courseId })
+        .from(enrollment)
+        .where(and(inArray(enrollment.studentId, studentIds), eq(enrollment.status, "active"), lte(enrollment.accessStartsOn, today), or(isNull(enrollment.accessEndsOn), gt(enrollment.accessEndsOn, today)))),
+      // The grade in effect today: a promotion confirmed in March for 1 April closes the old grade on 1 April, so the new row must not count yet.
+      db
+        .select({ s: studentLevel.studentId, g: studentLevel.gradeLevelId })
+        .from(studentLevel)
+        .where(and(inArray(studentLevel.studentId, studentIds), lte(studentLevel.fromDate, today), or(isNull(studentLevel.toDate), gt(studentLevel.toDate, today)))),
     ]);
     const live = await db
       .select()
@@ -105,6 +123,8 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
 
   return {
     async create(input: { actor: string; branchId: string | null; title: string; body: string; expiresAt?: Date | null; publishAt?: Date; targets?: NoticeTargetInput[] }): Promise<NoticeView> {
+      // One spelling of the branch for the permission check, the target checks and the audit row.
+      if (input.branchId) input = { ...input, branchId: canonicalUuid(input.branchId) };
       await requirePermission(db, input.actor, "notices.manage", { branchId: input.branchId });
       const title = input.title.trim();
       const body = input.body.trim();
@@ -129,31 +149,37 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
 
     /** Change the wording or the expiry. The branch and the audience stay as published. */
     async update(input: { noticeId: string; actor: string; title?: string; body?: string; expiresAt?: Date | null }): Promise<NoticeView> {
-      const [cur] = await db.select().from(notice).where(eq(notice.id, input.noticeId));
-      if (!cur) throw new ServiceError("not_found", "Notice not found.");
-      await requirePermission(db, input.actor, "notices.manage", { branchId: cur.branchId });
-      const title = input.title === undefined ? cur.title : input.title.trim();
-      const body = input.body === undefined ? cur.body : input.body.trim();
-      if (!title || title.length > 200) throw new ServiceError("invalid_input", "A title of 1 to 200 characters is required.");
-      if (!body || body.length > 10000) throw new ServiceError("invalid_input", "A body of 1 to 10000 characters is required.");
-      const expiresAt = input.expiresAt === undefined ? cur.expiresAt : input.expiresAt;
-      if (expiresAt && expiresAt <= cur.publishedAt) throw new ServiceError("invalid_input", "The expiry must be after the publish time.");
+      const [seen] = await db.select().from(notice).where(eq(notice.id, input.noticeId));
+      if (!seen) throw new ServiceError("not_found", "Notice not found.");
+      await requirePermission(db, input.actor, "notices.manage", { branchId: seen.branchId });
       return db.transaction(async (tx) => {
+        // The fields left out of the patch come from the row as locked here, so a title edit never writes back an older body.
+        const [cur] = await tx.select().from(notice).where(eq(notice.id, input.noticeId)).for("update");
+        if (!cur) throw new ServiceError("not_found", "Notice not found.");
+        const title = input.title === undefined ? cur.title : input.title.trim();
+        const body = input.body === undefined ? cur.body : input.body.trim();
+        if (!title || title.length > 200) throw new ServiceError("invalid_input", "A title of 1 to 200 characters is required.");
+        if (!body || body.length > 10000) throw new ServiceError("invalid_input", "A body of 1 to 10000 characters is required.");
+        const expiresAt = input.expiresAt === undefined ? cur.expiresAt : input.expiresAt;
+        if (expiresAt && expiresAt <= cur.publishedAt) throw new ServiceError("invalid_input", "The expiry must be after the publish time.");
         const [n] = await tx.update(notice).set({ title, body, expiresAt }).where(eq(notice.id, cur.id)).returning();
+        if (!n) throw new ServiceError("not_found", "Notice not found.");
         await writeAudit(tx, { actor: input.actor, action: "notice.update", entityType: "notice", entityId: cur.id, before: { title: cur.title, body: cur.body, expiresAt: cur.expiresAt }, after: { title, body, expiresAt } });
-        const [view] = await withTargets([n!], tx);
+        const [view] = await withTargets([n], tx);
         return view!;
       });
     },
 
     /** Take a notice down for good (its targets go with it). The audit trail keeps what it said. */
     async remove(input: { noticeId: string; actor: string }): Promise<void> {
-      const [cur] = await db.select().from(notice).where(eq(notice.id, input.noticeId));
-      if (!cur) throw new ServiceError("not_found", "Notice not found.");
-      await requirePermission(db, input.actor, "notices.manage", { branchId: cur.branchId });
+      const [seen] = await db.select().from(notice).where(eq(notice.id, input.noticeId));
+      if (!seen) throw new ServiceError("not_found", "Notice not found.");
+      await requirePermission(db, input.actor, "notices.manage", { branchId: seen.branchId });
       await db.transaction(async (tx) => {
-        await tx.delete(notice).where(eq(notice.id, cur.id));
-        await writeAudit(tx, { actor: input.actor, action: "notice.remove", entityType: "notice", entityId: cur.id, before: { title: cur.title, body: cur.body, branchId: cur.branchId } });
+        // The audit records the row the delete actually removed; if another manager removed it first there is nothing to delete or audit.
+        const [gone] = await tx.delete(notice).where(eq(notice.id, seen.id)).returning();
+        if (!gone) throw new ServiceError("not_found", "Notice not found.");
+        await writeAudit(tx, { actor: input.actor, action: "notice.remove", entityType: "notice", entityId: gone.id, before: { title: gone.title, body: gone.body, branchId: gone.branchId } });
       });
     },
 
@@ -186,7 +212,7 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
       return visibleTo(kids.map((k) => k.id));
     },
 
-    /** Staff see the live notices aimed at everyone or at a role they hold, in their branches. */
+    /** Staff see the live notices aimed at a role they hold, in their branches. `all` targets reach students and parents only. */
     async listForStaff(userId: string): Promise<NoticeView[]> {
       const at = now();
       const mine = await db.select({ roleId: staffRoleAssignment.roleId, branchId: staffRoleAssignment.branchId }).from(staffRoleAssignment).where(eq(staffRoleAssignment.userId, userId));

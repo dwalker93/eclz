@@ -1,6 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { enrollment, feeException, feeStructure } from "@workspace/db/schema";
 import { writeAudit, isConstraintError } from "./audit";
+import { isCalendarDay } from "./dates";
+import { requireModule } from "./authorization";
 import { loadOrganization, todayFor } from "./lookups";
 import { ServiceError } from "./errors";
 import { type Db } from "./types";
@@ -24,6 +26,7 @@ export function createFeeExceptionService(db: Db, opts: { now?: () => Date } = {
     /** D15 to D22: needs the fee_exceptions module to be on. Ones already created keep applying if it is later switched off (D21). */
     async createFeeException(input: CreateFeeException) {
       if (!input.reason.trim()) throw new ServiceError("reason_required", "A reason is required.");
+      if (!isCalendarDay(input.effectiveFrom) || (input.effectiveTo != null && !isCalendarDay(input.effectiveTo))) throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
       return db.transaction(async (tx) => {
         const org = await loadOrganization(tx);
         if ((org.enabledModules as Record<string, boolean>)?.fee_exceptions !== true) {
@@ -88,7 +91,10 @@ export function createFeeExceptionService(db: Db, opts: { now?: () => Date } = {
 
     /** Ends an exception (D18). Never deleted. Periods already invoiced are not changed. */
     async endFeeException(input: { exceptionId: string; endedBy: string; effectiveTo?: string }) {
+      if (input.effectiveTo !== undefined && !isCalendarDay(input.effectiveTo)) throw new ServiceError("invalid_input", "Dates must be real calendar days like 2027-03-31.");
       return db.transaction(async (tx) => {
+        // K: ending is gated too; exceptions that exist keep applying unchanged while the module is off.
+        await requireModule(tx, "fee_exceptions");
         const today = input.effectiveTo ?? (await todayFor(tx, now()));
         const [ex] = await tx.select().from(feeException).where(eq(feeException.id, input.exceptionId)).for("update");
         if (!ex) throw new ServiceError("not_found", "Exception not found.");

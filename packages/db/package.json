@@ -12,26 +12,27 @@
     },
     "./schema": "./src/schema/index.ts",
     "./money": "./src/money.ts",
-    "./seed": "./src/seed.ts"
+    "./seed": "./src/seed.ts",
+    "./migrate": "./src/migrate.ts"
   },
   "scripts": {
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
+    "db:migrate": "bun run scripts/migrate.ts",
     "db:studio": "drizzle-kit studio",
     "db:seed": "bun run scripts/seed.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test --timeout 60000"
   },
   "dependencies": {
-    "drizzle-orm": "^0.45.4",
-    "postgres": "^4.1.1",
+    "drizzle-orm": "^0.44.0",
+    "postgres": "^3.4.5",
     "server-only": "^0.0.1"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.16",
+    "@electric-sql/pglite": "^0.3.0",
     "@types/bun": "^1.4.2",
-    "@types/node": "^26.6.6",
+    "@types/node": "^22.0.0",
     "drizzle-kit": "^0.31.0",
-    "typescript": "^7.0.2"
+    "typescript": "^5.6.0"
   }
 }

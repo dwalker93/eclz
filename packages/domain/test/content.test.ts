@@ -2,11 +2,13 @@
  * Content: recordings, files and books, who can open them, purchases and handover (F rules).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@workspace/db/schema";
 import { createContentService, createPaymentService, decideContentAccess, hmacSigner } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -327,6 +329,28 @@ describe("physical books (F6)", () => {
     await fails("not_found", () => content.handOver({ purchaseId: "00000000-0000-0000-0000-000000000000", handedOverBy: staff }));
   });
 
+  test("pendingHandovers filters by branch set in the query and keeps order", async () => {
+    const mk = async (branch: string) => {
+      const item = await publish(await content.createItem({ lecturerId: lec, kind: "physical_book", title: `Book ${++n}`, accessType: "paid", price: 900, branchIds: [branch] }));
+      const s = await newStudent({ branches: [branch] });
+      const r = await content.purchase({ contentId: item.id, studentId: s });
+      await payFull(s, r.invoiceId, branch);
+      return r.purchase.id;
+    };
+    const p1 = await mk(b1);
+    const p2 = await mk(b2);
+    const p3 = await mk(b1);
+    const ids = async (i?: { branchIds?: string[] }) => (await content.pendingHandovers(i)).map((x) => x.purchase.id).filter((x) => [p1, p2, p3].includes(x));
+    // Purchases can share a timestamp, so the expected order is the unfiltered one (purchasedAt, then id).
+    const all = await ids();
+    eq([...all].sort(), [p1, p2, p3].sort(), "no filter returns all");
+    const inOrder = (want: string[]) => all.filter((x) => want.includes(x));
+    eq(await ids({ branchIds: [b1] }), inOrder([p1, p3]), "one branch, same order");
+    eq(await ids({ branchIds: [b2] }), [p2], "other branch");
+    eq(await ids({ branchIds: [b1, b2] }), all, "both branches");
+    eq(await ids({ branchIds: [] }), [], "empty set matches nothing");
+  });
+
   test("a digital purchase is never handed over", async () => {
     const item = await publish(await recording({ accessType: "paid", price: 10, branchIds: [b1] }));
     const s = await newStudent({ branches: [b1] });
@@ -346,3 +370,85 @@ describe("physical books (F6)", () => {
     eq((await q(`SELECT status FROM invoice WHERE id = $1`, [r.invoiceId]))[0]!.status, "pending", "the invoice shows the money is owed again");
   });
 });
+
+describe("review hardening", () => {
+  const onSale = async (price: number | string = 100, branchIds = [b1]) => publish(await recording({ accessType: "paid", price, branchIds }));
+  test("attaching again changes only what is supplied", async () => {
+    const c = await newCourse();
+    const sec1 = await content.createSection({ courseId: c, title: "S1", position: 1 });
+    const sec2 = await content.createSection({ courseId: c, title: "S2", position: 2 });
+    const item = await publish(await recording({ title: "Keeps its section" }));
+    const row = async () => (await q(`SELECT section_id, position FROM course_content WHERE course_id = $1 AND content_id = $2`, [c, item.id]))[0]!;
+    await content.attachToCourse({ courseId: c, contentId: item.id, sectionId: sec1.id, position: 3 });
+    eq([(await row()).section_id, (await row()).position], [sec1.id, 3]);
+    await content.attachToCourse({ courseId: c, contentId: item.id, position: 7 });
+    eq([(await row()).section_id, (await row()).position], [sec1.id, 7], "a new position keeps the section");
+    await content.attachToCourse({ courseId: c, contentId: item.id, sectionId: sec2.id });
+    eq([(await row()).section_id, (await row()).position], [sec2.id, 7], "a new section keeps the position");
+    const again = await content.attachToCourse({ courseId: c, contentId: item.id });
+    eq([again.sectionId, again.position], [sec2.id, 7], "nothing supplied: nothing changes, the row comes back");
+    await content.attachToCourse({ courseId: c, contentId: item.id, sectionId: null });
+    eq([(await row()).section_id, (await row()).position], [null, 7], "null takes it out of its section");
+    // a first attach still defaults to no section and position 0
+    const other = await publish(await recording({ title: "Fresh" }));
+    const fresh = await content.attachToCourse({ courseId: c, contentId: other.id });
+    eq([fresh.sectionId, fresh.position], [null, 0]);
+  });
+
+  test("cancelling a purchase locks the invoice before the purchase, like a payment verification", async () => {
+    const item = await onSale(100);
+    const s = await newStudent({ branches: [b1] });
+    const r = await content.purchase({ contentId: item.id, studentId: s });
+    // every statement the service sends, in order, including those inside its transaction
+    const sqls: string[] = [];
+    const spy = (target: any): any =>
+      new Proxy(target, {
+        get(t, k) {
+          const v = t[k];
+          if (k === "query") return (text: string, ...a: unknown[]) => (sqls.push(String(text)), t.query(text, ...a));
+          if (k === "transaction") return (cb: (tx: unknown) => unknown) => t.transaction((tx: unknown) => cb(spy(tx)));
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      });
+    const spied = createContentService(drizzle(spy(pg), { schema }) as unknown as typeof db, { now });
+    const cancelled = await spied.cancelPurchase({ purchaseId: r.purchase.id });
+    eq(cancelled.status, "cancelled");
+    const locks = sqls.filter((t) => /for update/i.test(t)).map((t) => (/from "invoice"/i.test(t) ? "invoice" : /from "content_purchase"/i.test(t) ? "purchase" : "other"));
+    eq(locks, ["invoice", "purchase"], "invoice lock first, then the purchase");
+    eq((await q(`SELECT status FROM invoice WHERE id = $1`, [r.invoiceId]))[0]!.status, "cancelled");
+  });
+
+  test("a purchase that gets its invoice between the first read and the locks is looked at again with the right locks", async () => {
+    const item = await onSale(100);
+    const s = await newStudent({ branches: [b1] });
+    // a pending purchase with no invoice yet; the invoice is attached after the service's first read, before its transaction
+    const pur = await id(`INSERT INTO content_purchase (content_id, student_id, branch_id, channel, price) VALUES ($1, $2, $3, 'online', 100)`, [item.id, s, b1]);
+    const inv = await id(`INSERT INTO invoice (student_id, branch_id, due_date, subtotal, total) VALUES ($1, $2, '2027-04-01', 100, 100)`, [s, b1]);
+    let first = true;
+    const sqls: string[] = [];
+    const spy = (target: any, hook = false): any =>
+      new Proxy(target, {
+        get(t, k) {
+          const v = t[k];
+          if (k === "query") return (text: string, ...a: unknown[]) => (sqls.push(String(text)), t.query(text, ...a));
+          if (k === "transaction") {
+            return async (cb: (tx: unknown) => unknown) => {
+              if (hook && first) {
+                first = false;
+                await q(`UPDATE content_purchase SET invoice_id = $2 WHERE id = $1`, [pur, inv]);
+              }
+              return t.transaction((tx: unknown) => cb(spy(tx)));
+            };
+          }
+          return typeof v === "function" ? v.bind(t) : v;
+        },
+      });
+    const done = await createContentService(drizzle(spy(pg, true), { schema }) as unknown as typeof db, { now }).cancelPurchase({ purchaseId: pur });
+    eq([done.status, done.invoiceId], ["cancelled", inv]);
+    eq((await q(`SELECT status FROM invoice WHERE id = $1`, [inv]))[0]!.status, "cancelled", "the invoice was cancelled too");
+    const locks = sqls.filter((t) => /for update/i.test(t)).map((t) => (/from "invoice"/i.test(t) ? "invoice" : /from "content_purchase"/i.test(t) ? "purchase" : "other"));
+    // the first pass (no invoice known) is abandoned; the second takes the invoice lock before the purchase lock
+    eq(locks, ["purchase", "invoice", "purchase"]);
+  });
+});
+

@@ -11,6 +11,27 @@ export function parseDay(iso: string): { y: number; m: number; d: number } {
   return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
 }
 
+/** A real calendar day written YYYY-MM-DD: 2027-02-31 and 2027-13-01 are refused, which the pattern alone would let through. */
+export function isCalendarDay(value: unknown): value is string {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const { y, m, d } = parseDay(value);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d;
+}
+
+/**
+ * A clock time written HH:MM or HH:MM:SS with real values (hour 00-23, minute and second 00-59), returned as HH:MM:SS so two spellings of
+ * one time compare equal as strings; anything else is null (`09:60`, `24:00`, `9:00`).
+ */
+export function normalizeClockTime(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const m = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
+  if (!m) return null;
+  const [h, mi, s] = [Number(m[1]), Number(m[2]), m[3] === undefined ? 0 : Number(m[3])];
+  if (h > 23 || mi > 59 || s > 59) return null;
+  return `${m[1]}:${m[2]}:${String(s).padStart(2, "0")}`;
+}
+
 export function formatDay(y: number, m: number, d: number): string {
   return `${String(y).padStart(4, "0")}-${pad(m)}-${pad(d)}`;
 }

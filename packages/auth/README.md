@@ -35,3 +35,5 @@ Cookies and request handling (the API layer sets the cookie from `token` and pas
 ## Tests
 
 `bun test --timeout 60000` runs `test/auth.test.ts` on PGlite (every migration applied): TOTP against the RFC vector, sign-in, limits, sessions, staff second step, first login, resets.
+
+Hardening notes: sessions are issued under a lock on the user row and re-check the verified password; disabling a user deletes their sessions (re-enabling needs a new sign-in); numeric usernames sign in; the sign-in counter uses the canonical phone number; password changes commit with their audit row and session revocation; a parent reset needs `guardians.manage` in all branches or in a branch of one of the parent's children (the guardian service rule); each TOTP step is accepted once; recovery-code use commits with the session's verified mark.
