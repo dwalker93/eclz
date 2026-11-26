@@ -4,10 +4,11 @@
  *   TEST_DATABASE_URL=postgres://postgres@localhost:5432/postgres bun test test/concurrency.pg.test.ts
  * Each run creates its own database, applies every migration and drops it again.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import postgres from "postgres";
+import { resetConnections } from "./pg-reset";
 
 const url = process.env.TEST_DATABASE_URL;
 const dir = resolve(import.meta.dir, "../drizzle");
@@ -43,6 +44,9 @@ describe.skipIf(!url)("gateway guards under concurrent writes (real PostgreSQL)"
     pidA = (await a`SELECT pg_backend_pid() AS pid`)[0]!.pid;
     pidB = (await b`SELECT pg_backend_pid() AS pid`)[0]!.pid;
   });
+
+  // A test that fails halfway must not leave a connection inside an aborted transaction for the next one.
+  afterEach(() => resetConnections(sql, [{ conn: a, pid: pidA }, { conn: b, pid: pidB }]));
 
   afterAll(async () => {
     a?.release();
@@ -189,3 +193,101 @@ describe.skipIf(!url)("gateway guards under concurrent writes (real PostgreSQL)"
     expect((await sql`SELECT status FROM gateway_transaction WHERE id = ${gt!.id}`)[0]!.status).toBe("failed");
   });
 });
+
+describe.skipIf(!url)("exam result writes against a mode change (real PostgreSQL)", () => {
+  const dbName = `eclz_conc_exam_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  let admin: postgres.Sql;
+  let sql: postgres.Sql;
+  let a: Conn;
+  let b: Conn;
+  let pidA = 0;
+  let pidB = 0;
+  let lecturerId = "";
+  let studentId = "";
+
+  beforeAll(async () => {
+    admin = postgres(url!, { max: 1, onnotice: () => {} });
+    await admin.unsafe(`CREATE DATABASE ${dbName}`);
+    const target = new URL(url!);
+    target.pathname = `/${dbName}`;
+    sql = postgres(target.toString(), { max: 4, onnotice: () => {} });
+    for (const t of tags) await sql.unsafe(readFileSync(join(dir, `${t}.sql`), "utf8"));
+    studentId = (await sql`INSERT INTO student (student_no, full_name, date_of_birth) VALUES ('S1', 'Student', '2014-05-01') RETURNING id`)[0]!.id;
+    lecturerId = crypto.randomUUID();
+    a = await sql.reserve();
+    b = await sql.reserve();
+    pidA = (await a`SELECT pg_backend_pid() AS pid`)[0]!.pid;
+    pidB = (await b`SELECT pg_backend_pid() AS pid`)[0]!.pid;
+  });
+
+  // A test that fails halfway must not leave a connection inside an aborted transaction for the next one.
+  afterEach(() => resetConnections(sql, [{ conn: a, pid: pidA }, { conn: b, pid: pidB }]));
+
+  afterAll(async () => {
+    a?.release();
+    b?.release();
+    await sql?.end({ timeout: 5 });
+    await admin?.unsafe(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+    await admin?.end({ timeout: 5 });
+  });
+
+  /** A draft paper exam; the lecturer row is not what these tests are about, so the exam is made with the foreign keys off for that one insert. */
+  const paperExam = async () => {
+    const c = await sql.reserve();
+    try {
+      await c`SET session_replication_role = replica`;
+      const [row] = await c`INSERT INTO exam (lecturer_id, title, mode, exam_date, max_marks) VALUES (${lecturerId}, 'Paper', 'paper', '2027-03-01', 100) RETURNING id`;
+      return row!.id as string;
+    } finally {
+      // Restored even when the insert throws: the connection goes back to the pool and is reused.
+      await c`SET session_replication_role = origin`.catch(() => undefined);
+      c.release();
+    }
+  };
+  const toOnline = (c: Conn, exam: string) =>
+    c`UPDATE exam SET mode = 'online_mcq', opens_at = now() - interval '1 hour', closes_at = now() + interval '1 day', max_attempts = 1 WHERE id = ${exam}`;
+  const manualResult = (c: Conn, exam: string) => c`INSERT INTO exam_result (exam_id, student_id, marks, source) VALUES (${exam}, ${studentId}, 50, 'manual')`;
+  const blocked = async (pid: number) => {
+    for (let i = 0; i < 100; i++) {
+      const [row] = await sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pid}`;
+      if (row?.wait_event_type === "Lock") return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error("the second write was never blocked behind the first");
+  };
+  const message = async (p: PromiseLike<unknown>) => {
+    try {
+      await p;
+    } catch (e) {
+      return String((e as Error).message);
+    }
+    return "";
+  };
+
+  test("a manual result in flight blocks the change of its draft paper exam to online, and the change then fails", async () => {
+    const exam = await paperExam();
+    await a`BEGIN`;
+    await manualResult(a, exam); // not committed
+    await b`BEGIN`;
+    const change = message(toOnline(b, exam));
+    await blocked(pidB);
+    await a`COMMIT`;
+    expect(await change).toMatch(/exam_status_guard: the mode of an exam with results cannot change/);
+    await b`ROLLBACK`;
+    expect((await sql`SELECT mode FROM exam WHERE id = ${exam}`)[0]!.mode).toBe("paper");
+  });
+
+  test("a mode change to online in flight blocks the manual result, and the result then fails", async () => {
+    const exam = await paperExam();
+    await b`BEGIN`;
+    await toOnline(b, exam); // not committed, no result yet
+    await a`BEGIN`;
+    const insert = message(manualResult(a, exam));
+    await blocked(pidA);
+    await b`COMMIT`;
+    expect(await insert).toMatch(/exam_result_guard: an online exam result comes from an attempt/);
+    await a`ROLLBACK`;
+    expect((await sql`SELECT count(*)::int AS n FROM exam_result WHERE exam_id = ${exam}`)[0]!.n).toBe(0);
+  });
+});
+

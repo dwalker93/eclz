@@ -29,7 +29,7 @@ const grade6 = String((await q(`SELECT id FROM grade_level ORDER BY ordinal LIMI
 const grade7 = String((await q(`SELECT id FROM grade_level ORDER BY ordinal OFFSET 1 LIMIT 1`))[0]!.id);
 const mkStudent = async (b: string, grade?: string) => {
   const s = await id(`INSERT INTO student (student_no, full_name, date_of_birth) VALUES ($1,$2,'2014-05-01')`, [`N${++n}`, `S${n}`]);
-  await q(`INSERT INTO student_branch (student_id, branch_id, is_primary) VALUES ($1,$2,true)`, [s, b]);
+  await q(`INSERT INTO student_branch (student_id, branch_id, is_primary, joined_on) VALUES ($1,$2,true,'2026-01-01')`, [s, b]);
   if (grade) await q(`INSERT INTO student_level (student_id, grade_level_id, from_date) VALUES ($1,$2,'2026-01-01')`, [s, grade]);
   return s;
 };
@@ -275,5 +275,40 @@ describe("who sees a notice on the day it takes effect", () => {
     await q(`UPDATE enrollment SET access_ends_on = '2027-05-01' WHERE course_id = $1 AND student_id = $2`, [c, s]);
     eq(await sees("2027-04-30T10:00:00Z"), true, "the last day before the end");
     eq(await sees("2027-05-01T10:00:00Z"), false, "on the end date, as accessState treats it");
+  });
+
+  test("a promoted pair: the old class's notices stay until the effective day, the new class's start on it", async () => {
+    const oldC = await mkCourse(b1);
+    const newC = await mkCourse(b1);
+    const s = await mkStudent(b1);
+    // the old enrolment is completed at confirmation but its access runs to the effective day, which is exclusive; the successor starts on it
+    await q(`INSERT INTO enrollment (course_id, student_id, status, end_reason, access_starts_on, access_ends_on) VALUES ($1,$2,'completed','promoted','2026-01-01','2027-04-01')`, [oldC, s]);
+    await q(`INSERT INTO enrollment (course_id, student_id, access_starts_on) VALUES ($1,$2,'2027-04-01')`, [newC, s]);
+    await notices.create({ actor: root, branchId: b1, title: "Old class notice", body: "b", targets: [{ type: "course", id: oldC }] });
+    await notices.create({ actor: root, branchId: b1, title: "New class notice", body: "b", targets: [{ type: "course", id: newC }] });
+    const seen = async (at: string) => {
+      let out: string[] = [];
+      await withClock(at, async () => void (out = titles((await notices.listForStudent(s)).filter((x) => x.title.endsWith("class notice")))));
+      return out;
+    };
+    eq(await seen("2027-03-10T10:00:00Z"), ["Old class notice"], "after confirmation, before the effective day");
+    eq(await seen("2027-03-31T10:00:00Z"), ["Old class notice"], "the last day of the old access");
+    eq(await seen("2027-04-01T10:00:00Z"), ["New class notice"], "on the effective day only the new class");
+    eq(await seen("2027-04-02T10:00:00Z"), ["New class notice"], "after it");
+  });
+
+  test("a branch counts from its joined day: the destination branch's notices reach a promoted student on the effective day, not before", async () => {
+    const s = await mkStudent(b1, grade6);
+    // promotion writes the destination branch at confirmation, joined on the effective day
+    await q(`INSERT INTO student_branch (student_id, branch_id, is_primary, joined_on) VALUES ($1,$2,false,'2027-04-01')`, [s, b2]);
+    await notices.create({ actor: root, branchId: b2, title: "Destination branch notice", body: "b", targets: [{ type: "all" }] });
+    await notices.create({ actor: root, branchId: b1, title: "Current branch notice", body: "b", targets: [{ type: "all" }] });
+    const seen = async (at: string) => {
+      let out: string[] = [];
+      await withClock(at, async () => void (out = titles((await notices.listForStudent(s)).filter((x) => x.title.endsWith("branch notice")))));
+      return out;
+    };
+    eq(await seen("2027-03-31T10:00:00Z"), ["Current branch notice"], "before the effective day");
+    eq(await seen("2027-04-01T10:00:00Z"), ["Current branch notice", "Destination branch notice"], "from the effective day");
   });
 });

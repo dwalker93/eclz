@@ -79,14 +79,14 @@ export function createContentRoutes({ db, auth, content, session }: ContentRoute
     const contentId = id(c);
     await requireContentWide(db, c.get("principal").userId, "content.manage", contentId);
     const b = await jsonBody(c, z.object({ title: z.string().trim().min(1).max(200).optional(), description: z.string().max(2000).nullable().optional(), price: price.optional() }));
-    return c.json({ item: await content.updateItem({ contentId, ...b }) });
+    return c.json({ item: await content.updateItem({ actor: c.get("principal").userId, contentId, ...b }) });
   });
 
   app.post("/items/:id/status", async (c) => {
     const contentId = id(c);
     await requireContentWide(db, c.get("principal").userId, "content.manage", contentId);
     const b = await jsonBody(c, z.object({ status: z.enum(["published", "archived"]) }));
-    return c.json({ item: await content.setStatus({ contentId, ...b }) });
+    return c.json({ item: await content.setStatus({ actor: c.get("principal").userId, contentId, ...b }) });
   });
 
   // ---- course layout

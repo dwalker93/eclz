@@ -297,6 +297,22 @@ describe("Yearly promotion", () => {
     eq(r.status === "blocked" ? r.flagged.map((f) => f.reason) : [], ["grade_not_allowed"]);
     eq((await levels(s)).length, 1);
   });
+  test("confirm locks the students (sorted) before the source enrolments, the order reconcileStudent uses", async () => {
+    const cls = await classes([g6, g7], { branch: b2 });
+    const s1 = await pupil(g6);
+    const s2 = await pupil(g6);
+    await enrol.enrollStudent({ studentId: s1, courseId: cls[g6]!.course });
+    await enrol.enrollStudent({ studentId: s2, courseId: cls[g6]!.course });
+    const d = await draft();
+    const log: { text: string; params: unknown[] }[] = [];
+    const logged = createPromotionService(drizzle(pg, { schema, logger: { logQuery: (text: string, params: unknown[]) => void log.push({ text, params }) } }) as unknown as typeof db, { now });
+    await logged.confirm({ runId: d.runId, confirmedBy: staff });
+    const studentLocks = log.map((l, i) => ({ ...l, i })).filter((l) => /from "student" where/.test(l.text) && /for no key update/.test(l.text));
+    const enrolmentLock = log.findIndex((l) => /from "enrollment" where/.test(l.text) && /for update/.test(l.text));
+    eq(enrolmentLock >= 0, true, "the source enrolments were locked");
+    const before = studentLocks.filter((l) => l.i < enrolmentLock).map((l) => String(l.params[0]));
+    eq(before, [s1, s2].sort(), "both students locked, in id order, before the enrolments");
+  });
   test("C14: an old enrolment ended by promotion is still billed for its unbilled months before the effective date", async () => {
     const cls = await classes([g6, g7]);
     const s = await pupil(g6);

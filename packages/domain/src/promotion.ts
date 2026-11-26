@@ -13,7 +13,7 @@ import {
 } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
 import { ensureStudentBranch, resolveFeeStructure } from "./enrollment";
-import { gradeOn, rateFor, todayFor } from "./lookups";
+import { gradeOn, lockStudent, rateFor, todayFor } from "./lookups";
 import { isCalendarDay, nextMonthStart } from "./dates";
 import { ServiceError } from "./errors";
 import { type Db, type Tx } from "./types";
@@ -250,6 +250,11 @@ export function createPromotionService(db: Db, opts: { now?: () => Date } = {}) 
 
           // C14: no enrolment that leaves its class may have been invoiced past the effective date.
           const leaving = items.filter((i) => i.decision === "move" && i.fromEnrollmentId).map((i) => i.fromEnrollmentId!);
+          // Student locks come before enrolment locks, the order reconcileStudent uses (lockStudent, then the enrolment rows): a confirm that took the
+          // enrolments first and waited for the student inside ensureStudentBranch would wait for a reconcile that holds the student and wants the
+          // enrolments, and PostgreSQL would abort one. Sorted, so two confirms over overlapping students cannot cross either. Students whose items are
+          // all skip are untouched and not locked.
+          for (const studentId of [...new Set(items.filter((i) => i.decision !== "skip").map((i) => i.studentId))].sort()) await lockStudent(tx, studentId);
           // The enrolment rows are locked before the invoice check below, and the recurring generator locks them (shared) before it inserts an
           // invoice and re-checks the period against them. Whichever comes second therefore sees the other's result: no old-class invoice can
           // be inserted for a period at or after the effective date between this check and the update.

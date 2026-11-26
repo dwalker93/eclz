@@ -3,7 +3,7 @@ import { branchScope, isCalendarDay, normalizeClockTime, requirePermission, requ
 import { eq } from "drizzle-orm";
 import type { Hono } from "hono";
 import { z } from "zod";
-import { jsonBody } from "./http";
+import { jsonBody, LARGE_JSON_BODY_LIMIT } from "./http";
 import type { Env } from "./session";
 
 const uuid = z.string().uuid();
@@ -71,7 +71,7 @@ export function addAttendanceRoutes(app: Hono<Env>, { db, attendance, students }
     const user = c.get("principal").userId;
     const id = uuid.parse(c.req.param("id"));
     await requirePermission(db, user, "attendance.mark", { branchId: await sessionBranch(id) });
-    const b = await jsonBody(c, z.object({ entries: z.array(entry).min(1).max(500) }));
+    const b = await jsonBody(c, z.object({ entries: z.array(entry).min(1).max(500) }), LARGE_JSON_BODY_LIMIT);
     return c.json(await attendance.mark({ sessionId: id, entries: b.entries, actor: user }));
   });
 

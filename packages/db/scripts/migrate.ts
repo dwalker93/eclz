@@ -4,10 +4,10 @@
  */
 import { resolve } from "node:path";
 import postgres from "postgres";
-import { migrateEachInOwnTransaction, type Run } from "../src/migrate";
+import { migrateEachInOwnTransaction, migrationUrl, type Run } from "../src/migrate";
 
-// A direct (not pooled) connection is the right one for migrations, so DATABASE_URL_DIRECT wins when it is set.
-const url = process.env.DATABASE_URL_DIRECT ?? process.env.DATABASE_URL;
+// A direct (not pooled) connection is the right one for migrations, so a non-empty DATABASE_URL_DIRECT wins; an empty one counts as unset.
+const url = migrationUrl(process.env);
 if (!url) {
   console.error("DATABASE_URL is not set.");
   process.exit(1);

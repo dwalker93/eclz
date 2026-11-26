@@ -11,7 +11,7 @@ const auth = createAuthService(db, { secretKey: process.env.AUTH_SECRET! }); // 
 | Call | What it does |
 |---|---|
 | `signIn({ identifier, password, ip?, userAgent? })` | Email, username or a parent's phone plus password. Every failure is `invalid_credentials` and costs the same time. Returns `{ token, expiresAt, principal }`. |
-| `firstLogin({ phone })` | A parent's first sign-in with the phone number alone, only while the account has no password. The session is restricted to `set_password`. |
+| `firstLogin({ phone })` | A parent's first sign-in with the phone number alone, only while the account has no password. The session is restricted to `set_password`. The lookup runs before the session transaction, so the conditions (same phone, active, no password, portal on, module on, no staff or lecturer role) are checked again under the user lock; if any changed, no session is issued. |
 | `setPassword({ token, newPassword })` | Ends the first login. Signs out the account's other sessions. |
 | `authenticate(token)` | The `Principal` for a token, or `unauthenticated`. Read `principal.restriction` and `principal.portals`. |
 | `verifyMfa({ token, code })` | Authenticator code or a one-time recovery code. |
@@ -26,7 +26,7 @@ const auth = createAuthService(db, { secretKey: process.env.AUTH_SECRET! }); // 
 
 ## Rules
 
-Passwords: argon2id, 10 to 200 characters. Sessions: token stored as a SHA-256 hash, 12 hours for staff, 30 days for everyone else, ended at once when the user is disabled. Second step: required for any staff role other than `lecturer`, optional for others and then required; authenticator secrets are stored encrypted with `secretKey`. Limits per 15 minutes: sign-in 10 per identifier and 60 per address; first login 5 per phone and 30 per address; codes 8 per 10 minutes. Audited (J3): password set, changed and reset, authenticator on and reset.
+Passwords: argon2id, 10 to 200 characters. Sessions: token stored as a SHA-256 hash, 12 hours for staff, 30 days for everyone else, ended at once when the user is disabled. Second step: required for any staff role other than `lecturer`, optional for others and then required; authenticator secrets are stored encrypted with `secretKey`. Limits per 15 minutes: sign-in 10 per identifier (phone spellings count together), 10 per account (whichever identifier reached it: email, username or phone; a success clears only that account, and clears the identifier's count only when it named one account) and 60 per address; first login 5 per phone and 30 per address; codes 8 per 10 minutes. Audited (J3): password set, changed and reset, authenticator on and reset.
 
 ## Not in this package
 

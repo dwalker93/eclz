@@ -187,6 +187,9 @@ const notifications = createNotificationService(db, {
 
 await notifications.runDueSoonJob({ leadDays: 3 }); // run daily: queues installment_due reminders
 await notifications.dispatchQueued({ limit: 100 }); // run every minute or so: sends queued email, SMS and push
+// dispatchQueued claims one row at a time in a short transaction (status `sending`, a 60 second lease in `claimed_until`), calls the provider outside any
+// transaction, then records the result only while the row is still `sending`. A row left `sending` past its lease (the dispatcher died mid-send) becomes
+// `unconfirmed` at the start of the next run, never `queued`, because the provider may already have sent it. Result: { attempted, sent, failed, unconfirmed, lost, expired }.
 await notifications.retryFailed();                  // after fixing a provider key
 await notifications.listInApp({ userId, unreadOnly: true });
 await notifications.markRead({ userId, ids });
@@ -370,7 +373,7 @@ await notices.listForStaff(userId);                                  // live not
 - `resolveIdentity` (A1, A3): staff roles, lecturer, student, guardian and which portals are open. `canAccessStudent`: the student, a linked guardian (parent_portal on), or staff with `students.read` in the student's branch.
 - `requireModule(q, name)` and `gateModule(db, name, service, jobs)` (K). `createExamService` is gated by `online_exams` and `createContentService` by `content_store`; their scheduled jobs return an empty result when the module is off, payment hooks always pass through.
 - Questions belong to the lecturer who created them: `createQuestion` and `updateQuestion` take an `actor` (a user id, or null for a trusted system call) and allow only that lecturer or a root administrator.
-- Parent first sign-in: `findFirstLoginUser({ phone })` finds the guardian login by phone while it has no password (parent_portal on, portal enabled, active), `setInitialPassword` saves the first password once, and `resolveIdentity(...).needsPasswordSetup` tells sign-in to open the set-password form.
+- Parent first sign-in: `findFirstLoginUser({ phone })` (its conditions are repeated inside the session transaction by `firstLoginStillValidIn(tx, userId, phone)`, because a change can commit between the lookup and the session) finds the guardian login by phone while it has no password (parent_portal on, portal enabled, active), `setInitialPassword` saves the first password once, and `resolveIdentity(...).needsPasswordSetup` tells sign-in to open the set-password form.
 - `authorizeStudent` / `requireStudent` (I2): staff may use a permission on a student through an all-branches assignment or any branch the student belongs to. A student in no branch is reachable only through an all-branches assignment, so registration takes a `branchId`.
 - `createAccessControlService(db)`: `assignRole`, `revokeRole`, `setUserStatus`, `setLecturerPortal`, `listAssignments`. The last active all-branches root admin cannot be revoked or disabled (A7, `last_root_admin`). Role, status and portal changes are audited (J3).
 

@@ -2,6 +2,7 @@
  * Commission accrual and reversal hooked into payment verify and void (H rules).
  */
 import { afterAll, describe, test } from "bun:test";
+import { sql } from "drizzle-orm";
 import {
   createCommissionService,
   createEnrollmentService,
@@ -236,6 +237,75 @@ describe("Commission accrual and reversal", () => {
     eq(e[0]!.status, "settled");
     eq([e[1]!.entry_type, e[1]!.base_amount, e[1]!.commission_amount, e[1]!.teacher_amount, e[1]!.status], ["reversal", "-10000.00", "-1000.00", "-9000.00", "accrued"]);
     eq(e[1]!.reverses_entry_id, e[0]!.id);
+  });
+  test("H7: a voided allocation replayed into accrue accrues nothing, even from a stale copy", async () => {
+    const lec = await lecturer();
+    await setRule(lec, "percent", 10);
+    const sc = await scenario([{ lec, share: 100 }]);
+    const p = await payIt(sc, "10000");
+    const v = await pay.voidPayment({ paymentId: p, voidedBy: staff, reason: "bounced" });
+    for (const allocations of [v.reversedAllocations, v.reversedAllocations.map((a) => ({ ...a, reversedAt: null }))]) {
+      const r = await db.transaction((tx) => commissions.accrue(tx, { allocations }));
+      eq(r.created.length, 0);
+      eq(r.skipped.map((x) => x.reason), ["allocation_reversed"]);
+    }
+    eq((await entries(lec)).map((x) => x.status), ["void"]);
+  });
+  test("H5: a fixed amount that does not divide by the shares still totals exactly", async () => {
+    const a = await lecturer(), b = await lecturer();
+    await setRule(a, "fixed_per_student_month", 1.01);
+    await setRule(b, "fixed_per_student_month", 1.01);
+    const sc = await scenario([{ lec: a, share: 50 }, { lec: b, share: 50 }]);
+    await payIt(sc, "10000");
+    const total = Number((await entries(a))[0]!.commission_amount) + Number((await entries(b))[0]!.commission_amount);
+    eq(total.toFixed(2), "1.01");
+  });
+  test("a linked positive adjustment raises the fee's net once, and the fixed commission is fully accrued", async () => {
+    const lec = await lecturer();
+    await setRule(lec, "fixed_per_student_month", 1000);
+    const sc = await scenario([{ lec, share: 100 }]);
+    await inv.addInvoiceLine({ invoiceId: sc.invoiceId, kind: "adjustment", amount: "2000", appliesToItemId: sc.item, description: "Extra", createdBy: staff, reason: "Materials" });
+    await payIt(sc, "6000");
+    await payIt(sc, "6000");
+    const e = await entries(lec);
+    eq(e.reduce((t, x) => t + Number(x.commission_amount), 0).toFixed(2), "1000.00");
+    eq(e.length, 2);
+  });
+  test("H7: a void whose entry was settled in the meantime reverses it instead of failing", async () => {
+    const lec = await lecturer();
+    await setRule(lec, "percent", 10);
+    const sc = await scenario([{ lec, share: 100 }]);
+    await payIt(sc, "10000");
+    const alloc = String((await q(`SELECT id FROM payment_allocation WHERE invoice_id = $1`, [sc.invoiceId]))[0]!.id);
+    const payout = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable) VALUES ($1,'2027-03-01','2027-04-01',0,0,0)`, [lec]);
+    const summary = await db.transaction(async (tx) => {
+      // "A payout settles the entry" right after reverse has read it as accrued and before its update runs: the first select resolves, then the settle happens.
+      let first = true;
+      const settle = () => tx.execute(sql`UPDATE commission_entry SET status = 'settled', payout_id = ${payout} WHERE payment_allocation_id = ${alloc}`);
+      const wrap = (b: object): object =>
+        new Proxy(b, {
+          get(t, k, r) {
+            if (k === "then") return (ok: (v: unknown) => unknown, err: (e: unknown) => unknown) => (t as Promise<unknown>).then(async (rows) => { await settle(); return rows; }).then(ok, err);
+            const v = Reflect.get(t, k, r);
+            return typeof v === "function" ? (...a: unknown[]) => wrap((v as (...x: unknown[]) => object).apply(t, a)) : v;
+          },
+        });
+      const racing = new Proxy(tx, {
+        get(t, k, r) {
+          if (k !== "select") return Reflect.get(t, k, r);
+          return (...a: unknown[]) => {
+            const b = (t.select as (...x: unknown[]) => object)(...a);
+            if (!first) return b;
+            first = false;
+            return wrap(b);
+          };
+        },
+      });
+      return commissions.reverse(racing as typeof tx, { reversedAllocations: [{ id: alloc }] as never });
+    });
+    eq(summary.voided.length, 0);
+    eq(summary.reversed.length, 1);
+    eq((await entries(lec)).map((x) => x.status), ["settled", "accrued"]);
   });
   test("a failing accrual rolls back the verification", async () => {
     const lec = await lecturer();

@@ -138,10 +138,16 @@ export async function guardianInScope(q: Q, actor: string, guardianId: string): 
   return !!hit;
 }
 
-/** The canonical spelling (lower-case, hyphenated) of any form PostgreSQL accepts for a uuid; anything else is returned unchanged. */
+/**
+ * The canonical spelling (lower-case, hyphenated) of a uuid, for the spellings PostgreSQL accepts: groups of four hex digits, with an optional hyphen after
+ * any group, the whole value optionally in one pair of braces. The complete spelling is checked before anything is removed, so `a0ee{bc99...` is not
+ * quietly repaired into a valid id. Anything else is returned unchanged.
+ */
 export function canonicalUuid(value: string): string {
-  const h = value.replace(/[{}-]/g, "").toLowerCase();
-  return /^[0-9a-f]{32}$/.test(h) ? `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}` : value;
+  const inner = value.startsWith("{") && value.endsWith("}") ? value.slice(1, -1) : value;
+  if (!/^([0-9a-f]{4}-?){7}[0-9a-f]{4}$/i.test(inner)) return value;
+  const h = inner.replace(/-/g, "").toLowerCase();
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
 export async function isRootAdmin(q: Q, userId: string): Promise<boolean> {
@@ -237,6 +243,9 @@ export async function examResultScope(q: Q, userId: string, code: PermissionCode
  * branch the item is currently listed in (an item listed nowhere needs an all-branches assignment). A manager of only one of two listing
  * branches would otherwise change the other branch's storefront. The owning lecturer, with the lecturer role's permission and an open portal,
  * still passes, as in `authorizeResource`.
+ *
+ * Call it inside the transaction that writes the item, after the item row is locked: adding a listing locks the same row, so the listings read here
+ * are the ones the write will see.
  */
 export async function requireContentWide(q: Q, userId: string, code: PermissionCode, contentId: string): Promise<void> {
   if (!(await isActive(q, userId))) throw new ServiceError("forbidden", `You may not do this (${code}).`);
@@ -363,6 +372,26 @@ export async function setInitialPasswordIn(tx: Tx, input: { userId: string; pass
   await writeAudit(tx, { actor: u.id, action: "user.password_set", entityType: "user", entityId: u.id });
 }
 
+/**
+ * The first-login conditions (A1), checked again inside the caller's transaction after it has locked the user row. `findFirstLoginUser` reads outside
+ * any transaction, so a phone change, a password, a disabled portal, a switched-off module or a new staff or lecturer assignment can commit between that
+ * lookup and the session being issued. True only if the account still has this normalized phone, is active with no password, has a guardian record with
+ * the portal on, the parent_portal module is on, and it has no staff assignment and no lecturer record.
+ */
+export async function firstLoginStillValidIn(tx: Tx, userId: string, phone: string): Promise<boolean> {
+  if (!(await isModuleOn(tx, "parent_portal"))) return false;
+  const [row] = await tx
+    .select({ id: user.id })
+    .from(user)
+    .innerJoin(guardian, eq(guardian.userId, user.id))
+    .where(and(eq(user.id, userId), eq(user.phone, phone), eq(user.status, "active"), isNull(user.passwordHash), eq(guardian.portalEnabled, true)))
+    .limit(1);
+  if (!row) return false;
+  const [staff] = await tx.select({ id: staffRoleAssignment.id }).from(staffRoleAssignment).where(eq(staffRoleAssignment.userId, userId)).limit(1);
+  const [lec] = await tx.select({ id: lecturer.id }).from(lecturer).where(eq(lecturer.userId, userId)).limit(1);
+  return !staff && !lec;
+}
+
 export function createAccessControlService(db: Db) {
   async function rootAdmins(tx: Tx, exceptUser?: string) {
     return tx
@@ -437,8 +466,9 @@ export function createAccessControlService(db: Db) {
           }
         }
         const [row] = await tx.update(user).set({ status: input.status }).where(eq(user.id, u.id)).returning();
-        // Disabling ends every session for good: re-enabling the account must need a new sign-in, never revive an old token.
-        if (input.status === "disabled") await tx.delete(authSession).where(eq(authSession.userId, u.id));
+        // Every status change ends every session: disabling ends them for good, and enabling clears any that survived from before sessions were
+        // deleted on disable (migration 0031 clears those of accounts still disabled). Re-enabling must need a new sign-in, never revive an old token.
+        await tx.delete(authSession).where(eq(authSession.userId, u.id));
         await writeAudit(tx, { actor: input.actor, action: input.status === "disabled" ? "user.disable" : "user.enable", entityType: "user", entityId: u.id, before: { status: u.status }, after: { status: input.status }, reason: input.reason });
         return row!;
       });

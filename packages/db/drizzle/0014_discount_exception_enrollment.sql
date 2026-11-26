@@ -49,7 +49,24 @@ $$ LANGUAGE plpgsql;
 --> statement-breakpoint
 
 -- The trigger looks discounts up by the item they reduce, which nothing indexed; without this each checked line could scan the whole table.
-CREATE INDEX "invoice_item_applies_to_idx" ON "invoice_item" USING btree ("applies_to_item_id");
+-- On a large table an operator can build it first with CREATE INDEX CONCURRENTLY (README, "Upgrading a running deployment"), so accept an index of this name
+-- that is valid and is exactly the one below, create it when the name is free, and stop on anything else rather than treat the name as success.
+DO $$
+DECLARE
+  existing oid := to_regclass('public.invoice_item_applies_to_idx');
+  usable boolean;
+BEGIN
+  IF existing IS NULL THEN
+    CREATE INDEX "invoice_item_applies_to_idx" ON "invoice_item" USING btree ("applies_to_item_id");
+  ELSE
+    SELECT i.indisvalid AND i.indisready AND i.indislive
+           AND pg_get_indexdef(existing) = 'CREATE INDEX invoice_item_applies_to_idx ON public.invoice_item USING btree (applies_to_item_id)'
+      INTO usable FROM pg_index i WHERE i.indexrelid = existing;
+    IF usable IS NOT TRUE THEN
+      RAISE EXCEPTION 'invoice_item_applies_to_idx already exists but is not a valid btree index on invoice_item (applies_to_item_id) (%). Drop it (DROP INDEX CONCURRENTLY public.invoice_item_applies_to_idx), build it again with CREATE INDEX CONCURRENTLY invoice_item_applies_to_idx ON invoice_item USING btree (applies_to_item_id), and run this migration again.', pg_get_indexdef(existing) USING ERRCODE = 'duplicate_table';
+    END IF;
+  END IF;
+END $$;
 --> statement-breakpoint
 
 CREATE CONSTRAINT TRIGGER "invoice_item_discount_enrollment"

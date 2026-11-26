@@ -30,7 +30,11 @@ export const NOTIFICATION_EVENTS = [
   "exam_published",
   "notice",
 ] as const;
-export const NOTIFICATION_STATUSES = ["queued", "sent", "failed"] as const;
+/**
+ * `failed` means the provider answered with a refusal, or nothing was sent at all: sending again cannot duplicate it. `unconfirmed` means the call timed out or
+ * was cut off, so the provider may still have accepted the message; it is not retried by `retryFailed`.
+ */
+export const NOTIFICATION_STATUSES = ["queued", "sending", "sent", "failed", "unconfirmed"] as const;
 
 /**
  * Per-buyer channel switches (J1). In-app is always available. A disabled external channel creates
@@ -79,7 +83,7 @@ export const notificationTemplate = pgTable(
 /**
  * One row per (user, event_key, channel). event_key identifies the event and the thing that caused it (an invoice installment,
  * a payment, a session) so retrying the enqueue does not create a second row (J2). That is enqueue deduplication only: it does not stop a second send of the same
- * row (a provider can accept a message and the dispatch transaction still roll back before `status = 'sent'` commits, so delivery is at least once). Two events with the same event_key therefore share one row per user and channel,
+ * row (a provider can accept a message and the dispatcher still stop before it records `sent`; that row is left `sending` and becomes `unconfirmed` when its lease runs out, never `queued`, so it is not sent again by itself, and an operator settles it; and a row the provider rejected is marked `failed` and skipped by later dispatches until an operator calls `retryFailed`, so a message can also go out zero times). Two events with the same event_key therefore share one row per user and channel,
  * so a key must be unique per event (the installment reminder uses `due:<invoice>:<seq>`). read_at tracks in-app reads.
  */
 export const notification = pgTable(
@@ -95,6 +99,8 @@ export const notification = pgTable(
     eventKey: text("event_key").notNull(),
     payload: jsonb("payload"),
     status: text("status").notNull().default("queued"),
+    /** Lease on a row being sent (status `sending`): the dispatcher that claimed it owns it until this time. An expired lease means the provider outcome is unknown. */
+    claimedUntil: tstz("claimed_until"),
     sentAt: tstz("sent_at"),
     readAt: tstz("read_at"),
     error: text("error"),
@@ -106,10 +112,13 @@ export const notification = pgTable(
     oneOf("notification_status_check", t.status, NOTIFICATION_STATUSES),
     check("notification_sent_check", sql`${t.status} <> 'sent' OR ${t.sentAt} IS NOT NULL`),
     check("notification_failed_check", sql`${t.status} <> 'failed' OR ${t.error} IS NOT NULL`),
+    check("notification_sending_check", sql`${t.status} <> 'sending' OR ${t.claimedUntil} IS NOT NULL`),
+    check("notification_unconfirmed_check", sql`${t.status} <> 'unconfirmed' OR ${t.error} IS NOT NULL`),
     // J2
     uniqueIndex("notification_dedupe_uq").on(t.userId, t.eventKey, t.channel),
     index("notification_user_idx").on(t.userId, t.createdAt),
     index("notification_queue_idx").on(t.status).where(sql`${t.status} = 'queued'`),
+    index("notification_sending_idx").on(t.claimedUntil).where(sql`${t.status} = 'sending'`),
   ],
 );
 

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -15,6 +15,8 @@ const validated = async (pg: PGlite) =>
 describe("upgrade across 0014 and 0026: discount lines from before the exception key", () => {
   const pg = new PGlite({ extensions: { btree_gist } });
   afterAll(() => pg.close());
+  // A fixture that fails between SET ... replica and the reset must not leave the next test running without foreign keys and triggers.
+  afterEach(() => pg.exec(`SET session_replication_role = DEFAULT`));
 
   test("0014 adds both constraints unvalidated, still refuses new bad rows, and 0026 validates them after the backfill", async () => {
     const at = tags.indexOf("0014_discount_exception_enrollment");
@@ -48,6 +50,8 @@ describe("upgrade across 0014 and 0026: discount lines from before the exception
 describe("upgrade across 0014: a legacy discount linked across enrolments", () => {
   const pg = new PGlite({ extensions: { btree_gist } });
   afterAll(() => pg.close());
+  // A fixture that fails between SET ... replica and the reset must not leave the next test running without foreign keys and triggers.
+  afterEach(() => pg.exec(`SET session_replication_role = DEFAULT`));
 
   test("0014 stops and lists the discount whose enrolment differs from the item it reduces, and runs once they match", async () => {
     const at = tags.indexOf("0014_discount_exception_enrollment");
@@ -87,3 +91,46 @@ describe("upgrade across 0014: a legacy discount linked across enrolments", () =
     expect((await pg.query<{ enrollment_id: string }>(`SELECT enrollment_id FROM invoice_item WHERE id = ANY($1) ORDER BY id`, [[good, bad]])).rows.every((r) => r.enrollment_id === enrolA)).toBe(true);
   });
 });
+
+describe("0014 and a prebuilt invoice_item_applies_to_idx", () => {
+  const IDX = "invoice_item_applies_to_idx";
+  const before = async (prebuilt?: string) => {
+    const pg = new PGlite({ extensions: { btree_gist } });
+    const at = tags.indexOf("0014_discount_exception_enrollment");
+    for (const t of tags.slice(0, at)) await apply(pg, t);
+    if (prebuilt) await pg.exec(prebuilt);
+    return { pg, at };
+  };
+  const count = async (pg: PGlite) => (await pg.query(`SELECT 1 FROM pg_indexes WHERE indexname = '${IDX}'`)).rows.length;
+
+  test("an operator-built matching index is kept and the migration succeeds; with none, the migration builds it", async () => {
+    const built = await before(`CREATE INDEX ${IDX} ON invoice_item USING btree (applies_to_item_id)`);
+    await apply(built.pg, tags[built.at]!);
+    expect(await count(built.pg)).toBe(1);
+    await built.pg.close();
+    const none = await before();
+    await apply(none.pg, tags[none.at]!);
+    expect(await count(none.pg)).toBe(1);
+    await none.pg.close();
+  });
+
+  test("an index of that name that is on other columns, partial, or unique stops the migration with the repair, and a retry after dropping it works", async () => {
+    for (const prebuilt of [`CREATE INDEX ${IDX} ON invoice_item USING btree (invoice_id)`, `CREATE INDEX ${IDX} ON invoice_item USING btree (applies_to_item_id) WHERE kind = 'discount'`, `CREATE UNIQUE INDEX ${IDX} ON invoice_item USING btree (applies_to_item_id)`]) {
+      const { pg, at } = await before(prebuilt);
+      let msg = "";
+      try {
+        await apply(pg, tags[at]!);
+      } catch (e) {
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/invoice_item_applies_to_idx already exists but is not a valid btree index/);
+      expect(msg).toMatch(/CREATE INDEX CONCURRENTLY/);
+      // the failed migration rolled back whole; once the index is dropped it runs
+      await pg.exec(`DROP INDEX ${IDX}`);
+      await apply(pg, tags[at]!);
+      expect(await count(pg)).toBe(1);
+      await pg.close();
+    }
+  });
+});
+

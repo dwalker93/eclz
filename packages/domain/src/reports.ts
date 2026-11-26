@@ -84,7 +84,7 @@ export function createReportService(db: Db, opts: { now?: () => Date } = {}) {
         );
         const owed = sql`(${invoice.total} - ${invoice.amountPaid})`;
         const late = sql`(${asOf}::date - ${invoice.dueDate})`;
-        const money = (e: ReturnType<typeof sql>) => sql<string>`coalesce(${e}, 0)::numeric(14,2)::text`;
+        const money = (e: ReturnType<typeof sql>) => sql<string>`round(coalesce(${e}, 0), 2)::text`;
 
         // Totals, aging and branches are computed by the database; only the requested page of invoices is read.
         const [t] = await tx

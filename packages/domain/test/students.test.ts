@@ -2,7 +2,7 @@
  * Student registration (B1, B2) and automatic guardian logins.
  */
 import { afterAll, describe, test } from "bun:test";
-import { ageOn, createAttendanceService, createStudentService } from "../src";
+import { ageOn, createAccessControlService, createAttendanceService, createStudentService } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -15,7 +15,13 @@ await q(`UPDATE organization SET timezone = 'UTC', guardian_required_below_age =
 const org = String((await q(`SELECT id FROM organization`))[0]!.id);
 await q(`INSERT INTO notification_channel (organization_id, channel, is_enabled) VALUES ($1,'sms',true) ON CONFLICT (organization_id, channel) DO UPDATE SET is_enabled = true`, [org]);
 const now = () => new Date("2027-03-10T10:00:00Z");
-const students = createStudentService(db, { now });
+const service = createStudentService(db, { now });
+const acl = createAccessControlService(db);
+const newUser = () => id(`INSERT INTO "user" (email, status) VALUES ($1, 'active')`, [`u${Math.random().toString(36).slice(2)}@example.com`]);
+const root = await newUser();
+await acl.assignRole({ userId: root, roleName: "root_admin", actor: root });
+/** Registers as the all-branches administrator unless a test names another actor. */
+const students = { ...service, register: (i: Omit<Parameters<typeof service.register>[0], "actor"> & { actor?: string }) => service.register({ actor: root, ...i }) };
 const parent = (over: Partial<{ fullName: string; phone: string; address: string; email: string }> = {}) => ({
   fullName: "Kamala Perera",
   phone: "077 123 4567",
@@ -324,5 +330,36 @@ describe("branch, list, get, update", () => {
     await fails("invalid_input", () => students.update({ studentId: r.student.id, actor, dateOfBirth: "1/1/90" }));
     await fails("invalid_input", () => students.update({ studentId: r.student.id, actor, status: "gone" as never }));
     await fails("not_found", () => students.update({ studentId: "00000000-0000-0000-0000-000000000000", actor, fullName: "X" }));
+  });
+});
+
+describe("guardian reuse at registration is scoped like guardians.link", () => {
+  test("a branch-only caller cannot pull in another branch's guardian by a different spelling of the phone; sibling and orphan reuse still work", async () => {
+    const editorA = await newUser();
+    await acl.assignRole({ userId: editorA, roleName: "student_counselor", branchId: b1, actor: root });
+    // a guardian of a branch-2 student, stored in the legacy local format
+    const other = await id(`INSERT INTO guardian (full_name, phone, address) VALUES ('Branch B Parent', '0777000888', 'Galle')`);
+    const kidB = (await students.register({ fullName: "B Kid", dateOfBirth: "2000-01-01", branchId: b2 })).student.id;
+    await q(`INSERT INTO student_guardian (student_id, guardian_id, is_primary) VALUES ($1,$2,true)`, [kidB, other]);
+    const counts = async () => [(await q(`SELECT count(*)::int AS c FROM student`))[0]!.c, (await q(`SELECT count(*)::int AS c FROM student_guardian WHERE guardian_id = $1`, [other]))[0]!.c];
+    const before = await counts();
+
+    await fails("forbidden", () => students.register({ actor: editorA, fullName: "A Kid", dateOfBirth: "2015-01-01", branchId: b1, guardians: [parent({ phone: "+94 77 700 0888" })] }));
+    eq(await counts(), before, "nothing was created and nothing linked");
+
+    // a guardian of a branch-1 student: sibling reuse by the branch-1 caller is allowed
+    const sib = await students.register({ actor: editorA, fullName: "A Sib 1", dateOfBirth: "2015-01-01", branchId: b1, guardians: [parent({ phone: "0777000889", fullName: "A Parent" })] });
+    const sib2 = await students.register({ actor: editorA, fullName: "A Sib 2", dateOfBirth: "2016-01-01", branchId: b1, guardians: [parent({ phone: "+94 77 700 0889" })] });
+    eq(sib2.guardians[0]!.guardianId, sib.guardians[0]!.guardianId, "sibling reuse");
+    eq(sib2.guardians[0]!.created, false, "not duplicated");
+
+    // a guardian with no student yet can be reused by anyone who registers
+    const orphan = await id(`INSERT INTO guardian (full_name, phone) VALUES ('Orphan Parent', '0777000890')`);
+    const viaOrphan = await students.register({ actor: editorA, fullName: "A Orphan Kid", dateOfBirth: "2015-01-01", branchId: b1, guardians: [parent({ phone: "+94 77 700 0890" })] });
+    eq(viaOrphan.guardians[0]!.guardianId, orphan, "orphan reuse");
+
+    // an all-branches administrator may reuse the branch-2 guardian
+    const byRoot = await students.register({ fullName: "Root Kid", dateOfBirth: "2015-01-01", branchId: b1, guardians: [parent({ phone: "+94 77 700 0888" })] });
+    eq(byRoot.guardians[0]!.guardianId, other, "all-branches reuse");
   });
 });

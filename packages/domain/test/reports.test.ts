@@ -215,6 +215,26 @@ describe("overdue report totals and pages", () => {
   });
 });
 
+describe("overdue report totals are not capped", () => {
+  test("a total beyond twelve integer digits is returned exactly, even for a one-row page; no match is 0.00", async () => {
+    // each invoice fits numeric(12,2); 1,001 of them owing 1,000,000,000.00 sum to 1,001,000,000,000.00 (13 integer digits)
+    await q(
+      `INSERT INTO invoice (student_id, branch_id, issued_on, due_date, subtotal, total, amount_paid, status)
+       SELECT $1, $2, '2020-01-01', '2020-02-01', 1000000000.00, 1000000000.00, 0, 'pending' FROM generate_series(1, 1001)`,
+      [sA, b1],
+    );
+    const r = await reports.overdue({ actor: root, limit: 1 });
+    eq(r.count, 1001, "count");
+    eq(r.outstanding, "1001000000000.00", "total");
+    eq(r.aging["61+"], "1001000000000.00", "aging bucket");
+    eq(r.byBranch.find((b) => b.branchId === b1)!.outstanding, "1001000000000.00", "branch total");
+    eq(r.rows[0]!.outstanding, "1000000000.00", "row");
+    await q(`DELETE FROM invoice`);
+    const none = await reports.overdue({ actor: root, limit: 1 });
+    eq([none.count, none.outstanding, none.aging["61+"], none.byBranch], [0, "0.00", "0.00", []], "nothing matches");
+  });
+});
+
 describe("collections input and snapshot", () => {
   test("impossible calendar dates are refused before the span is measured; a 366-day period is accepted", async () => {
     for (const [from, to] of [["2025-01-01", "2027-13-01"], ["2025-02-30", "2025-03-01"], ["2025-00-10", "2025-03-01"]]) {

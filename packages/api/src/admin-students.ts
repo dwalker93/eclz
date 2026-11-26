@@ -75,7 +75,7 @@ export function addStudentRoutes(app: Hono<Env>, { db, students, enrollment: enr
     const user = c.get("principal").userId;
     const b = await jsonBody(c, registerBody);
     await requirePermission(db, user, "students.create", { branchId: b.branchId });
-    const r = await students.register(b);
+    const r = await students.register({ ...b, actor: user });
     return c.json({ student: r.student, guardians: r.guardians }, 201);
   });
 

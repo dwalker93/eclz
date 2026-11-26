@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, ne } from "drizzle-orm";
 import {
   guardian,
   invoice,
@@ -60,7 +60,7 @@ export async function resolveGuardianRecipients(tx: Tx, org: OrgRow, studentId: 
 }
 
 /** J1: in-app always, plus each external channel whose module flag and channel switch are both on. */
-export async function activeChannels(tx: Tx, org: OrgRow): Promise<string[]> {
+export async function activeChannels(tx: Tx | Db, org: OrgRow): Promise<string[]> {
   const channels: string[] = ["in_app"];
   const enabled = await tx
     .select()
@@ -168,12 +168,31 @@ export interface EmailMessage { to: string; subject: string; body: string }
 export interface SmsMessage { to: string; body: string }
 export interface PushMessage { subscription: { endpoint: string; p256dhKey: string; authKey: string }; title: string; body: string }
 
-/** Each sender throws on failure; the message becomes the notification's error. A missing provider fails its rows with a clear reason. */
+/** Passed to every send. The key is the notification's id: stable across retries of the same row, so a provider that supports one can refuse a duplicate. */
+export interface SendContext { idempotencyKey: string }
+
+/**
+ * Each sender throws on failure; the message becomes the notification's error. A missing provider fails its rows with a clear reason.
+ * A sender throws `ProviderOutcomeUnknown` when it cannot tell whether the provider accepted the message (a timeout, a connection cut after the request went
+ * out); any other error means the provider refused it or never got it.
+ * `idempotent` names the channels whose sender passes `ctx.idempotencyKey` to a provider that refuses a second message with the same key. Only those
+ * channels may re-send an `unconfirmed` row (`retryUnconfirmed`); none is assumed.
+ */
 export interface Providers {
-  email?: (m: EmailMessage) => Promise<void>;
-  sms?: (m: SmsMessage) => Promise<void>;
-  push?: (m: PushMessage) => Promise<void>;
+  email?: (m: EmailMessage, ctx: SendContext) => Promise<void>;
+  sms?: (m: SmsMessage, ctx: SendContext) => Promise<void>;
+  push?: (m: PushMessage, ctx: SendContext) => Promise<void>;
+  idempotent?: { email?: boolean; sms?: boolean; push?: boolean };
 }
+
+/** The send may or may not have reached the recipient: the row becomes `unconfirmed`, not `failed`, because sending it again could duplicate it. */
+export class ProviderOutcomeUnknown extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProviderOutcomeUnknown";
+  }
+}
+const isUnknownOutcome = (e: unknown) => e instanceof ProviderOutcomeUnknown || (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError"));
 
 /** Sri Lankan numbers as text.lk wants them: country code, no plus or spaces. 0771234567 becomes 94771234567. */
 export function normalizeSriLankaPhone(raw: string): string | null {
@@ -190,14 +209,14 @@ export function normalizeSriLankaPhone(raw: string): string | null {
 export const PROVIDER_TIMEOUT_MS = 15_000;
 
 /** text.lk v3 plain SMS (POST app.text.lk/api/v3/sms/send, bearer token). `fetch` is injectable for tests. */
-export function createTextLkSms(opts: { apiToken: string; senderId: string; fetch?: typeof fetch }): NonNullable<Providers["sms"]> {
+export function createTextLkSms(opts: { apiToken: string; senderId: string; fetch?: typeof fetch; timeoutMs?: number }): (m: SmsMessage, ctx?: SendContext) => Promise<void> {
   const doFetch = opts.fetch ?? fetch;
   return async ({ to, body }) => {
     const res = await doFetch("https://app.text.lk/api/v3/sms/send", {
       method: "POST",
       headers: { Authorization: `Bearer ${opts.apiToken}`, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ recipient: to, sender_id: opts.senderId, type: "plain", message: body }),
-      signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? PROVIDER_TIMEOUT_MS),
     });
     const json = (await res.json().catch(() => null)) as { status?: string; message?: string } | null;
     if (!res.ok || json?.status !== "success") throw new Error(`text.lk: ${json?.message ?? `HTTP ${res.status}`}`);
@@ -210,23 +229,33 @@ export interface DispatchResult {
   attempted: number;
   sent: number;
   failed: number;
-  /** Rows another worker held at the time; they are left for that worker. */
-  skipped: number;
+  /** Rows whose provider call timed out: the message may still arrive, so they wait for `resolveUnconfirmed` or `retryUnconfirmed`. Not counted in `failed`. */
+  unconfirmed: number;
+  /** Rows this run sent whose lease had already run out, so another run had marked them `unconfirmed`: the outcome could not be recorded and is left to `resolveUnconfirmed`. */
+  lost: number;
+  /** Rows found `sending` with an expired lease (a dispatcher stopped mid-send) and moved to `unconfirmed`. */
+  expired: number;
 }
+
+/** How long a dispatcher owns a row it is sending. It must outlast the slowest send: one provider timeout for email and sms, and for push every device that is still tried. */
+export const DISPATCH_LEASE_MS = 60_000;
 
 const shortError = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 300) || "send failed";
 
-export function createNotificationService(db: Db, opts: { now?: () => Date; providers?: Providers; providerTimeoutMs?: number } = {}) {
+export function createNotificationService(db: Db, opts: { now?: () => Date; providers?: Providers; providerTimeoutMs?: number; leaseMs?: number } = {}) {
   const timeoutMs = opts.providerTimeoutMs ?? PROVIDER_TIMEOUT_MS;
+  const leaseMs = Math.max(opts.leaseMs ?? DISPATCH_LEASE_MS, timeoutMs + 1000);
   const now = () => (opts.now ?? (() => new Date()))();
   const providers = opts.providers ?? {};
 
-  /** Bounds any provider call (email, sms, push) so a silent gateway cannot hold the row lock and connection. */
+  /** Bounds any provider call (email, sms, push) so a silent gateway cannot keep a send (and its lease) open for long. */
   async function withTimeout<T>(call: Promise<T>): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const limit = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`provider timed out after ${timeoutMs} ms`)), timeoutMs);
+      timer = setTimeout(() => reject(new ProviderOutcomeUnknown(`provider did not answer within ${timeoutMs} ms; the message may still be delivered`)), timeoutMs);
     });
+    // The call keeps running after the deadline; a late rejection must not surface as an unhandled one.
+    call.catch(() => undefined);
     try {
       return await Promise.race([call, limit]);
     } finally {
@@ -234,7 +263,7 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     }
   }
 
-  async function sendOne(tx: Tx, row: typeof notification.$inferSelect, org: OrgRow): Promise<void> {
+  async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number): Promise<void> {
     const ext = EXTERNAL.find((e) => e.channel === row.channel);
     if (!ext) throw new Error("not an external channel");
     // J1: a channel switched off after queueing is not attempted.
@@ -248,72 +277,121 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     if (row.channel === "email") {
       if (!u.email) throw new Error("no email address");
       if (!providers.email) throw new Error("no email provider configured");
-      await withTimeout(providers.email({ to: u.email, subject: msg.subject, body: msg.body }));
+      await withTimeout(providers.email({ to: u.email, subject: msg.subject, body: msg.body }, { idempotencyKey: row.id }));
     } else if (row.channel === "sms") {
       const to = u.phone ? normalizeSriLankaPhone(u.phone) : null;
       if (!to) throw new Error(u.phone ? "invalid phone number" : "no phone number");
       if (!providers.sms) throw new Error("no sms provider configured");
-      await withTimeout(providers.sms({ to, body: msg.body }));
+      await withTimeout(providers.sms({ to, body: msg.body }, { idempotencyKey: row.id }));
     } else {
       const subs = await tx.select().from(pushSubscription).where(eq(pushSubscription.userId, row.userId)).orderBy(asc(pushSubscription.id));
       if (subs.length === 0) throw new Error("no push subscription");
       if (!providers.push) throw new Error("no push provider configured");
       let delivered = 0;
-      let last = "";
+      let last: unknown = "";
+      let unknown = false;
       for (const s of subs) {
+        // Stop while a further call could still end after the lease: a device not tried is not a device that may have received it.
+        if (now().getTime() + timeoutMs >= deadline) {
+          last = new Error("lease nearly over; remaining devices not tried");
+          break;
+        }
         try {
-          await withTimeout(providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body }));
+          await withTimeout(providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body }, { idempotencyKey: `${row.id}:${s.id}` }));
           delivered++;
         } catch (e) {
-          last = shortError(e);
+          last = e;
+          if (isUnknownOutcome(e)) unknown = true;
         }
       }
-      if (delivered === 0) throw new Error(last);
+      // One device that got it is a delivery. With none confirmed, a timed-out device may still receive it, so the outcome is unknown, not failed.
+      if (delivered === 0) throw unknown ? new ProviderOutcomeUnknown(shortError(last)) : new Error(shortError(last));
     }
   }
 
   return {
     /**
-     * Sends queued external notifications, oldest first. Each row runs in its own transaction under a row lock that skips rows
-     * another worker holds, so two dispatchers never send the same row. A row ends `sent` (with `sent_at`) or `failed` (with the reason);
-     * a failed row is not retried by itself, use `retryFailed`. Safe to run on a timer.
+     * Sends queued external notifications, oldest first, without holding a transaction or a row lock across a provider call.
+     * Each row is claimed in a short transaction (`FOR UPDATE SKIP LOCKED`, status `sending`, lease until `claimed_until`), sent outside any
+     * transaction, then finished with an update that only applies while the row is still `sending`. Two dispatchers never claim the same row.
+     * A row ends `sent` (with `sent_at`) or `failed` (with the reason); a failed row is not retried by itself, use `retryFailed`. A call that times out
+     * ends `unconfirmed` instead: the provider may still deliver it, so it is never re-sent by `retryFailed`.
+     * A row left `sending` past its lease (the dispatcher stopped mid-send) is moved to `unconfirmed` at the start of the next run, never back to `queued`,
+     * for the same reason. Safe to run on a timer.
      */
     async dispatchQueued(input: { limit?: number } = {}): Promise<DispatchResult> {
       const limit = input.limit ?? 100;
       if (!Number.isInteger(limit) || limit < 1) throw new ServiceError("invalid_input", "limit must be a positive whole number.");
-      const ids = (
-        await db
-          .select({ id: notification.id })
-          .from(notification)
-          .where(and(eq(notification.status, "queued"), ne(notification.channel, "in_app")))
-          .orderBy(asc(notification.createdAt), asc(notification.id))
-          .limit(limit)
-      ).map((r) => r.id);
+      const result: DispatchResult = { attempted: 0, sent: 0, failed: 0, unconfirmed: 0, lost: 0, expired: 0 };
 
-      const result: DispatchResult = { attempted: 0, sent: 0, failed: 0, skipped: 0 };
-      for (const id of ids) {
-        await db.transaction(async (tx) => {
-          const [row] = await tx.select().from(notification).where(eq(notification.id, id)).for("update", { skipLocked: true });
-          if (!row || row.status !== "queued") {
-            result.skipped++;
-            return;
-          }
-          result.attempted++;
-          const org = await loadOrganization(tx);
-          try {
-            await sendOne(tx, row, org);
-            await tx.update(notification).set({ status: "sent", sentAt: now(), error: null }).where(eq(notification.id, id));
-            result.sent++;
-          } catch (e) {
-            await tx.update(notification).set({ status: "failed", error: shortError(e) }).where(eq(notification.id, id));
-            result.failed++;
-          }
+      const expired = await db
+        .update(notification)
+        .set({ status: "unconfirmed", claimedUntil: null, error: "dispatcher stopped before the provider answered; the message may have been delivered" })
+        .where(and(eq(notification.status, "sending"), lte(notification.claimedUntil, now())))
+        .returning({ id: notification.id });
+      result.expired = expired.length;
+
+      for (let n = 0; n < limit; n++) {
+        // Claim one row at a time so its lease starts when its send starts, not when a batch was picked.
+        const claimed = await db.transaction(async (tx) => {
+          const [next] = await tx
+            .select({ id: notification.id })
+            .from(notification)
+            .where(and(eq(notification.status, "queued"), ne(notification.channel, "in_app")))
+            .orderBy(asc(notification.createdAt), asc(notification.id))
+            .limit(1)
+            .for("update", { skipLocked: true });
+          if (!next) return null;
+          const claimedUntil = new Date(now().getTime() + leaseMs);
+          const [row] = await tx.update(notification).set({ status: "sending", claimedUntil }).where(eq(notification.id, next.id)).returning();
+          return row ?? null;
         });
+        if (!claimed) break;
+        result.attempted++;
+
+        // Everything from here runs outside any transaction.
+        let outcome: "sent" | "failed" | "unconfirmed";
+        let error: string | null = null;
+        try {
+          const org = await loadOrganization(db);
+          await sendOne(db, claimed, org, claimed.claimedUntil!.getTime());
+          outcome = "sent";
+        } catch (e) {
+          outcome = isUnknownOutcome(e) ? "unconfirmed" : "failed";
+          error = shortError(e);
+        }
+        const set =
+          outcome === "sent" ? { status: "sent", sentAt: now(), error: null, claimedUntil: null } : { status: outcome, error, claimedUntil: null };
+        const done = await db.update(notification).set(set).where(and(eq(notification.id, claimed.id), eq(notification.status, "sending"))).returning({ id: notification.id });
+        if (done.length === 0) result.lost++;
+        else result[outcome]++;
       }
       return result;
     },
 
-    /** Puts failed external rows back in the queue (for example after fixing a provider key). Returns how many. */
+    /**
+     * Puts `unconfirmed` rows back in the queue, only for channels whose provider is declared `idempotent` (it refuses a second message with the same key).
+     * For any other channel the row stays unconfirmed until an operator checks the provider and calls `resolveUnconfirmed`. Returns how many.
+     */
+    async retryUnconfirmed(input: { event?: NotificationEvent } = {}): Promise<number> {
+      const channels = EXTERNAL.map((e) => e.channel).filter((c) => providers.idempotent?.[c as "email" | "sms" | "push"] === true);
+      if (channels.length === 0) return 0;
+      const rows = await db
+        .update(notification)
+        .set({ status: "queued", error: null })
+        .where(and(eq(notification.status, "unconfirmed"), inArray(notification.channel, channels), input.event ? eq(notification.event, input.event) : undefined))
+        .returning({ id: notification.id });
+      return rows.length;
+    },
+
+    /** An operator's answer for one unconfirmed row after checking the provider's log: it was delivered (`sent`) or it was not (`failed`, which `retryFailed` may then send). */
+    async resolveUnconfirmed(input: { id: string; outcome: "sent" | "not_delivered" }): Promise<void> {
+      const set = input.outcome === "sent" ? { status: "sent", sentAt: now(), error: null } : { status: "failed", error: "confirmed not delivered by an operator" };
+      const rows = await db.update(notification).set(set).where(and(eq(notification.id, input.id), eq(notification.status, "unconfirmed"))).returning({ id: notification.id });
+      if (rows.length === 0) throw new ServiceError("not_found", "No unconfirmed notification with that id.");
+    },
+
+    /** Puts failed external rows back in the queue (for example after fixing a provider key). Returns how many. Unconfirmed rows are not touched. */
     async retryFailed(input: { event?: NotificationEvent } = {}): Promise<number> {
       const rows = await db
         .update(notification)

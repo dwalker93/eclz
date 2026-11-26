@@ -2,6 +2,8 @@
  * Exams: question snapshots, attempts, grading, results and release (G1 to G9).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@workspace/db/schema";
 import {
   attemptDeadline,
   buildSnapshot,
@@ -10,11 +12,12 @@ import {
   pickCounted,
   seededOrder,
   studentView,
+  type Db,
 } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -684,5 +687,41 @@ describe("review hardening", () => {
     const sub = await racing2.submitAttempt({ attemptId: b.paper.attemptId, studentId: s2.studentId });
     eq([sub.status, sub.alreadyFinished], ["expired", true]);
     eq((await hiddenRows(b.paper.attemptId))[0]!.status, "expired");
+  });
+});
+
+describe("review fixes: marks spelling and the close lock", () => {
+  test("setQuestions: numbers are rounded like the column, over-precise strings and non-numbers are question_invalid, and the total uses the stored values", async () => {
+    const c = await newCourse();
+    const e = await ex.createExam({ lecturerId: lec, title: "Marks", mode: "online_mcq", courseIds: [c], opensAt: new Date("2027-03-10T08:00:00Z"), closesAt: new Date("2027-03-10T09:00:00Z"), maxAttempts: 1 });
+    const mine = await mcq("marks", 0, "2.50");
+    const two = await mcq("marks two", 0, 1);
+    const stored = async () => (await q(`SELECT marks FROM exam_question WHERE exam_id = $1 ORDER BY position`, [e.id])).map((r) => r.marks);
+    await ex.setQuestions({ examId: e.id, questions: [{ questionId: mine.id, marks: 1.234 }, { questionId: two.id, marks: 0.1 + 0.2 }] });
+    eq(await stored(), ["1.23", "0.30"], "numbers rounded to two decimals");
+    await ex.setQuestions({ examId: e.id, questions: [{ questionId: mine.id }, { questionId: two.id, marks: "4" }] });
+    eq(await stored(), ["2.50", "4.00"], "the bank default and a whole number stay valid");
+    for (const bad of ["1.234", "abc", "", "1e3", Number.NaN, Number.POSITIVE_INFINITY, 1e21, 0, "0.00", -1, 0.001]) {
+      await fails("question_invalid", () => ex.setQuestions({ examId: e.id, questions: [{ questionId: mine.id, marks: bad }] }));
+    }
+    eq(await stored(), ["2.50", "4.00"], "refused input changed nothing");
+    eq((await ex.publishExam({ examId: e.id })).exam.maxMarks, "6.50", "total from the stored marks");
+  });
+
+  test("closeExam locks the exam row FOR NO KEY UPDATE and startAttempt FOR UPDATE: close does not conflict with the key-share lock a result insert needs, and start and close still exclude each other", async () => {
+    const sql: string[] = [];
+    const logged = drizzle(pg, { schema, logger: { logQuery: (query: string) => void sql.push(query) } }) as unknown as Db;
+    const svc = createExamService(logged, { now: () => clock });
+    const p = await publishedExam();
+    const s = await newStudent(p.courses);
+    at("10:00");
+    sql.length = 0;
+    const a = await svc.startAttempt({ examId: p.exam.id, studentId: s.studentId });
+    const examLocks = (stmts: string[]) => stmts.filter((t) => /from "exam" where/.test(t) && /for (no key )?update/.test(t)).map((t) => /for no key update/.test(t) ? "no key update" : "update");
+    eq(examLocks(sql), ["update"], "start");
+    await answer(a.paper.attemptId, s.studentId, [[p.q1, "A"]]);
+    sql.length = 0;
+    await svc.closeExam({ examId: p.exam.id });
+    eq(examLocks(sql), ["no key update"], "close");
   });
 });

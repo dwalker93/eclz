@@ -4,7 +4,7 @@
 import { afterAll, describe, test } from "bun:test";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "@workspace/db/schema";
-import { createContentService, createPaymentService, decideContentAccess, hmacSigner } from "../src";
+import { createAccessControlService, createContentService, createPaymentService, decideContentAccess, hmacSigner } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -15,7 +15,17 @@ afterAll(async () => {
 
 await q(`UPDATE organization SET timezone = 'UTC', enabled_modules = '{"content_store": true}'::jsonb`);
 const now = () => new Date("2027-03-10T10:00:00Z");
-const content = createContentService(db, { now });
+const service = createContentService(db, { now });
+const acl = createAccessControlService(db);
+const root = await id(`INSERT INTO "user" (email) VALUES ('root@example.com')`);
+await acl.assignRole({ userId: root, roleName: "root_admin", actor: root });
+type Actorless<T> = Omit<T, "actor"> & { actor?: string };
+/** setStatus and updateItem check scope for an actor; tests act as the all-branches administrator unless one is named. */
+const content = {
+  ...service,
+  setStatus: (i: Actorless<Parameters<typeof service.setStatus>[0]>) => service.setStatus({ actor: root, ...i }),
+  updateItem: (i: Actorless<Parameters<typeof service.updateItem>[0]>) => service.updateItem({ actor: root, ...i }),
+};
 const pay = createPaymentService(db, { signer: hmacSigner("s"), now, hooks: content.hooks });
 
 const b1 = String((await q(`SELECT id FROM branch LIMIT 1`))[0]!.id);
@@ -452,3 +462,30 @@ describe("review hardening", () => {
   });
 });
 
+describe("content-wide scope is checked inside the write", () => {
+  test("a branch manager who passed when the item was listed only in their branch is refused once another branch lists it", async () => {
+    const mgr = await id(`INSERT INTO "user" (email) VALUES ('mgr-one@example.com')`);
+    await q(`INSERT INTO role (name, description) VALUES ('content_b1_only', 'custom')`);
+    await q(`INSERT INTO role_permission (role_id, permission_id) SELECT r.id, p.id FROM role r, permission p WHERE r.name = 'content_b1_only' AND p.code = 'content.manage'`);
+    await acl.assignRole({ userId: mgr, roleName: "content_b1_only", branchId: b1, actor: root });
+    const item = await publish(await recording());
+    await content.addBranches({ contentId: item.id, branchIds: [b1] });
+    eq((await content.updateItem({ actor: mgr, contentId: item.id, title: "Mine" })).title, "Mine", "listed only in their branch");
+    await content.addBranches({ contentId: item.id, branchIds: [b2] });
+    await fails("forbidden", () => content.updateItem({ actor: mgr, contentId: item.id, title: "Theirs too" }));
+    await fails("forbidden", () => content.setStatus({ actor: mgr, contentId: item.id, status: "archived" }));
+    eq(String((await q(`SELECT status FROM content_item WHERE id = $1`, [item.id]))[0]!.status), "published", "nothing changed");
+    eq((await content.updateItem({ contentId: item.id, title: "Root may" })).title, "Root may", "an all-branches administrator still can");
+  });
+
+  test("the scope check runs after the item row is locked", async () => {
+    const log: string[] = [];
+    const logged = createContentService(drizzle(pg, { schema, logger: { logQuery: (t: string) => void log.push(t) } }) as unknown as typeof db, { now });
+    const item = await publish(await recording());
+    log.length = 0;
+    await logged.updateItem({ actor: root, contentId: item.id, title: "Locked first" });
+    const lock = log.findIndex((t) => /from "content_item" where/.test(t) && /for update/.test(t));
+    const listings = log.findIndex((t) => /from "content_branch"/.test(t));
+    eq(lock >= 0 && listings > lock, true, "the listings are read after the lock");
+  });
+});

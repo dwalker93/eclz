@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { migrateEachInOwnTransaction, type MigrationConnection } from "../src/migrate";
+import { migrateEachInOwnTransaction, migrationUrl, type MigrationConnection } from "../src/migrate";
 
 const connection = (pg: PGlite): MigrationConnection => ({
   run: async (statement, params) => (await pg.query<Record<string, unknown>>(statement, params ?? [])).rows,
@@ -66,5 +66,46 @@ describe("migrateEachInOwnTransaction", () => {
     const rows = (await pg.query<{ convalidated: boolean }>(`SELECT convalidated FROM pg_constraint WHERE conname IN ('invoice_item_exception_enrollment_fk', 'message_thread_id_message_thread_id_fk')`)).rows;
     expect(rows.length).toBe(2);
     expect(rows.every((r) => r.convalidated)).toBe(true);
+  });
+});
+
+describe("migrateEachInOwnTransaction: lock order", () => {
+  test("every transaction takes the migration lock before it reads the history, and the history is read inside the transaction", async () => {
+    const pg = new PGlite();
+    const log: string[] = [];
+    const record = (tag: string, run: Parameters<MigrationConnection["transaction"]>[0] extends (r: infer R) => unknown ? R : never) =>
+      (async (statement: string, params?: unknown[]) => {
+        log.push(`${tag}:${statement.replace(/\s+/g, " ").slice(0, 40)}`);
+        return run(statement, params);
+      }) as typeof run;
+    const base = connection(pg);
+    const conn: MigrationConnection = {
+      run: record("outside", base.run),
+      transaction: (fn) => base.transaction((run) => fn(record("tx", run))),
+    };
+    try {
+      await migrateEachInOwnTransaction(conn, folder([["0000_a", `CREATE TABLE a (id int);`], ["0001_b", `CREATE TABLE b (id int);`]]));
+      const reads = log.map((l, i) => [l, i] as const).filter(([l]) => l.includes("SELECT created_at"));
+      expect(reads.length).toBe(2);
+      for (const [l, i] of reads) {
+        expect(l.startsWith("tx:")).toBe(true);
+        expect(log[i - 1]).toContain("pg_advisory_xact_lock");
+      }
+      expect(log.some((l) => l.startsWith("outside:"))).toBe(false);
+    } finally {
+      await pg.close();
+    }
+  });
+});
+
+describe("migrationUrl", () => {
+  test("a non-empty direct URL wins; an empty or blank one counts as unset", () => {
+    expect(migrationUrl({ DATABASE_URL_DIRECT: "postgres://direct", DATABASE_URL: "postgres://pooled" })).toBe("postgres://direct");
+    expect(migrationUrl({ DATABASE_URL: "postgres://pooled" })).toBe("postgres://pooled");
+    expect(migrationUrl({ DATABASE_URL_DIRECT: "", DATABASE_URL: "postgres://pooled" })).toBe("postgres://pooled");
+    expect(migrationUrl({ DATABASE_URL_DIRECT: "   ", DATABASE_URL: "postgres://pooled" })).toBe("postgres://pooled");
+    expect(migrationUrl({ DATABASE_URL_DIRECT: "postgres://direct", DATABASE_URL: "" })).toBe("postgres://direct");
+    expect(migrationUrl({ DATABASE_URL_DIRECT: "", DATABASE_URL: "" })).toBeUndefined();
+    expect(migrationUrl({})).toBeUndefined();
   });
 });
