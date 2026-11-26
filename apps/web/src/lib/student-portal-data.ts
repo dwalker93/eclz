@@ -839,11 +839,7 @@ export const upcomingExam = {
 export type ExamMode = "online_mcq" | "paper"
 export type ExamResultState = "pending" | "provisional" | "released"
 export type ExamAvailability =
-  | "available"
-  | "upcoming"
-  | "in_progress"
-  | "past"
-  | "results"
+  "available" | "upcoming" | "in_progress" | "past" | "results"
 
 export const EXAM_MODE_LABELS: Record<ExamMode, string> = {
   online_mcq: "Online MCQ",
@@ -930,12 +926,7 @@ const scienceMatterQuestions: ExamQuestion[] = [
     id: "question-science-4",
     prompt:
       "Which piece of equipment measures the volume of a liquid most accurately?",
-    options: [
-      "Beaker",
-      "Measuring cylinder",
-      "Test tube",
-      "Evaporating dish",
-    ],
+    options: ["Beaker", "Measuring cylinder", "Test tube", "Evaporating dish"],
   },
 ]
 
@@ -1126,7 +1117,8 @@ export const studentExams: StudentExam[] = [
     maxAttempts: 1,
     usedAttempts: 1,
     venue: "Room 2A",
-    availabilityNote: "The paper has been collected. Results will appear after release.",
+    availabilityNote:
+      "The paper has been collected. Results will appear after release.",
     instructions: [
       "The paper has been collected.",
       "Results are released by the Academic Office; no online action is needed.",
@@ -1701,12 +1693,7 @@ export function formatLkr(amount: number) {
  * ----------------------------------------------------------------------- */
 
 export type InvoiceStatus =
-  | "pending"
-  | "partial"
-  | "paid"
-  | "overdue"
-  | "waived"
-  | "cancelled"
+  "pending" | "partial" | "paid" | "overdue" | "waived" | "cancelled"
 
 export type InvoiceLineKind = "fee" | "content" | "discount" | "adjustment"
 
@@ -1719,9 +1706,7 @@ export type InstallmentStatus = "pending" | "partial" | "paid" | "overdue"
 export type PaymentMethod = "bank_transfer" | "cash" | "gateway"
 
 export type PaymentVerificationStatus =
-  | "pending_verification"
-  | "verified"
-  | "rejected"
+  "pending_verification" | "verified" | "rejected"
 
 export const INVOICE_STATUS_LABELS: Record<InvoiceStatus, string> = {
   pending: "Pending",
@@ -1810,6 +1795,40 @@ export type StudentPayment = {
   status: PaymentVerificationStatus
   invoiceId: string
   invoiceNo: string
+  note?: string
+}
+
+export type ReceiptStatus = "issued" | "void"
+
+export const RECEIPT_STATUS_LABELS: Record<ReceiptStatus, string> = {
+  issued: "Issued",
+  void: "Void",
+}
+
+/**
+ * A receipt issued for a verified payment. The receipt signing key, content
+ * hash and storage path are deliberately not modelled here; only the public
+ * verification code is shown so a receipt can be checked safely.
+ */
+export type StudentReceipt = {
+  id: string
+  receiptNo: string
+  /** The verified payment this receipt was issued for. */
+  paymentId: string
+  /** Invoice number shown alongside the payment reference, when known. */
+  invoiceNo?: string
+  branch: string
+  issuedOn: string
+  amount: number
+  method: PaymentMethod
+  reference: string
+  status: ReceiptStatus
+  /** Public verification code only. Never a signing key or content hash. */
+  verificationCode: string
+  /** Set on a void receipt that was replaced by a newer receipt. */
+  replacedByReceiptNo?: string
+  /** Set on a reissued receipt that replaces an earlier void receipt. */
+  replacesReceiptNo?: string
   note?: string
 }
 
@@ -2269,9 +2288,9 @@ export const billingSummary = {
 
 export const invoiceStatusFilterOptions = [
   { value: "all", label: "All statuses" },
-  ...(
-    Object.entries(INVOICE_STATUS_LABELS) as [InvoiceStatus, string][]
-  ).map(([value, label]) => ({ value, label })),
+  ...(Object.entries(INVOICE_STATUS_LABELS) as [InvoiceStatus, string][]).map(
+    ([value, label]) => ({ value, label })
+  ),
 ]
 
 export const paymentStatusFilterOptions = [
@@ -2282,6 +2301,13 @@ export const paymentStatusFilterOptions = [
       string,
     ][]
   ).map(([value, label]) => ({ value, label })),
+]
+
+export const receiptStatusFilterOptions = [
+  { value: "all", label: "All receipts" },
+  ...(Object.entries(RECEIPT_STATUS_LABELS) as [ReceiptStatus, string][]).map(
+    ([value, label]) => ({ value, label })
+  ),
 ]
 
 /* --------------------------------------------------------------------------
@@ -2296,11 +2322,7 @@ export const paymentStatusFilterOptions = [
  * ----------------------------------------------------------------------- */
 
 export type NoticeAudienceType =
-  | "all"
-  | "branch"
-  | "grade"
-  | "course"
-  | "student"
+  "all" | "branch" | "grade" | "course" | "student"
 
 export const NOTICE_AUDIENCE_LABELS: Record<NoticeAudienceType, string> = {
   all: "Everyone",
@@ -2698,10 +2720,7 @@ export const STUDENT_STATUS_LABELS: Record<StudentAccountStatus, string> = {
 }
 
 export type StudentGradeStage =
-  | "Primary"
-  | "Junior"
-  | "Ordinary level"
-  | "Advanced level"
+  "Primary" | "Junior" | "Ordinary level" | "Advanced level"
 
 export type StudentBranchMembership = {
   id: string

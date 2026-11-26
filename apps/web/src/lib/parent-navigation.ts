@@ -17,9 +17,10 @@ import type { PortalNavGroup } from "@/lib/student-navigation"
 
 /**
  * Planned parent portal destinations from the public portal guide. The
- * dashboard and My Children pages are implemented; every other item is an
- * intentionally disabled placeholder. Parent pages only ever show children
- * linked to this guardian.
+ * dashboard, My Children, Courses, Timetable, Attendance, Exams & Results,
+ * Invoices & Payments, Receipts, Notices and Messages pages are implemented;
+ * every other item is an intentionally disabled placeholder. Parent pages only
+ * ever show children linked to this guardian.
  */
 export const parentNav: PortalNavGroup[] = [
   {
@@ -33,24 +34,52 @@ export const parentNav: PortalNavGroup[] = [
         icon: UsersRoundIcon,
         url: "/portal/parent/children",
       },
-      { title: "Courses", icon: BookOpenIcon, disabled: true },
-      { title: "Timetable", icon: CalendarClockIcon, disabled: true },
-      { title: "Attendance", icon: ClipboardCheckIcon, disabled: true },
-      { title: "Exams & Results", icon: AwardIcon, disabled: true },
+      { title: "Courses", icon: BookOpenIcon, url: "/portal/parent/courses" },
+      {
+        title: "Timetable",
+        icon: CalendarClockIcon,
+        url: "/portal/parent/timetable",
+      },
+      {
+        title: "Attendance",
+        icon: ClipboardCheckIcon,
+        url: "/portal/parent/attendance",
+      },
+      {
+        title: "Exams & Results",
+        icon: AwardIcon,
+        url: "/portal/parent/exams",
+      },
     ],
   },
   {
     label: "Fees",
     items: [
-      { title: "Invoices & Payments", icon: WalletCardsIcon, disabled: true },
-      { title: "Receipts", icon: ReceiptTextIcon, disabled: true },
+      {
+        title: "Invoices & Payments",
+        icon: WalletCardsIcon,
+        url: "/portal/parent/billing",
+      },
+      {
+        title: "Receipts",
+        icon: ReceiptTextIcon,
+        url: "/portal/parent/receipts",
+      },
     ],
   },
   {
     label: "Communication",
     items: [
-      { title: "Notices", icon: MegaphoneIcon, disabled: true },
-      { title: "Messages", icon: MessagesSquareIcon, disabled: true },
+      {
+        title: "Notices",
+        icon: MegaphoneIcon,
+        url: "/portal/parent/notices",
+      },
+      {
+        title: "Messages",
+        icon: MessagesSquareIcon,
+        url: "/portal/parent/messages",
+      },
       { title: "Notifications", icon: BellIcon, disabled: true },
     ],
   },

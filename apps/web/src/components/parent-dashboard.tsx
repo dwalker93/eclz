@@ -1,11 +1,10 @@
 "use client"
 
 import Link from "next/link"
-import { useState } from "react"
 
 import { Avatar, AvatarFallback } from "@workspace/ui/components/avatar"
 import { Badge } from "@workspace/ui/components/badge"
-import { buttonVariants } from "@workspace/ui/components/button"
+import { Button, buttonVariants } from "@workspace/ui/components/button"
 import {
   Card,
   CardContent,
@@ -22,7 +21,6 @@ import {
   BookOpenIcon,
   CalendarClockIcon,
   CalendarDaysIcon,
-  CheckCircle2Icon,
   ChevronRightIcon,
   ClipboardCheckIcon,
   FileCheck2Icon,
@@ -37,6 +35,7 @@ import {
 } from "lucide-react"
 
 import { EmptyState } from "@/components/empty-state"
+import { useParentChild } from "@/components/parent-child-context"
 import { PortalPageHeader } from "@/components/portal-page-header"
 import {
   ExamModeBadge,
@@ -45,7 +44,6 @@ import {
 } from "@/components/portal-status-badge"
 import {
   parent,
-  parentChildren,
   type ParentChild,
   type ParentChildAttendance,
 } from "@/lib/parent-portal-data"
@@ -84,29 +82,26 @@ const attendanceTones: Record<
 }
 
 export function ParentDashboard() {
-  const [selectedChildId, setSelectedChildId] = useState(
-    parentChildren[0]?.id ?? ""
-  )
-
-  const selectedChild =
-    parentChildren.find((child) => child.id === selectedChildId) ??
-    parentChildren[0] ??
-    null
+  const {
+    children: linkedChildren,
+    selectedChild,
+    selectChild,
+  } = useParentChild()
 
   return (
     <main className="mx-auto size-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
       <div className="flex flex-col gap-6">
         <PortalPageHeader
           title="Parent Dashboard"
-          description="A read-only summary for the children linked to your guardian record. Switch children to update every summary card below."
+          description="A read-only summary for the children linked to your guardian record. Use the child selector in the header to update every summary card below."
           meta={
             <>
               <Badge variant="secondary" className="rounded-full">
                 Parent portal
               </Badge>
               <Badge variant="outline" className="rounded-full">
-                {parentChildren.length} linked{" "}
-                {parentChildren.length === 1 ? "child" : "children"}
+                {linkedChildren.length} linked{" "}
+                {linkedChildren.length === 1 ? "child" : "children"}
               </Badge>
               {selectedChild ? (
                 <Badge variant="outline" className="rounded-full">
@@ -142,8 +137,8 @@ export function ParentDashboard() {
             <div className="flex flex-wrap items-center gap-2">
               <Badge variant="outline" className="gap-1.5 rounded-full">
                 <UsersRoundIcon aria-hidden="true" />
-                {parentChildren.length} linked{" "}
-                {parentChildren.length === 1 ? "child" : "children"}
+                {linkedChildren.length} linked{" "}
+                {linkedChildren.length === 1 ? "child" : "children"}
               </Badge>
               <Badge variant="outline" className="rounded-full">
                 Guardian view
@@ -152,64 +147,60 @@ export function ParentDashboard() {
           </CardContent>
         </Card>
 
-        <Card className="gap-0 py-0">
-          <CardHeader className="border-b px-4 py-4 sm:px-6">
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div className="flex flex-col gap-0.5">
-                <CardTitle className="flex items-center gap-2">
-                  <UsersRoundIcon
-                    className="size-4 text-muted-foreground"
-                    aria-hidden="true"
-                  />
-                  Linked children
-                </CardTitle>
-                <CardDescription>
-                  Select a child to update every summary card below.
-                </CardDescription>
+        {selectedChild ? (
+          <Card className="gap-0 py-0">
+            <CardContent className="flex flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between sm:p-4">
+              <div className="flex min-w-0 items-center gap-3">
+                <Avatar className="size-10 shrink-0">
+                  <AvatarFallback>{selectedChild.initials}</AvatarFallback>
+                </Avatar>
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <p className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+                    Viewing child
+                  </p>
+                  <p className="truncate text-sm font-semibold">
+                    {selectedChild.fullName}
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {selectedChild.studentNo} · {selectedChild.grade} ·{" "}
+                    {selectedChild.branch} branch
+                  </p>
+                </div>
               </div>
-              <div className="flex flex-wrap items-center justify-end gap-2">
-                <Badge variant="outline" className="rounded-full">
-                  {parentChildren.length} linked
-                </Badge>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {linkedChildren.map((child) => (
+                  <Button
+                    key={child.id}
+                    variant={
+                      child.id === selectedChild.id ? "secondary" : "outline"
+                    }
+                    size="sm"
+                    onClick={() => selectChild(child.id)}
+                    aria-pressed={child.id === selectedChild.id}
+                    aria-label={`View summary for ${child.fullName}`}
+                  >
+                    {child.preferredName}
+                  </Button>
+                ))}
                 <Link
                   href="/portal/parent/children"
-                  className={buttonVariants({ variant: "ghost", size: "xs" })}
+                  className={buttonVariants({ variant: "ghost", size: "sm" })}
                 >
-                  View children
+                  All children
                   <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
                 </Link>
               </div>
-            </div>
-          </CardHeader>
-          <CardContent className="p-4 sm:p-6">
-            {parentChildren.length === 0 ? (
-              <EmptyState
-                icon={<UsersRoundIcon className="size-5" aria-hidden="true" />}
-                title="No linked children"
-                description="No student is linked to this guardian record. Contact the branch office if a child is missing from your account."
-              />
-            ) : (
-              <div
-                role="group"
-                aria-label="Select a linked child"
-                className="grid gap-3 sm:grid-cols-2"
-              >
-                {parentChildren.map((child) => (
-                  <ChildCard
-                    key={child.id}
-                    child={child}
-                    selected={child.id === selectedChild?.id}
-                    onSelect={() => setSelectedChildId(child.id)}
-                  />
-                ))}
-              </div>
-            )}
-          </CardContent>
-          <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-            Children are shown only through your guardian links. No student
-            directory or other family&apos;s records are used.
-          </CardFooter>
-        </Card>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card className="gap-0 py-0">
+            <EmptyState
+              icon={<UsersRoundIcon className="size-5" aria-hidden="true" />}
+              title="No linked children"
+              description="No student is linked to this guardian record, so there are no child summaries to show. Contact the branch office if a child is missing from your account."
+            />
+          </Card>
+        )}
 
         {selectedChild ? (
           <>
@@ -226,14 +217,23 @@ export function ParentDashboard() {
                   {selectedChild.branch} branch · {selectedChild.relationship}
                 </p>
               </div>
-              <Badge
-                variant="secondary"
-                className="gap-1.5 rounded-full"
-                aria-label={`Selected child: ${selectedChild.fullName}`}
-              >
-                <BadgeCheckIcon aria-hidden="true" />
-                Viewing {selectedChild.preferredName}
-              </Badge>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge
+                  variant="secondary"
+                  className="gap-1.5 rounded-full"
+                  aria-label={`Selected child: ${selectedChild.fullName}`}
+                >
+                  <BadgeCheckIcon aria-hidden="true" />
+                  Viewing {selectedChild.preferredName}
+                </Badge>
+                <Link
+                  href="/portal/parent/courses"
+                  className={buttonVariants({ variant: "outline", size: "sm" })}
+                >
+                  <BookOpenIcon data-icon="inline-start" aria-hidden="true" />
+                  View courses
+                </Link>
+              </div>
             </div>
 
             <div className="grid gap-4 xl:grid-cols-3">
@@ -263,78 +263,6 @@ export function ParentDashboard() {
         ) : null}
       </div>
     </main>
-  )
-}
-
-function ChildCard({
-  child,
-  selected,
-  onSelect,
-}: {
-  child: ParentChild
-  selected: boolean
-  onSelect: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onSelect}
-      aria-pressed={selected}
-      aria-label={`View summary for ${child.fullName}`}
-      className={cn(
-        "flex flex-col gap-3 rounded-lg border p-3 text-left transition-colors outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 sm:p-4",
-        selected
-          ? "border-primary/40 bg-primary/5"
-          : "bg-card hover:bg-muted/40"
-      )}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-3">
-          <Avatar>
-            <AvatarFallback>{child.initials}</AvatarFallback>
-          </Avatar>
-          <div className="flex min-w-0 flex-col gap-0.5">
-            <span className="flex flex-wrap items-center gap-2 text-sm font-semibold">
-              <span className="truncate">{child.fullName}</span>
-              {selected ? (
-                <Badge variant="secondary" className="rounded-full">
-                  Viewing
-                </Badge>
-              ) : null}
-            </span>
-            <span className="truncate text-xs text-muted-foreground">
-              {child.studentNo} · {child.grade} · {child.branch}
-            </span>
-          </div>
-        </div>
-        {selected ? (
-          <CheckCircle2Icon
-            className="mt-0.5 size-4 shrink-0 text-primary"
-            aria-hidden="true"
-          />
-        ) : (
-          <span
-            className="mt-1 size-3.5 shrink-0 rounded-full border"
-            aria-hidden="true"
-          />
-        )}
-      </div>
-
-      <div className="flex flex-wrap items-center gap-1.5">
-        <Badge variant="outline" className="rounded-full">
-          {child.relationship}
-        </Badge>
-        {child.isPrimary ? (
-          <Badge variant="outline" className="rounded-full">
-            Primary guardian
-          </Badge>
-        ) : null}
-        <Badge variant="outline" className="rounded-full">
-          {child.activeCourseCount} active{" "}
-          {child.activeCourseCount === 1 ? "course" : "courses"}
-        </Badge>
-      </div>
-    </button>
   )
 }
 
@@ -397,9 +325,18 @@ function NextClassCard({ child }: { child: ParentChild }) {
           />
         )}
       </CardContent>
-      <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-        The parent view is read-only. Classes cannot be booked, cancelled or
-        rescheduled here.
+      <CardFooter className="flex flex-wrap items-center justify-between gap-2 border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
+        <span>
+          The parent view is read-only. Classes cannot be booked, cancelled or
+          rescheduled here.
+        </span>
+        <Link
+          href="/portal/parent/timetable"
+          className={buttonVariants({ variant: "ghost", size: "xs" })}
+        >
+          View timetable
+          <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+        </Link>
       </CardFooter>
     </Card>
   )
@@ -475,9 +412,18 @@ function AttendanceCard({ child }: { child: ParentChild }) {
           />
         )}
       </CardContent>
-      <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-        Read-only summary. No staff marking controls are available in the parent
-        portal.
+      <CardFooter className="flex flex-wrap items-center justify-between gap-2 border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
+        <span>
+          Read-only summary. No staff marking controls are available in the
+          parent portal.
+        </span>
+        <Link
+          href="/portal/parent/attendance"
+          className={buttonVariants({ variant: "ghost", size: "xs" })}
+        >
+          View attendance
+          <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+        </Link>
       </CardFooter>
     </Card>
   )
@@ -585,9 +531,18 @@ function ExamResultCard({ child }: { child: ParentChild }) {
           )}
         </div>
       </CardContent>
-      <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-        Parent view only. There is no exam start, answer, submit or attempt
-        action, and only released results are shown.
+      <CardFooter className="flex flex-wrap items-center justify-between gap-2 border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
+        <span>
+          Parent view only. There is no exam start, answer, submit or attempt
+          action, and only released results are shown.
+        </span>
+        <Link
+          href="/portal/parent/exams"
+          className={buttonVariants({ variant: "ghost", size: "xs" })}
+        >
+          View exams &amp; results
+          <ChevronRightIcon data-icon="inline-end" aria-hidden="true" />
+        </Link>
       </CardFooter>
     </Card>
   )
@@ -717,7 +672,7 @@ function InfoLine({ icon: Icon, value }: { icon: LucideIcon; value: string }) {
         className="mt-0.5 size-4 shrink-0 text-muted-foreground"
         aria-hidden="true"
       />
-      <span className="break-words">{value}</span>
+      <span className="wrap-break-word">{value}</span>
     </span>
   )
 }

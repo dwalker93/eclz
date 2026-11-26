@@ -1,10 +1,10 @@
 "use client"
 
-import { useState } from "react"
+import Link from "next/link"
 
 import { Avatar, AvatarFallback } from "@workspace/ui/components/avatar"
 import { Badge } from "@workspace/ui/components/badge"
-import { Button } from "@workspace/ui/components/button"
+import { Button, buttonVariants } from "@workspace/ui/components/button"
 import {
   Card,
   CardContent,
@@ -35,12 +35,9 @@ import {
 } from "lucide-react"
 
 import { EmptyState } from "@/components/empty-state"
+import { useParentChild } from "@/components/parent-child-context"
 import { PortalPageHeader } from "@/components/portal-page-header"
-import {
-  parent,
-  parentChildren,
-  type ParentChild,
-} from "@/lib/parent-portal-data"
+import { parent, type ParentChild } from "@/lib/parent-portal-data"
 import {
   formatDisplayDate,
   formatLkr,
@@ -52,24 +49,30 @@ import {
 const childPageLinks: Array<{
   title: string
   icon: LucideIcon
+  url?: string
 }> = [
-  { title: "Courses", icon: BookOpenIcon },
-  { title: "Timetable", icon: CalendarClockIcon },
-  { title: "Attendance", icon: ClipboardCheckIcon },
+  { title: "Courses", icon: BookOpenIcon, url: "/portal/parent/courses" },
+  {
+    title: "Timetable",
+    icon: CalendarClockIcon,
+    url: "/portal/parent/timetable",
+  },
+  {
+    title: "Attendance",
+    icon: ClipboardCheckIcon,
+    url: "/portal/parent/attendance",
+  },
   { title: "Exams & Results", icon: AwardIcon },
   { title: "Invoices & Payments", icon: WalletCardsIcon },
   { title: "Notices", icon: MegaphoneIcon },
 ]
 
 export function ParentChildren() {
-  const [selectedChildId, setSelectedChildId] = useState(
-    parentChildren[0]?.id ?? ""
-  )
-
-  const selectedChild =
-    parentChildren.find((child) => child.id === selectedChildId) ??
-    parentChildren[0] ??
-    null
+  const {
+    children: linkedChildren,
+    selectedChild,
+    selectChild,
+  } = useParentChild()
 
   return (
     <main className="mx-auto size-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
@@ -83,8 +86,8 @@ export function ParentChildren() {
                 Parent portal
               </Badge>
               <Badge variant="outline" className="rounded-full">
-                {parentChildren.length} linked{" "}
-                {parentChildren.length === 1 ? "child" : "children"}
+                {linkedChildren.length} linked{" "}
+                {linkedChildren.length === 1 ? "child" : "children"}
               </Badge>
               {selectedChild ? (
                 <Badge variant="outline" className="rounded-full">
@@ -101,7 +104,7 @@ export function ParentChildren() {
           }
         />
 
-        {parentChildren.length === 0 ? (
+        {linkedChildren.length === 0 ? (
           <div className="flex flex-col gap-4">
             <Card className="gap-0 py-0">
               <EmptyState
@@ -142,18 +145,18 @@ export function ParentChildren() {
                     </CardDescription>
                   </div>
                   <Badge variant="outline" className="rounded-full">
-                    {parentChildren.length}
+                    {linkedChildren.length}
                   </Badge>
                 </div>
               </CardHeader>
               <CardContent className="p-0">
                 <ul className="divide-y">
-                  {parentChildren.map((child) => (
+                  {linkedChildren.map((child) => (
                     <li key={child.id}>
                       <ChildListItem
                         child={child}
                         selected={child.id === selectedChild?.id}
-                        onSelect={() => setSelectedChildId(child.id)}
+                        onSelect={() => selectChild(child.id)}
                       />
                     </li>
                   ))}
@@ -352,17 +355,31 @@ function ChildDetail({ child }: { child: ParentChild }) {
                 {child.preferredName}&apos;s pages
               </CardTitle>
               <CardDescription>
-                Child-specific pages will keep this child selected.
+                Available child pages keep this child selected. Planned pages
+                are marked Soon.
               </CardDescription>
             </div>
             <Badge variant="outline" className="rounded-full">
-              Planned shortcuts
+              Child pages
             </Badge>
           </div>
         </CardHeader>
         <CardContent className="flex flex-wrap gap-2 p-4 sm:p-6">
           {childPageLinks.map((page) => {
             const Icon = page.icon
+
+            if (page.url) {
+              return (
+                <Link
+                  key={page.title}
+                  href={page.url}
+                  className={buttonVariants({ variant: "outline", size: "sm" })}
+                >
+                  <Icon data-icon="inline-start" aria-hidden="true" />
+                  {page.title}
+                </Link>
+              )
+            }
 
             return (
               <Button
@@ -382,7 +399,8 @@ function ChildDetail({ child }: { child: ParentChild }) {
           })}
         </CardContent>
         <CardFooter className="border-t px-4 py-3 text-xs text-muted-foreground sm:px-6">
-          These shortcuts are placeholders until the child-specific pages are
+          Courses, Timetable and Attendance open with this child selected. The
+          remaining shortcuts are placeholders until those child pages are
           added. No student-only exam, payment or profile action is available
           here.
         </CardFooter>
@@ -545,7 +563,7 @@ function InfoLine({ icon: Icon, value }: { icon: LucideIcon; value: string }) {
         className="mt-0.5 size-4 shrink-0 text-muted-foreground"
         aria-hidden="true"
       />
-      <span className="break-words">{value}</span>
+      <span className="wrap-break-word">{value}</span>
     </span>
   )
 }

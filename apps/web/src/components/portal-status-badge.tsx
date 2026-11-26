@@ -51,6 +51,7 @@ import {
   NOTIFICATION_STATUS_LABELS,
   PAYMENT_METHOD_LABELS,
   PAYMENT_VERIFICATION_LABELS,
+  RECEIPT_STATUS_LABELS,
   STUDENT_STATUS_LABELS,
   EXAM_MODE_LABELS,
   EXAM_RESULT_STATE_LABELS,
@@ -70,6 +71,7 @@ import {
   type NotificationStatus,
   type PaymentMethod,
   type PaymentVerificationStatus,
+  type ReceiptStatus,
   type StudentAccountStatus,
   type StudentCourseStatus,
 } from "@/lib/student-portal-data"
@@ -85,6 +87,10 @@ import {
   type LecturerExamStatus,
   type LecturerPayoutStatus,
 } from "@/lib/lecturer-portal-data"
+import {
+  PARENT_NOTICE_AUDIENCE_LABELS,
+  type ParentNoticeAudience,
+} from "@/lib/parent-portal-data"
 
 type BadgeConfig = {
   icon: LucideIcon
@@ -720,6 +726,34 @@ export function PaymentMethodBadge({
   )
 }
 
+const receiptStatusConfig: Record<ReceiptStatus, BadgeConfig> = {
+  issued: {
+    icon: BadgeCheckIcon,
+    className:
+      "border-emerald-600/20 bg-emerald-500/10 text-emerald-700 dark:border-emerald-400/20 dark:text-emerald-400",
+  },
+  void: {
+    icon: BanIcon,
+    className: "border-border bg-muted/60 text-muted-foreground",
+  },
+}
+
+export function ReceiptStatusBadge({
+  status,
+  className,
+}: {
+  status: ReceiptStatus
+  className?: string
+}) {
+  return (
+    <ConfigBadge
+      config={receiptStatusConfig[status]}
+      label={RECEIPT_STATUS_LABELS[status]}
+      className={className}
+    />
+  )
+}
+
 const noticeAudienceConfig: Record<NoticeAudienceType, BadgeConfig> = {
   all: {
     icon: UsersIcon,
@@ -773,6 +807,56 @@ export function NoticeExpiredBadge({ className }: { className?: string }) {
         className: "border-border bg-muted/60 text-muted-foreground",
       }}
       label="Expired"
+      className={className}
+    />
+  )
+}
+
+const parentNoticeAudienceConfig: Record<ParentNoticeAudience, BadgeConfig> = {
+  all: {
+    icon: UsersIcon,
+    className:
+      "border-sky-600/20 bg-sky-500/10 text-sky-700 dark:border-sky-400/20 dark:text-sky-400",
+  },
+  guardian: {
+    icon: UserRoundIcon,
+    className:
+      "border-indigo-600/20 bg-indigo-500/10 text-indigo-700 dark:border-indigo-400/20 dark:text-indigo-400",
+  },
+  branch: {
+    icon: Building2Icon,
+    className:
+      "border-violet-600/20 bg-violet-500/10 text-violet-700 dark:border-violet-400/20 dark:text-violet-400",
+  },
+  grade: {
+    icon: GraduationCapIcon,
+    className:
+      "border-amber-600/20 bg-amber-500/10 text-amber-700 dark:border-amber-400/20 dark:text-amber-400",
+  },
+  course: {
+    icon: BookOpenIcon,
+    className:
+      "border-emerald-600/20 bg-emerald-500/10 text-emerald-700 dark:border-emerald-400/20 dark:text-emerald-400",
+  },
+  student: {
+    icon: UserRoundIcon,
+    className: "border-border bg-muted/60 text-muted-foreground",
+  },
+}
+
+export function ParentNoticeAudienceBadge({
+  audienceType,
+  label,
+  className,
+}: {
+  audienceType: ParentNoticeAudience
+  label?: string
+  className?: string
+}) {
+  return (
+    <ConfigBadge
+      config={parentNoticeAudienceConfig[audienceType]}
+      label={label ?? PARENT_NOTICE_AUDIENCE_LABELS[audienceType]}
       className={className}
     />
   )
