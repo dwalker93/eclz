@@ -278,8 +278,29 @@ export function createAccessService(db: Db, opts: { now?: () => Date } = {}) {
       return result;
     },
 
-    /** The same reconcile for one student, in the caller's transaction. Call it after a change to what a student owes (invoice cancel or adjustment). */
+    /**
+     * The same reconcile for one student, in the caller's transaction. Call it after a change to what a student owes (invoice cancel or adjustment).
+     *
+     * LOCK ORDER (the contract for callers): the student is locked before any of their invoices, everywhere (payment verify and void, invoice changes,
+     * this reconcile, the overdue job). `recheckStudent` locks the student itself, but only when it runs: a caller that has already locked or changed an
+     * invoice in the same transaction took the invoice first, and if the overdue job holds the student and waits for that invoice, each waits for the
+     * other and PostgreSQL aborts one. So a caller that changes an invoice must lock the student first. Use `changeThenRecheck`, which does that, or call
+     * `lockStudent` before the first invoice read or write and `recheckStudent` after.
+     */
     recheckStudent: recheck,
+
+    /** Locks the student (FOR NO KEY UPDATE) for the rest of the transaction. Call it before touching any of the student's invoices; taking it again is free. */
+    lockStudent: (tx: Tx, studentId: string) => lockStudent(tx, studentId),
+
+    /**
+     * Locks the student, runs `change` (the caller's invoice cancel or adjustment, in the same transaction), then reconciles the student. The order is the
+     * one described at `recheckStudent`, so the change cannot cross the overdue job. Returns what `change` returned and the reconcile summary.
+     */
+    async changeThenRecheck<T>(tx: Tx, input: { studentId: string; actor: string | null }, change: () => Promise<T>): Promise<{ result: T; summary: ReconcileSummary }> {
+      await lockStudent(tx, input.studentId);
+      const result = await change();
+      return { result, summary: await recheck(tx, input.studentId, input.actor) };
+    },
 
     /**
      * C9: pass as `hooks` (through `combineHooks`) to createPaymentService. A verified payment clears the restriction in the same transaction when

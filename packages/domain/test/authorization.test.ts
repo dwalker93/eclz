@@ -10,6 +10,7 @@ import {
   requireStudent,
   branchScope,
   canAccessStudent,
+  canonicalUuid,
   createAccessControlService,
   createContentService,
   createExamService,
@@ -356,5 +357,17 @@ describe("staff access to one student (I2)", () => {
     await requireStudent(db, mine, "students.update", inB1);
     await fails("forbidden", () => requireStudent(db, mine, "students.update", inB2));
     await fails("not_found", () => requireStudent(db, mine, "students.update", "00000000-0000-0000-0000-000000000000"));
+  });
+});
+
+describe("canonicalUuid", () => {
+  const id = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
+  test("accepts the spellings PostgreSQL accepts and nothing else", () => {
+    for (const ok of [id, id.toUpperCase(), id.replace(/-/g, ""), `{${id}}`, `{${id.toUpperCase()}}`, `{${id.replace(/-/g, "")}}`, "a0eebc99-9c0b4ef8-bb6d6bb9-bd380a11", "a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11"]) {
+      eq(canonicalUuid(ok), id, ok);
+    }
+    for (const bad of [`a0eebc99-9c0b-4ef8-bb6d-6bb9{bd380a11}`, `{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`, `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}`, `{{${id}}}`, `a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11`, `-${id}`, `${id}-`, "a0ee-bc9-99c0-b4ef-8bb6-d6bb-9bd3-80a11", `${id}0`, "not a uuid", ""]) {
+      eq(canonicalUuid(bad), bad, `${bad} is left alone`);
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { eq, sql } from "drizzle-orm";
 import { authRateLimit } from "@workspace/db/schema";
-import { ServiceError, type Db } from "@workspace/domain";
+import { ServiceError, type Db, type Tx } from "@workspace/domain";
 
 /**
  * Fixed-window counter shared by every server through the database. Each call counts one attempt and throws `rate_limited` once the
@@ -22,6 +22,7 @@ export async function hit(db: Db, key: string, rule: { limit: number; windowMs: 
   if (row!.count > rule.limit) throw new ServiceError("rate_limited", "Too many attempts. Try again later.");
 }
 
-export async function clear(db: Db, key: string): Promise<void> {
+/** Resets a counter. Takes a transaction too, so a reset can commit or roll back together with the step that earned it. */
+export async function clear(db: Db | Tx, key: string): Promise<void> {
   await db.delete(authRateLimit).where(eq(authRateLimit.key, key));
 }

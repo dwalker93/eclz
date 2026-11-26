@@ -1248,6 +1248,12 @@ describe("Course changes keep enrolments valid (C2) and money is never NaN", () 
     if (rows.length !== 1 || !/\(applies_to_item_id\)/.test(String(rows[0]!.indexdef))) throw new Error("invoice_item_applies_to_idx on (applies_to_item_id) is missing");
   });
 
+  test("the exam result guard locks the exam row FOR SHARE before it reads the mode", async () => {
+    // PGlite cannot show the wait; this guards the lock clause (test/concurrency.pg.test.ts runs both write orders on a real server)
+    const [fn] = await q(`SELECT pg_get_functiondef('exam_result_guard'::regproc) AS def`);
+    if (!/FROM exam WHERE id = NEW\.exam_id FOR SHARE/i.test(String(fn!.def))) throw new Error(`exam_result_guard must read the exam FOR SHARE:\n${fn!.def}`);
+  });
+
   test("the payment guard reads the target payment method FOR SHARE, so a concurrent change of its type waits for the payment move", async () => {
     // PGlite has one connection and cannot show the wait itself; this guards the lock clause (the real-PostgreSQL concurrency test is owed)
     const [fn] = await q(`SELECT pg_get_functiondef('payment_gateway_method_guard'::regproc) AS def`);

@@ -4,7 +4,7 @@ import { examResultScope, isCalendarDay, requireModule, requireResource, Service
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
-import { jsonBody } from "./http";
+import { jsonBody, LARGE_JSON_BODY_LIMIT } from "./http";
 import { requirePortalOf, requireReady, withPrincipal, type Env, type SessionConfig } from "./session";
 
 const uuid = z.string().uuid();
@@ -124,6 +124,7 @@ export function createExamRoutes({ db, auth, exams, session }: ExamRouteDeps, po
     const b = await jsonBody(
       c,
       z.object({ entries: z.array(z.object({ studentId: uuid, marks, grade: z.string().max(10).optional(), remarks: z.string().max(300).optional() })).min(1).max(500), reason: z.string().max(300).optional() }),
+      LARGE_JSON_BODY_LIMIT,
     );
     // A manager of one branch of a shared exam may only enter marks for results recorded in that branch; the owner and all-branches staff are unrestricted.
     const scope = await examResultScope(db, p.userId, "exams.manage", id);

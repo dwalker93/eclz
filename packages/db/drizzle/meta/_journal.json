@@ -197,6 +197,62 @@
       "when": 1795160789844,
       "tag": "0027_validate_message_thread_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1795160849844,
+      "tag": "0028_guard_locking",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1795160909844,
+      "tag": "0029_discount_enrollment_forward",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1795160969844,
+      "tag": "0030_course_intake_forward",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1795161029844,
+      "tag": "0031_clear_sessions_of_disabled_users",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1795161089844,
+      "tag": "0032_notification_unconfirmed",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1795161149844,
+      "tag": "0033_validate_notification_unconfirmed",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1795161209844,
+      "tag": "0034_notification_sending",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1795161269844,
+      "tag": "0035_validate_notification_sending",
+      "breakpoints": true
     }
   ]
 }

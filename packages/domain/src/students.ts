@@ -1,6 +1,7 @@
 import { and, asc, count, eq, ilike, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { branch, course, enrollment, guardian, lecturer, staffRoleAssignment, student, studentBranch, studentGuardian, studentLevel, user, gradeLevel, STUDENT_STATUSES } from "@workspace/db/schema";
 import { writeAudit } from "./audit";
+import { guardianInScope } from "./authorization";
 import { ageOn, isCalendarDay } from "./dates";
 import { loadOrganization, todayFor } from "./lookups";
 import { normalizeSriLankaPhone } from "./notifications";
@@ -109,6 +110,8 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
      * The student number is generated (STU-000001, ...) unless one is given. An optional grade starts a `student_level` on the registration day.
      */
     async register(input: {
+      /** The user registering the student. A guardian who is already known by phone is reused only if this user may manage that guardian (`guardianInScope`). */
+      actor: string;
       fullName: string;
       dateOfBirth: string;
       gradeLevelId?: string;
@@ -211,6 +214,14 @@ export function createStudentService(db: Db, opts: { now?: () => Date } = {}) {
         const wantPrimary = Math.max(0, people.findIndex((x) => x.primary));
         for (const [i, { g, phone }] of people.entries()) {
           let row = await findGuardianByPhone(tx, phone);
+          if (row) {
+            // The same rule as guardians.link: reusing a known guardian by phone hands this actor that guardian's details through the new link. Allowed when
+            // the guardian has no student yet, or the actor manages one of their children; otherwise an all-branches manager has to make the link.
+            const [anyLink] = await tx.select({ id: studentGuardian.studentId }).from(studentGuardian).where(eq(studentGuardian.guardianId, row.id)).limit(1);
+            if (anyLink && !(await guardianInScope(tx, input.actor, row.id))) {
+              throw new ServiceError("forbidden", "This phone number belongs to a guardian of students outside your branches. Ask an all-branches manager to register or link them.");
+            }
+          }
           const created = !row;
           if (!row) {
             [row] = await tx

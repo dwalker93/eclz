@@ -105,6 +105,18 @@ describe("guards and errors", () => {
     eq([b.status, b.json.error.code], [400, "invalid_request"]);
     eq((await get("/nope")).status, 404);
   });
+
+  test("an oversized JSON body is 413 before it is parsed, on a public route and on the larger-limit routes", async () => {
+    const huge = JSON.stringify({ identifier: "a".repeat(70 * 1024), password: "x" });
+    const a = await call("POST", "/auth/sign-in", { raw: huge });
+    eq([a.status, a.json.error.code], [413, "payload_too_large"]);
+    // Under the default limit it reaches validation as before.
+    const b = await call("POST", "/auth/sign-in", { raw: JSON.stringify({ identifier: "a".repeat(1000), password: "x" }) });
+    eq(b.status === 413, false);
+    // A route that checks the session first never reads the body of a signed-out caller.
+    const c = await call("POST", "/admin/attendance/sessions/00000000-0000-4000-8000-000000000000/mark", { raw: huge, cookie: null });
+    eq(c.status, 401);
+  });
 });
 
 describe("sign-in over HTTP", () => {
@@ -167,7 +179,7 @@ describe("admin portal", () => {
     const stu = await id(`INSERT INTO student (student_no, full_name, date_of_birth) VALUES ('API1','Kid','2014-05-01')`);
     await q(`INSERT INTO student_branch (student_id, branch_id, is_primary) VALUES ($1,$2,true)`, [stu, b1]);
     const item = await content.createItem({ lecturerId: lec, kind: "recording", title: "Paid", externalUrl: "https://youtu.be/abc", accessType: "paid", price: "500.00", branchIds: [b1] });
-    await content.setStatus({ contentId: item.id, status: "published" });
+    await content.setStatus({ actor: root, contentId: item.id, status: "published" });
     const purchase = await content.purchase({ contentId: item.id, studentId: stu });
     const method = String((await q(`SELECT id FROM payment_method WHERE type = 'bank_transfer'`))[0]!.id);
     const bank = await id(`INSERT INTO bank_account (branch_id, bank_name, account_name, account_number) VALUES ($1,'BOC','T','1')`, [b1]);
@@ -231,7 +243,7 @@ describe("portals", () => {
   test("a student sees their own library; a parent signs in with the phone, sets a password, then sees only their child", async () => {
     const lec = await id(`INSERT INTO lecturer (full_name) VALUES ('Ms Perera')`);
     const free = await content.createItem({ lecturerId: lec, kind: "recording", title: "Free lesson", externalUrl: "https://youtu.be/free", accessType: "free_registered", branchIds: [b1] });
-    await content.setStatus({ contentId: free.id, status: "published" });
+    await content.setStatus({ actor: root, contentId: free.id, status: "published" });
 
     const su = await newUser();
     const stu = await id(`INSERT INTO student (student_no, full_name, date_of_birth, user_id) VALUES ('API2','Mine','2012-01-01',$1)`, [su]);
@@ -719,9 +731,12 @@ describe("fee exceptions, promotion and payouts", () => {
     // approve and refresh share one shape: { payout, pulledReversals }.
     const second = await id(`INSERT INTO teacher_payout (lecturer_id, period_start, period_end, gross_collected, commission_total, net_payable, status) VALUES ($1,'2027-03-01','2027-04-01','100','20','80','draft')`, [lec2]);
     // One accrual entry in the draft, without building the payment chain behind it (foreign keys are skipped for this insert only).
-    await q(`SET session_replication_role = replica`);
-    await q(`INSERT INTO commission_entry (payment_allocation_id, rule_id, lecturer_id, entry_type, calc_type_applied, rate_applied, share_percent_applied, basis_applied, base_amount, commission_amount, teacher_amount, status, payout_id) VALUES (gen_random_uuid(), gen_random_uuid(), $1,'accrual','percent',20,100,'paid',100,20,80,'settled',$2)`, [lec2, second]);
-    await q(`SET session_replication_role = origin`);
+    try {
+      await q(`SET session_replication_role = replica`);
+      await q(`INSERT INTO commission_entry (payment_allocation_id, rule_id, lecturer_id, entry_type, calc_type_applied, rate_applied, share_percent_applied, basis_applied, base_amount, commission_amount, teacher_amount, status, payout_id) VALUES (gen_random_uuid(), gen_random_uuid(), $1,'accrual','percent',20,100,'paid',100,20,80,'settled',$2)`, [lec2, second]);
+    } finally {
+      await q(`SET session_replication_role = origin`);
+    }
     const refreshed = await post(`/admin/payouts/${second}/refresh`, {}, all);
     eq([refreshed.status, refreshed.json.payout.id, typeof refreshed.json.pulledReversals], [200, second, "number"]);
     const ok = await post(`/admin/payouts/${second}/approve`, {}, all);
@@ -1448,5 +1463,19 @@ describe("exam routes: shared exams and timestamps", () => {
     eq([ok.status, new Date(ok.json.exam.opensAt).toISOString()], [201, "2099-01-01T08:00:00.000Z"], "an offset is honoured");
     const missing = await post("/admin/exams/exams", { ...base, closesAt: closes }, rootCookie);
     eq([missing.status, missing.json.error.code], [422, "exam_invalid"]);
+  });
+});
+
+describe("fixtures leave constraint enforcement on", () => {
+  // Runs last: a fixture that skipped foreign keys and failed before restoring them would show here instead of silently weakening every later check.
+  test("the connection is back in normal replication mode and foreign keys reject a dangling reference", async () => {
+    eq((await q(`SHOW session_replication_role`))[0]!.session_replication_role, "origin", "role");
+    let message = "";
+    try {
+      await q(`INSERT INTO enrollment (course_id, student_id) VALUES (gen_random_uuid(), gen_random_uuid())`);
+    } catch (e) {
+      message = String((e as Error).message);
+    }
+    eq(/foreign key|violates/i.test(message), true, "a dangling reference is refused");
   });
 });

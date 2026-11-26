@@ -107,6 +107,17 @@ export interface QuestionInput {
 
 /** The largest total a numeric(8,2) column can hold, in cents: an exam's total marks are the sum of its question marks. */
 const MAX_TOTAL_CENTS = 99_999_999;
+/**
+ * One spelling of a question's marks, from a string or a number, used for both the total and the stored value. A number is rounded to two decimals the way
+ * the numeric column and `enterMarks` round it; a string must already have at most two. Anything else is `question_invalid`, never a plain Error.
+ */
+function normalizeMarks(value: string | number): string {
+  if (typeof value === "number" && !Number.isFinite(value)) throw new ServiceError("question_invalid", "Marks must be a number.");
+  const text = typeof value === "number" ? value.toFixed(2) : value.trim();
+  // A sign is let through so that zero and negative marks get the "above zero" error; anything else that toCents cannot read (1e21, "1.234", "abc") is refused here.
+  if (!/^-?\d+(\.\d{1,2})?$/.test(text)) throw new ServiceError("question_invalid", "Marks must be a number with at most two decimals.");
+  return fromCents(toCents(text));
+}
 const totalTooLarge = () => new ServiceError("exam_invalid", "The questions add up to more marks than an exam can hold (999999.99).");
 
 function checkQuestion(input: QuestionInput) {
@@ -121,9 +132,14 @@ function checkQuestion(input: QuestionInput) {
 function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
   const now = () => (opts.now ?? (() => new Date()))();
 
-  async function loadExam(tx: Tx, examId: string, lock = false): Promise<ExamRow> {
+  /**
+   * `lock` true is FOR UPDATE; "no_key_update" is FOR NO KEY UPDATE. Both conflict with each other and with themselves, so start, close and the other
+   * exam changes still run one at a time. Only FOR UPDATE also conflicts with FOR KEY SHARE, which an insert of any row that references the exam
+   * (an attempt, a result) holds on it.
+   */
+  async function loadExam(tx: Tx, examId: string, lock: boolean | "no_key_update" = false): Promise<ExamRow> {
     const q = tx.select().from(exam).where(eq(exam.id, examId));
-    const [e] = await (lock ? q.for("update") : q);
+    const [e] = await (lock === "no_key_update" ? q.for("no key update") : lock ? q.for("update") : q);
     if (!e) throw new ServiceError("not_found", "Exam not found.");
     return e;
   }
@@ -327,17 +343,17 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         if (bank.some((q) => q.lecturerId !== ex.lecturerId)) throw new ServiceError("question_invalid", "A question belongs to another lecturer.");
         const byId = new Map(bank.map((q) => [q.id, q]));
         // The total, with the bank's defaults for entries that give no marks, must fit before anything is replaced.
+        const entries = input.questions.map((q) => ({ questionId: q.questionId, marks: normalizeMarks(q.marks ?? byId.get(q.questionId)!.defaultMarks) }));
         let total = 0;
-        for (const q of input.questions) {
-          const m = String(q.marks ?? byId.get(q.questionId)!.defaultMarks);
-          if (!(Number(m) > 0)) throw new ServiceError("question_invalid", "Marks must be above zero.");
-          total += toCents(m);
+        for (const e of entries) {
+          const cents = toCents(e.marks);
+          if (!(cents > 0)) throw new ServiceError("question_invalid", "Marks must be above zero.");
+          total += cents;
         }
         if (total > MAX_TOTAL_CENTS) throw totalTooLarge();
         await tx.delete(examQuestion).where(eq(examQuestion.examId, ex.id));
-        for (const [i, q] of input.questions.entries()) {
-          const marks = String(q.marks ?? byId.get(q.questionId)!.defaultMarks);
-          if (!(Number(marks) > 0)) throw new ServiceError("question_invalid", "Marks must be above zero.");
+        for (const [i, q] of entries.entries()) {
+          const marks = q.marks;
           await tx.insert(examQuestion).values({ examId: ex.id, questionId: q.questionId, marks, position: i + 1 });
         }
         return input.questions.length;
@@ -394,7 +410,10 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
      */
     async closeExam(input: { examId: string }) {
       return db.transaction(async (tx) => {
-        const ex = await loadExam(tx, input.examId, true);
+        // FOR NO KEY UPDATE, not FOR UPDATE: ending a running attempt below can insert its exam_result, whose foreign key needs FOR KEY SHARE on this row, and
+        // a save that expired the same attempt holds the attempt lock while it does that. With FOR UPDATE here the two would wait for each other and
+        // PostgreSQL would abort one. startAttempt takes FOR UPDATE, which still conflicts with this lock, so start and close stay one at a time.
+        const ex = await loadExam(tx, input.examId, "no_key_update");
         if (ex.status !== "published") throw new ServiceError("exam_not_published", "Only a published exam can be closed.");
         const running = await tx.select().from(examAttempt).where(and(eq(examAttempt.examId, ex.id), eq(examAttempt.status, "in_progress"))).orderBy(asc(examAttempt.id)).for("update");
         for (const a of running) {
@@ -421,7 +440,7 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
         .then((rows) => Promise.all(rows.map((r) => finalizeLate(r.id, input.studentId))));
       try {
         return await db.transaction(async (tx) => {
-          // closeExam takes this same lock, so starting and closing serialize.
+          // closeExam takes FOR NO KEY UPDATE on this row, which conflicts with this lock, so starting and closing serialize.
           const ex = await loadExam(tx, input.examId, true);
           if (ex.mode !== "online_mcq") throw new ServiceError("exam_invalid", "This is a paper exam.");
           if (ex.status !== "published") throw new ServiceError("exam_not_published", "The exam is not open.");

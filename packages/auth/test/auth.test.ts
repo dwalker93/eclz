@@ -1,7 +1,7 @@
 /**
  * Sign-in: passwords, parent first login, sessions, staff authenticator codes, rate limits, resets.
  */
-import { afterAll, describe, test } from "bun:test";
+import { afterAll, describe, spyOn, test } from "bun:test";
 import { createAccessControlService, createGuardianService, resolveIdentity, ServiceError } from "@workspace/domain";
 import { createAuthService, hashPassword, signInKey, totp, verifyTotp } from "../src";
 import { eq, fails } from "./helpers";
@@ -139,6 +139,18 @@ describe("sessions", () => {
     await auth.authenticate(fresh.token);
     await auth.signOutEverywhere(lecUser);
     await fails("unauthenticated", () => auth.authenticate(fresh.token));
+  });
+
+  test("a session that survived from before sessions were deleted on disable does not come back when the account is re-enabled", async () => {
+    const u = await newUser();
+    const email = (await q(`SELECT email FROM "user" WHERE id = $1`, [u]))[0]!.email as string;
+    const old = await auth.signIn({ identifier: email, password: GOOD });
+    // the old behaviour: the status flips and the session row stays
+    await q(`UPDATE "user" SET status = 'disabled' WHERE id = $1`, [u]);
+    await fails("unauthenticated", () => auth.authenticate(old.token));
+    await acl.setUserStatus({ userId: u, status: "active", actor: root });
+    await fails("unauthenticated", () => auth.authenticate(old.token));
+    eq(await count(`SELECT count(*)::int AS c FROM auth_session WHERE user_id = $1`, [u]), 0, "sessions deleted at enable");
   });
 
   test("purgeExpired removes only expired sessions", async () => {
@@ -279,6 +291,44 @@ describe("parent first login", () => {
     await auth.firstLogin({ phone: "0771230002" });
     await acl.assignRole({ userId: u, roleName: "payment_handler", actor: root });
     await fails("invalid_credentials", () => auth.firstLogin({ phone: "0771230002" }));
+  });
+
+  test("the first login is checked again under the user lock: a change that commits after the lookup stops the session", async () => {
+    // The lookup (findFirstLoginUser) runs before the session transaction. `between` runs just before that transaction starts, as a concurrent write would.
+    const racing = (between: () => Promise<unknown>) =>
+      createAuthService(
+        new Proxy(db, {
+          get(t, k, r) {
+            if (k !== "transaction") return Reflect.get(t, k, r);
+            return async (...a: unknown[]) => {
+              await between();
+              return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+            };
+          },
+        }),
+        { secretKey: "test-secret-key-0123456789", now: () => clock },
+      );
+    const sessions = (u: string) => count(`SELECT count(*)::int AS c FROM auth_session WHERE user_id = $1`, [u]);
+    const MODULES = `UPDATE organization SET enabled_modules = '{"parent_portal": true, "lecturer_portal": true}'::jsonb`;
+    const cases: [string, (u: string) => Promise<unknown>][] = [
+      ["a phone change", (u) => q(`UPDATE "user" SET phone = '94779990000' WHERE id = $1`, [u])],
+      ["a password set", (u) => q(`UPDATE "user" SET password_hash = $2 WHERE id = $1`, [u, goodHash])],
+      ["the portal switched off", (u) => q(`UPDATE guardian SET portal_enabled = false WHERE user_id = $1`, [u])],
+      ["the account disabled", (u) => q(`UPDATE "user" SET status = 'disabled' WHERE id = $1`, [u])],
+      ["the module switched off", () => q(`UPDATE organization SET enabled_modules = '{}'::jsonb`)],
+      ["a staff role assigned", (u) => acl.assignRole({ userId: u, roleName: "payment_handler", actor: root })],
+      ["a lecturer record linked", (u) => q(`INSERT INTO lecturer (full_name, user_id) VALUES ('L', $1)`, [u])],
+    ];
+    for (const [k, [name, change]] of cases.entries()) {
+      const digits = `0771231${String(100 + k)}`;
+      const u = await newParent(`94${digits.slice(1)}`);
+      await fails("invalid_credentials", () => racing(() => change(u)).firstLogin({ phone: digits }));
+      eq([name, await sessions(u)], [name, 0]);
+      await q(MODULES);
+    }
+    // nothing changed in between: the session is issued
+    const ok = await newParent("94771231200");
+    eq((await racing(async () => {}).firstLogin({ phone: "0771231200" })).principal.userId, ok);
   });
 
   test("five tries per number in a window", async () => {
@@ -429,6 +479,42 @@ describe("numeric usernames and canonical throttling", () => {
     eq((await auth.signIn({ identifier: "123456789", password: GOOD })).principal.userId, byName, "username still works");
     eq((await auth.signIn({ identifier: "123456789", password: "another long passphrase" })).principal.userId, byPhone, "phone account too");
     await fails("invalid_credentials", () => auth.signIn({ identifier: "123456789", password: "not either of them!!" }));
+  });
+
+  test("failure counts are per account: a sign-in to one account does not reset the other account the same identifier names", async () => {
+    const mine = await newUser({ username: "143456789" });
+    const victim = await id(`INSERT INTO "user" (username, phone, password_hash) VALUES ('parent-94143456789', '94143456789', $1)`, [await hashPassword("victim long passphrase")]);
+    const failures = async (userId: string) => (await q(`SELECT count FROM auth_rate_limit WHERE key = $1`, [`signin:acct:${userId}`]))[0]?.count ?? null;
+    for (let i = 0; i < 3; i++) await fails("invalid_credentials", () => auth.signIn({ identifier: "143456789", password: "wrong password!!" }));
+    eq([await failures(victim), await failures(mine)], [3, 3]);
+    // the owner of the numeric username signs in: that account's count goes, the phone account's keeps counting (it was tried first and failed)
+    eq((await auth.signIn({ identifier: "143456789", password: GOOD })).principal.userId, mine);
+    eq([await failures(victim), await failures(mine)], [4, null]);
+    // the shared identifier counter was not cleared either, because the identifier names two accounts
+    eq(Number((await q(`SELECT count FROM auth_rate_limit WHERE key = $1`, [signInKey("143456789")]))[0]!.count) > 0, true);
+    // the phone account's owner still signs in (the phone account is tried first, so the other is not counted) and its count goes
+    eq((await auth.signIn({ identifier: "143456789", password: "victim long passphrase" })).principal.userId, victim);
+    eq([await failures(victim), await failures(mine)], [null, null]);
+  });
+
+  test("a locked account is skipped, so it cannot stop the other account's owner, and wrong guesses report rate_limited", async () => {
+    const mine = await newUser({ username: "153456789" });
+    const victim = await id(`INSERT INTO "user" (username, phone, password_hash) VALUES ('parent-94153456789', '94153456789', $1)`, [await hashPassword("victim long passphrase")]);
+    await q(`INSERT INTO auth_rate_limit (key, count, window_start) VALUES ($1, 10, $2)`, [`signin:acct:${victim}`, clock]);
+    eq((await auth.signIn({ identifier: "153456789", password: GOOD })).principal.userId, mine);
+    await fails("rate_limited", () => auth.signIn({ identifier: "153456789", password: "victim long passphrase" }));
+  });
+
+  test("one account has one failure budget across its email, username and phone", async () => {
+    const u = await id(`INSERT INTO "user" (email, username, phone, password_hash) VALUES ('budget@example.com', 'budget-user', '94771239811', $1)`, [goodHash]);
+    const wrong = (identifier: string) => auth.signIn({ identifier, password: "wrong password!!" });
+    for (let i = 0; i < 4; i++) await fails("invalid_credentials", () => wrong("budget@example.com"));
+    for (let i = 0; i < 4; i++) await fails("invalid_credentials", () => wrong("budget-user"));
+    await fails("invalid_credentials", () => wrong("0771239811"));
+    await fails("invalid_credentials", () => wrong("0771239811"));
+    await fails("rate_limited", () => wrong("0771239811"));
+    await fails("rate_limited", () => auth.signIn({ identifier: "budget@example.com", password: GOOD }));
+    eq(u.length > 0, true);
   });
 
   test("phone spellings share one counter; usernames keep their case", async () => {
@@ -629,5 +715,72 @@ describe("parent password reset is scoped to branches", () => {
     await guardians.update({ guardianId: p.g, actor: local, fullName: "Scoped Parent" });
     await auth.resetParentPassword({ guardianId: p.g, actor: local });
     eq(await count(`SELECT count(*)::int AS c FROM "user" WHERE id = $1 AND password_hash IS NULL`, [p.u]), 1);
+  });
+});
+
+describe("review fixes: step cleanup, expiry under the lock, password work", () => {
+  const refuseCounterReset = async (fn: () => Promise<unknown>) => {
+    await q(`CREATE FUNCTION no_counter_reset() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'counter reset refused'; END $$ LANGUAGE plpgsql`);
+    await q(`CREATE TRIGGER no_counter_reset BEFORE DELETE ON auth_rate_limit FOR EACH ROW EXECUTE FUNCTION no_counter_reset()`);
+    try {
+      let threw = false;
+      await fn().catch(() => (threw = true));
+      eq(threw, true, "the step failed as a whole");
+    } finally {
+      await q(`DROP TRIGGER no_counter_reset ON auth_rate_limit`);
+      await q(`DROP FUNCTION no_counter_reset()`);
+    }
+  };
+
+  test("a failed counter reset does not consume the authenticator code: the same code finishes the step on retry (sign-in and enrolment)", async () => {
+    const u = await newUser({ email: "mfa-reset@example.com" });
+    await acl.assignRole({ userId: u, roleName: "student_counselor", actor: root });
+    const first = await auth.signIn({ identifier: "mfa-reset@example.com", password: GOOD });
+    const { secret } = await auth.beginMfaEnrollment({ token: first.token });
+    const enrolCode = totp(secret, clock);
+    await refuseCounterReset(() => auth.confirmMfaEnrollment({ token: first.token, code: enrolCode }));
+    eq(await count(`SELECT count(*)::int AS c FROM user_two_factor WHERE user_id = $1 AND enabled_at IS NOT NULL`, [u]), 0, "enrolment rolled back");
+    const { recoveryCodes } = await auth.confirmMfaEnrollment({ token: first.token, code: enrolCode });
+    eq(recoveryCodes.length, 8, "the same code enrols on retry");
+
+    const s = await auth.signIn({ identifier: "mfa-reset@example.com", password: GOOD });
+    const code = totp(secret, new Date(clock.getTime() + 30_000));
+    await refuseCounterReset(() => auth.verifyMfa({ token: s.token, code }));
+    eq(await count(`SELECT count(*)::int AS c FROM auth_session WHERE id = $1 AND mfa_verified_at IS NOT NULL`, [s.principal.sessionId]), 0, "not verified");
+    const ok = await auth.verifyMfa({ token: s.token, code });
+    eq(ok.restriction, null, "the same code finishes it on retry");
+  });
+
+  test("a session that expires while a password change is running cannot commit it", async () => {
+    const u = await newUser({ email: "expiring@example.com" });
+    const s = await auth.signIn({ identifier: "expiring@example.com", password: GOOD });
+    // The clock jumps a year ahead only for the read inside the credential lock, so the early expiry check passes and the locked one must catch it.
+    const lateInLock = createAuthService(db, { secretKey: "test-secret-key-0123456789", now: () => ((new Error().stack ?? "").includes("lockUserAndSession") ? new Date(clock.getTime() + 365 * 24 * HOUR) : clock) });
+    await fails("unauthenticated", () => lateInLock.changePassword({ token: s.token, currentPassword: GOOD, newPassword: "a brand new password" }));
+    eq(await count(`SELECT count(*)::int AS c FROM audit_log WHERE action = 'user.password_changed' AND entity_id = $1`, [u]), 0, "not changed");
+    await auth.changePassword({ token: s.token, currentPassword: GOOD, newPassword: "a brand new password" });
+  });
+
+  test("a failed sign-in costs the same number of password checks whatever the identifier matched", async () => {
+    await id(`INSERT INTO "user" (username, password_hash) VALUES ('987654321', $1)`, [goodHash]);
+    await id(`INSERT INTO "user" (username, phone, password_hash) VALUES ('parent-94987654321', '94987654321', $1)`, [goodHash]);
+    await id(`INSERT INTO "user" (username, phone, password_hash) VALUES ('parent-94771234599', '94771234599', $1)`, [goodHash]);
+    await newUser({ email: "workcheck@example.com" });
+    const spy = spyOn(Bun.password, "verify");
+    try {
+      const checks = async (identifier: string) => {
+        spy.mockClear();
+        await fails("invalid_credentials", () => auth.signIn({ identifier, password: "definitely not it" }));
+        return spy.mock.calls.length;
+      };
+      eq(await checks("0770000000"), 2, "phone-like, no account");
+      eq(await checks("0771234599"), 2, "phone-like, one account");
+      eq(await checks("987654321"), 2, "phone-like, two accounts");
+      eq(await checks("nobody@example.com"), 1, "email, no account");
+      eq(await checks("workcheck@example.com"), 1, "email, one account");
+      eq(await checks("no-such-name"), 1, "username, no account");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

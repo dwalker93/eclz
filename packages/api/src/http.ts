@@ -4,7 +4,7 @@ import { ZodError, type ZodType } from "zod";
 
 export class HttpError extends Error {
   constructor(
-    readonly status: 400 | 401 | 403 | 404 | 429,
+    readonly status: 400 | 401 | 403 | 404 | 413 | 429,
     readonly code: string,
     message: string,
   ) {
@@ -87,9 +87,47 @@ export function onError(err: unknown, c: Context) {
   return c.json({ error: { code: "internal_error", message: "Something went wrong" } }, 500);
 }
 
-/** Parses a JSON body with a zod schema (invalid: 400). An empty body counts as `{}`. */
-export async function jsonBody<T>(c: Context, schema: ZodType<T>): Promise<T> {
-  const text = await c.req.text();
+/** Largest JSON body a route accepts unless it asks for more: far above any normal form, far below anything that costs real memory. */
+export const JSON_BODY_LIMIT = 64 * 1024;
+/** For the few routes that take a batch of up to 500 entries with free-text fields (marks, attendance). */
+export const LARGE_JSON_BODY_LIMIT = 512 * 1024;
+
+const tooLarge = () => new HttpError(413, "payload_too_large", "Request body is too large");
+
+/**
+ * Reads the body as text, refusing more than `maxBytes` (413). A declared `Content-Length` over the limit is refused without reading anything;
+ * because that header can be absent or wrong, the stream is also counted and cancelled the moment it passes the limit, so at most `maxBytes`
+ * (plus one chunk) is ever held in memory.
+ */
+async function readTextLimited(req: Request, maxBytes: number): Promise<string> {
+  const declared = req.headers.get("content-length");
+  if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > maxBytes) throw tooLarge();
+  if (!req.body) return "";
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return new TextDecoder().decode(all);
+}
+
+/** Parses a JSON body with a zod schema (invalid: 400, over `maxBytes`: 413, checked before parsing). An empty body counts as `{}`. */
+export async function jsonBody<T>(c: Context, schema: ZodType<T>, maxBytes: number = JSON_BODY_LIMIT): Promise<T> {
+  const text = await readTextLimited(c.req.raw, maxBytes);
   let raw: unknown = {};
   if (text.trim()) {
     try {

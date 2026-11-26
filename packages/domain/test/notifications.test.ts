@@ -100,9 +100,9 @@ describe("pure helpers", () => {
     await bad({ to: "1", body: "x" }).catch((e) => (msg = e.message));
     eq(msg, "text.lk: Invalid token", "error");
   });
-  test("text.lk request carries an abort signal that fires", async () => {
+  test("text.lk: a normal response still succeeds with the deadline signal attached", async () => {
     let signal: AbortSignal | null | undefined;
-    const hang = createTextLkSms({
+    const ok = createTextLkSms({
       apiToken: "t",
       senderId: "I",
       fetch: (async (_u: string, init: RequestInit) => {
@@ -110,9 +110,31 @@ describe("pure helpers", () => {
         return new Response(JSON.stringify({ status: "success" }), { status: 200 });
       }) as unknown as typeof fetch,
     });
-    await hang({ to: "1", body: "x" });
+    await ok({ to: "1", body: "x" });
     eq(signal instanceof AbortSignal, true, "signal passed");
-    eq(signal!.aborted, false, "not yet aborted");
+    eq(signal!.aborted, false, "not aborted by a prompt answer");
+  });
+  test("text.lk: a request that never answers is aborted when the deadline expires, and the failure is a timeout (an unknown outcome)", async () => {
+    let aborted = false;
+    const hang = createTextLkSms({
+      apiToken: "t",
+      senderId: "I",
+      timeoutMs: 30,
+      // waits until the signal aborts, like a real fetch: a signal that never fires leaves it pending
+      fetch: ((_u: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal!.addEventListener("abort", () => {
+            aborted = true;
+            reject(init.signal!.reason);
+          });
+        })) as unknown as typeof fetch,
+    });
+    const outcome = await Promise.race([
+      hang({ to: "1", body: "x" }).then(() => "resolved", (e: Error) => e.name),
+      new Promise<string>((r) => setTimeout(() => r("still pending after 1s"), 1000)),
+    ]);
+    eq(outcome, "TimeoutError", "rejects with the abort reason");
+    eq(aborted, true, "the request was aborted");
   });
 });
 
@@ -191,7 +213,7 @@ describe("dispatcher", () => {
     await svc.runDueSoonJob();
   }
   const drain = async () => {
-    await q(`DELETE FROM notification WHERE channel <> 'in_app' AND status IN ('queued','failed')`);
+    await q(`DELETE FROM notification WHERE channel <> 'in_app' AND status IN ('queued','sending','failed','unconfirmed')`);
   };
 
   test("sends queued SMS with the rendered template and marks the row sent", async () => {
@@ -203,7 +225,7 @@ describe("dispatcher", () => {
     const p = await person({ phone: "077 111 2222" });
     await queued(p, "2027-03-12");
     const r = await svc.dispatchQueued();
-    eq(r, { attempted: 2, sent: 2, failed: 0, skipped: 0 }, "result");
+    eq(r, { attempted: 2, sent: 2, failed: 0, unconfirmed: 0, lost: 0, expired: 0 }, "result");
     eq(sent.sms.length, 1, "one sms");
     eq(sent.sms[0]!.to, "94771112222", "normalised number");
     eq(sent.sms[0]!.body.includes("pay 2500"), true, "rendered body");
@@ -296,7 +318,12 @@ describe("dispatcher", () => {
     eq((await q(`SELECT error FROM notification WHERE user_id = $1 AND channel = 'email'`, [p.userId]))[0]!.error, "user inactive", "reason");
   });
 
-  test("a provider that never answers fails the row instead of holding the lock", async () => {
+  const statusOf = async (userId: string, channel = "email") => {
+    const r = (await q(`SELECT id, status, error FROM notification WHERE user_id = $1 AND channel = $2`, [userId, channel]))[0]!;
+    return { id: String(r.id), status: String(r.status), error: r.error as string | null };
+  };
+
+  test("a provider that never answers does not hold the lock, and the row is unconfirmed, not failed: retryFailed leaves it alone", async () => {
     await drain();
     await setModules({ email: true });
     await setChannel("email", true);
@@ -304,10 +331,250 @@ describe("dispatcher", () => {
     const p = await person();
     await queued(p, "2027-03-11");
     const r = await slow.dispatchQueued();
-    eq(r.failed >= 1, true, "failed");
-    const [row] = await q(`SELECT status, error FROM notification WHERE user_id = $1 AND channel = 'email'`, [p.userId]);
-    eq(row!.status, "failed", "status");
-    eq(String(row!.error).startsWith("provider timed out"), true, "reason");
+    eq([r.failed, r.unconfirmed], [0, 1], "counted as unconfirmed");
+    const row = await statusOf(p.userId);
+    eq(row.status, "unconfirmed", "status");
+    eq(String(row.error).startsWith("provider did not answer"), true, "reason");
+    eq(await slow.retryFailed(), 0, "retryFailed does not requeue it");
+    eq((await statusOf(p.userId)).status, "unconfirmed", "still unconfirmed");
+    eq((await slow.dispatchQueued()).attempted, 0, "dispatch does not pick it up");
+  });
+
+  test("a provider that answers after the deadline cannot be sent to twice through retryFailed", async () => {
+    await drain();
+    await setModules({ email: true });
+    await setChannel("email", true);
+    const delivered: string[] = [];
+    const late = createNotificationService(db, {
+      now,
+      providerTimeoutMs: 20,
+      providers: { email: async (m) => { await new Promise((r) => setTimeout(r, 80)); delivered.push(m.to); } },
+    });
+    const p = await person();
+    await queued(p, "2027-03-11");
+    await late.dispatchQueued();
+    await new Promise((r) => setTimeout(r, 120));
+    eq(delivered.length, 1, "the provider did accept it after the deadline");
+    eq(await late.retryFailed(), 0, "and no retry path re-sends it");
+    await late.dispatchQueued();
+    eq(delivered.length, 1, "still one delivery");
+  });
+
+  test("a refusal is still a confirmed failure that retryFailed re-sends", async () => {
+    await drain();
+    await setModules({ email: true });
+    await setChannel("email", true);
+    let refuse = true;
+    const svc2 = createNotificationService(db, { now, providers: { email: async () => { if (refuse) throw new Error("550 mailbox unavailable"); } } });
+    const p = await person();
+    await queued(p, "2027-03-11");
+    eq((await svc2.dispatchQueued()).failed, 1, "failed");
+    eq((await statusOf(p.userId)).status, "failed", "status");
+    refuse = false;
+    eq(await svc2.retryFailed(), 1, "requeued");
+    eq((await svc2.dispatchQueued()).sent, 1, "sent");
+  });
+
+  test("retryUnconfirmed re-sends only for a provider declared idempotent, with the same key; otherwise an operator resolves the row", async () => {
+    await drain();
+    await setModules({ email: true });
+    await setChannel("email", true);
+    const keys: string[] = [];
+    let hang = true;
+    const providers = { email: async (_m: EmailMessage, ctx: { idempotencyKey: string }) => { keys.push(ctx.idempotencyKey); if (hang) await new Promise(() => {}); } };
+    const plain = createNotificationService(db, { now, providerTimeoutMs: 20, providers });
+    const p = await person();
+    await queued(p, "2027-03-11");
+    await plain.dispatchQueued();
+    const row = await statusOf(p.userId);
+    eq(row.status, "unconfirmed", "unconfirmed");
+    eq(await plain.retryUnconfirmed(), 0, "not declared idempotent: nothing is requeued");
+    eq((await statusOf(p.userId)).status, "unconfirmed", "still waiting for an operator");
+
+    hang = false;
+    const idem = createNotificationService(db, { now, providerTimeoutMs: 20, providers: { ...providers, idempotent: { email: true } } });
+    eq(await idem.retryUnconfirmed(), 1, "declared idempotent: requeued");
+    eq((await idem.dispatchQueued()).sent, 1, "sent");
+    eq(keys, [row.id, row.id], "the same key both times");
+  });
+
+  test("resolveUnconfirmed records the operator's answer and works only on an unconfirmed row", async () => {
+    await drain();
+    await setModules({ email: true });
+    await setChannel("email", true);
+    const slow = createNotificationService(db, { now, providerTimeoutMs: 20, providers: { email: () => new Promise<void>(() => {}) } });
+    const a = await person();
+    const b = await person();
+    await queued(a, "2027-03-11");
+    await queued(b, "2027-03-11");
+    await slow.dispatchQueued();
+    const rowA = await statusOf(a.userId);
+    const rowB = await statusOf(b.userId);
+    await slow.resolveUnconfirmed({ id: rowA.id, outcome: "sent" });
+    const doneA = (await q(`SELECT status, sent_at, error FROM notification WHERE id = $1`, [rowA.id]))[0]!;
+    eq([doneA.status, doneA.sent_at !== null, doneA.error], ["sent", true, null], "delivered");
+    await slow.resolveUnconfirmed({ id: rowB.id, outcome: "not_delivered" });
+    eq((await statusOf(b.userId)).status, "failed", "not delivered becomes failed");
+    eq(await slow.retryFailed(), 1, "and retryFailed may now send it");
+    await fails("not_found", () => slow.resolveUnconfirmed({ id: rowA.id, outcome: "not_delivered" }));
+  });
+
+  test("push: a device that got it makes it sent; only timeouts leave it unconfirmed", async () => {
+    await drain();
+    await setModules({ web_push: true });
+    await setChannel("push", true);
+    const mk = async () => {
+      const p = await person();
+      // endpoints are unique, so each person's devices get their own; "a" ends the first device's endpoint, "b" the second
+      await q(`INSERT INTO push_subscription (user_id, endpoint, p256dh_key, auth_key) VALUES ($1,$2,'k1','a1'), ($1,$3,'k2','a2')`, [p.userId, `https://push/${p.userId}/a`, `https://push/${p.userId}/b`]);
+      await queued(p, "2027-03-11");
+      return p;
+    };
+    const mixed = await mk();
+    const svcMixed = createNotificationService(db, { now, providerTimeoutMs: 20, providers: { push: async (m) => { if (m.subscription.endpoint.endsWith("a")) await new Promise(() => {}); } } });
+    await svcMixed.dispatchQueued();
+    eq((await statusOf(mixed.userId, "push")).status, "sent", "one device delivered");
+    await drain();
+    const hung = await mk();
+    const svcHung = createNotificationService(db, { now, providerTimeoutMs: 20, providers: { push: async (m) => { if (m.subscription.endpoint.endsWith("a")) await new Promise(() => {}); throw new Error("410 gone"); } } });
+    await svcHung.dispatchQueued();
+    eq((await statusOf(hung.userId, "push")).status, "unconfirmed", "a timed-out device may still receive it");
+    await drain();
+    const refused = await mk();
+    const svcRefused = createNotificationService(db, { now, providers: { push: async () => { throw new Error("410 gone"); } } });
+    await svcRefused.dispatchQueued();
+    eq((await statusOf(refused.userId, "push")).status, "failed", "all refused is a confirmed failure");
+  });
+
+  describe("claim and lease", () => {
+    const row = async (userId: string, channel = "email") => (await q(`SELECT status, to_char(claimed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') AS claimed_until, error, sent_at FROM notification WHERE user_id = $1 AND channel = $2`, [userId, channel]))[0]!;
+
+    test("the row is `sending` with a lease while the provider is called, and the call runs outside any transaction", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const p = await person();
+      await queued(p, "2027-03-11");
+      let seen: Record<string, unknown> | undefined;
+      // A query made from inside the provider call waits for any open transaction on the connection, so a send inside one would hang here.
+      const probe = createNotificationService(db, { now, providers: { email: async () => void (seen = await row(p.userId)) } });
+      const r = await probe.dispatchQueued();
+      eq(r.sent, 1, "sent");
+      eq(seen!.status, "sending", "claimed while sending");
+      eq(seen!.claimed_until, "2027-03-10T10:01:00", "a 60 second lease");
+      const done = await row(p.userId);
+      eq([done.status, done.claimed_until, done.error, done.sent_at !== null], ["sent", null, null, true], "finished row has no lease");
+    });
+
+    test("each row is claimed when its own send starts, not when the run started", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const a = await person();
+      const b = await person();
+      await queued(a, "2027-03-11");
+      await queued(b, "2027-03-11");
+      let clock = new Date("2027-03-10T10:00:00Z");
+      const leases: string[] = [];
+      const timed = createNotificationService(db, {
+        now: () => clock,
+        providers: {
+          email: async () => {
+            leases.push(String((await q(`SELECT to_char(claimed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS') AS c FROM notification WHERE status = 'sending'`))[0]!.c));
+            clock = new Date(clock.getTime() + 10_000);
+          },
+        },
+      });
+      eq((await timed.dispatchQueued()).sent, 2, "both sent");
+      eq(leases, ["2027-03-10T10:01:00", "2027-03-10T10:01:10"], "second lease starts ten seconds later");
+    });
+
+    test("a row left `sending` past its lease becomes unconfirmed, is not sent again, and one with a live lease is left alone", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const stale = await person();
+      const live = await person();
+      await queued(stale, "2027-03-11");
+      await queued(live, "2027-03-11");
+      await q(`UPDATE notification SET status = 'sending', claimed_until = '2027-03-10T09:59:59Z' WHERE user_id = $1 AND channel = 'email'`, [stale.userId]);
+      await q(`UPDATE notification SET status = 'sending', claimed_until = '2027-03-10T10:00:30Z' WHERE user_id = $1 AND channel = 'email'`, [live.userId]);
+      const before = sent.email.length;
+      const r = await svc.dispatchQueued();
+      eq([r.expired, r.attempted], [1, 0], "one expired, nothing sent");
+      eq(sent.email.length, before, "the provider was not called");
+      const s1 = await row(stale.userId);
+      eq([s1.status, s1.claimed_until, String(s1.error).startsWith("dispatcher stopped")], ["unconfirmed", null, true], "stale row");
+      eq((await row(live.userId)).status, "sending", "live lease untouched");
+      eq(await svc.retryFailed(), 0, "retryFailed does not requeue it");
+      eq((await svc.dispatchQueued()).expired, 0, "nothing more to expire");
+      await svc.resolveUnconfirmed({ id: String((await q(`SELECT id FROM notification WHERE user_id = $1 AND channel = 'email'`, [stale.userId]))[0]!.id), outcome: "sent" });
+      eq((await row(stale.userId)).status, "sent", "an operator can still settle it");
+    });
+
+    test("a result is recorded only while the row is still `sending`: a run whose lease was taken over does not overwrite it", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const p = await person();
+      await queued(p, "2027-03-11");
+      const swept = createNotificationService(db, {
+        now,
+        providers: {
+          email: async () => {
+            await q(`UPDATE notification SET status = 'unconfirmed', claimed_until = NULL, error = 'dispatcher stopped before the provider answered' WHERE user_id = $1 AND channel = 'email'`, [p.userId]);
+          },
+        },
+      });
+      const r = await swept.dispatchQueued();
+      eq([r.sent, r.failed, r.unconfirmed, r.lost], [0, 0, 0, 1], "counted as lost");
+      eq((await row(p.userId)).status, "unconfirmed", "the other run's state stands");
+    });
+
+    test("a row that fails or times out also loses its lease", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const f = await person();
+      const t = await person();
+      await queued(f, "2027-03-11");
+      await queued(t, "2027-03-11");
+      let call = 0;
+      const mixed = createNotificationService(db, {
+        now,
+        providerTimeoutMs: 20,
+        providers: { email: () => (++call === 1 ? Promise.reject(new Error("refused")) : new Promise<void>(() => {})) },
+      });
+      const r = await mixed.dispatchQueued();
+      eq([r.failed, r.unconfirmed], [1, 1], "one each");
+      eq((await q(`SELECT count(*)::int AS c FROM notification WHERE claimed_until IS NOT NULL`))[0]!.c, 0, "no lease left behind");
+    });
+
+    test("push stops trying devices when another call could outlast the lease; untried devices are not an unknown outcome", async () => {
+      await drain();
+      await setModules({ web_push: true });
+      await setChannel("push", true);
+      const p = await person();
+      await q(`INSERT INTO push_subscription (user_id, endpoint, p256dh_key, auth_key) VALUES ($1,$2,'k1','a1'), ($1,$3,'k2','a2'), ($1,$4,'k3','a3')`, [p.userId, `https://push/${p.userId}/1`, `https://push/${p.userId}/2`, `https://push/${p.userId}/3`]);
+      await queued(p, "2027-03-11");
+      let clock = new Date("2027-03-10T10:00:00Z");
+      let calls = 0;
+      const slowRefusals = createNotificationService(db, {
+        now: () => clock,
+        providerTimeoutMs: 15_000,
+        leaseMs: 60_000,
+        providers: {
+          push: async () => {
+            calls++;
+            clock = new Date(clock.getTime() + 40_000);
+            throw new Error("refused");
+          },
+        },
+      });
+      const r = await slowRefusals.dispatchQueued();
+      eq(calls, 2, "the third device is not tried: 80s in, a 15s call could end after the 60s lease");
+      eq([r.failed, r.unconfirmed], [1, 0], "failed, not unconfirmed");
+    });
   });
 
   test("limit is validated and respected", async () => {

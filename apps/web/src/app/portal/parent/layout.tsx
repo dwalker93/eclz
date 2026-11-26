@@ -1,3 +1,4 @@
+import { ParentChildProvider } from "@/components/parent-child-context"
 import { PortalShell } from "@/components/portal-shell"
 
 export default function ParentPortalLayout({
@@ -5,5 +6,9 @@ export default function ParentPortalLayout({
 }: {
   children: React.ReactNode
 }) {
-  return <PortalShell role="parent">{children}</PortalShell>
+  return (
+    <ParentChildProvider>
+      <PortalShell role="parent">{children}</PortalShell>
+    </ParentChildProvider>
+  )
 }

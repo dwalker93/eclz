@@ -22,7 +22,7 @@ import { isConstraintError } from "./audit";
 import { addDays } from "./dates";
 import { insertInvoice } from "./invoicing";
 import { todayFor } from "./lookups";
-import { gateModule } from "./authorization";
+import { gateModule, requireContentWide } from "./authorization";
 import { ServiceError } from "./errors";
 import { type VerifiedEvent, type VoidedEvent } from "./payments";
 import { type Db, type Tx } from "./types";
@@ -173,9 +173,11 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /** Changes the text, and the price of a paid item. A new price applies to later purchases only; each purchase keeps the price it was bought at. */
-    async updateItem(input: { contentId: string; title?: string; description?: string | null; price?: string | number }) {
+    async updateItem(input: { actor: string; contentId: string; title?: string; description?: string | null; price?: string | number }) {
       return db.transaction(async (tx) => {
         const item = await loadItem(tx, input.contentId, true);
+        // The scope check runs here, after the item row is locked: addBranches takes the same lock, so a listing added meanwhile is seen.
+        await requireContentWide(tx, input.actor, "content.manage", input.contentId);
         const set: Partial<typeof contentItem.$inferInsert> = {};
         if (input.title !== undefined) {
           if (!input.title.trim()) throw new ServiceError("content_invalid", "The title is required.");
@@ -194,9 +196,10 @@ function buildContentService(db: Db, opts: { now?: () => Date } = {}) {
     },
 
     /** draft -> published, published -> archived, archived -> published. Archiving hides the item from the store and from course and free access; paid owners keep it (F4). */
-    async setStatus(input: { contentId: string; status: "published" | "archived" }) {
+    async setStatus(input: { actor: string; contentId: string; status: "published" | "archived" }) {
       return db.transaction(async (tx) => {
         const item = await loadItem(tx, input.contentId, true);
+        await requireContentWide(tx, input.actor, "content.manage", input.contentId);
         const ok = (item.status === "draft" && input.status === "published") || (item.status === "published" && input.status === "archived") || (item.status === "archived" && input.status === "published");
         if (!ok) throw new ServiceError("content_invalid", `Cannot move content from ${item.status} to ${input.status}.`);
         const [row] = await tx.update(contentItem).set({ status: input.status }).where(eq(contentItem.id, item.id)).returning();

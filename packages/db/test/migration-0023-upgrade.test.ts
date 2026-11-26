@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -19,6 +19,8 @@ const message = async (p: Promise<unknown>) => {
 describe("upgrade across 0023: paid purchases with no invoice", () => {
   const pg = new PGlite({ extensions: { btree_gist } });
   afterAll(() => pg.close());
+  // A fixture that fails between SET ... replica and the reset must not leave the next test running without foreign keys and triggers.
+  afterEach(() => pg.exec(`SET session_replication_role = DEFAULT`));
 
   test("0023 lists the purchases, says a handed-over one needs its invoice or reconciled handover records, and runs once each is repaired", async () => {
     const at = tags.indexOf("0022_content_purchase_paid_invoice");

@@ -7,6 +7,7 @@ import {
   createAccessControlService,
   isRootAdmin,
   normalizeSriLankaPhone,
+  firstLoginStillValidIn,
   resolveIdentity,
   ServiceError,
   setInitialPasswordIn,
@@ -23,6 +24,8 @@ import { newTotpSecret, otpauthUri, verifyTotp } from "./totp";
 type Q = Db | Tx;
 type UserRow = typeof user.$inferSelect;
 const PHONE_LIKE = /^[\d\s+()-]{9,}$/;
+/** How many password checks a failed sign-in costs: findCandidates can return two accounts only for a phone-like identifier. */
+const passwordCheckBudget = (identifier: string) => (PHONE_LIKE.test(identifier.trim()) ? 2 : 1);
 
 /**
  * The sign-in counter key. Phone numbers are canonical, so `0771234567` and `077 1234567` share one counter, the same canonical form the
@@ -34,6 +37,9 @@ export function signInKey(raw: string): string {
   if (PHONE_LIKE.test(id)) return `signin:id:phone:${normalizeSriLankaPhone(id) ?? id.replace(/\D/g, "")}`;
   return `signin:id:user:${id}`;
 }
+
+/** The failure counter of one account, shared by every identifier that reaches it. */
+const accountSignInKey = (userId: string) => `signin:acct:${userId}`;
 
 export interface AuthOptions {
   /** Server secret (at least 16 characters) that protects stored authenticator secrets. Keep it in the environment, never in the repository. */
@@ -97,15 +103,18 @@ export function createAuthService(db: Db, opts: AuthOptions) {
   /**
    * Issues a session under a lock on the user row, the same lock every credential change takes (set or change password, disable). The
    * authentication condition is checked again inside the lock: the account must still be active and still hold the password hash the
-   * caller verified (`null` for a first login). If a credential change got in between, no session is issued.
+   * caller verified (`null` for a first login). If a credential change got in between, no session is issued. A first login (`firstLoginPhone`, the
+   * normalized number it signed in with) also repeats the lookup's conditions here, because the lookup ran before the lock: the account must still have
+   * that phone and still be an active, passwordless guardian account with the portal on and no staff or lecturer role.
    */
-  async function createSession(userId: string, meta: { ip?: string | null; userAgent?: string | null }, expectHash: string | null): Promise<SignedIn> {
+  async function createSession(userId: string, meta: { ip?: string | null; userAgent?: string | null }, expectHash: string | null, firstLoginPhone?: string): Promise<SignedIn> {
     const token = newToken();
     return db.transaction(async (tx) => {
       const [u] = await tx.select().from(user).where(eq(user.id, userId)).for("update");
       if (!u || u.status !== "active" || u.passwordHash !== expectHash) throw bad();
       const identity = await resolveIdentity(tx, userId);
       if (!identity?.active) throw bad();
+      if (expectHash === null && !(firstLoginPhone && (await firstLoginStillValidIn(tx, userId, firstLoginPhone)))) throw bad();
       const hours = identity.portals.admin ? (opts.staffSessionHours ?? 12) : (opts.sessionDays ?? 30) * 24;
       const expiresAt = new Date(now().getTime() + hours * 3_600_000);
       const [s] = await tx
@@ -167,11 +176,14 @@ export function createAuthService(db: Db, opts: AuthOptions) {
     await q.delete(authSession).where(and(eq(authSession.userId, userId), ne(authSession.id, keepSessionId)));
   }
 
-  /** Locks the user row and confirms the caller's session still exists, so a credential change cannot outlive the session that asked for it. */
+  /**
+   * Locks the user row and confirms the caller's session still exists and has not expired, so a credential change cannot outlive the session that asked
+   * for it: not one deleted, and not one that ran out while the operation was hashing or waiting (the row stays until `purgeExpired` removes it).
+   */
   async function lockUserAndSession(tx: Tx, userId: string, sessionId: string) {
     const [u] = await tx.select().from(user).where(eq(user.id, userId)).for("update");
-    const [alive] = await tx.select({ id: authSession.id }).from(authSession).where(eq(authSession.id, sessionId));
-    if (!u || !alive) throw noSession();
+    const [alive] = await tx.select({ id: authSession.id, expiresAt: authSession.expiresAt }).from(authSession).where(eq(authSession.id, sessionId));
+    if (!u || !alive || alive.expiresAt <= now()) throw noSession();
     return u;
   }
 
@@ -194,20 +206,39 @@ export function createAuthService(db: Db, opts: AuthOptions) {
       await hit(db, idKey, SIGN_IN_ID, now());
       let matched: UserRow | null = null;
       let tried = 0;
-      for (const c of await findCandidates(input.identifier)) {
-        if (!c.passwordHash || c.status !== "active") continue;
+      let throttled = false;
+      const usable = (await findCandidates(input.identifier)).filter((c) => c.passwordHash && c.status === "active");
+      for (const c of usable) {
+        // Each account has its own failure count, whatever the identifier that reached it. An identifier can name two accounts (a numeric username and a
+        // phone account), and one identifier, or a different one for the same account (email, username, phone), has its own input counter above; neither a
+        // sign-in to one account nor another spelling can reset or dodge the count of the account that is being guessed. A locked account is skipped, so it
+        // cannot stop the owner of the other account from signing in.
+        try {
+          await hit(db, accountSignInKey(c.id), SIGN_IN_ID, now());
+        } catch (e) {
+          if (e instanceof ServiceError && e.code === "rate_limited") {
+            throttled = true;
+            continue;
+          }
+          throw e;
+        }
         tried++;
-        if (await verifyPassword(input.password, c.passwordHash)) {
+        if (await verifyPassword(input.password, c.passwordHash!)) {
           matched = c;
           break;
         }
       }
       if (!matched) {
-        if (tried === 0) await burnTime(input.password);
+        if (throttled) throw new ServiceError("rate_limited", "Too many attempts. Try again later.");
+        // A failure costs the same password work whatever the identifier matched: an identifier that can name two accounts (a phone number and a numeric
+        // username) always costs two checks, any other costs one. Unused checks are made against a throwaway hash.
+        for (let i = tried; i < passwordCheckBudget(input.identifier); i++) await burnTime(input.password);
         throw bad();
       }
       const signedIn = await createSession(matched.id, input, matched.passwordHash);
-      await clear(db, idKey);
+      await clear(db, accountSignInKey(matched.id));
+      // The input counter is cleared only when the identifier named this one account; for an identifier that names two, a success proves nothing about the other.
+      if (usable.length === 1) await clear(db, idKey);
       return signedIn;
     },
 
@@ -220,8 +251,8 @@ export function createAuthService(db: Db, opts: AuthOptions) {
       if (input.ip) await hit(db, `first:ip:${input.ip}`, FIRST_IP, now());
       await hit(db, `first:phone:${phone ?? input.phone.replace(/\D/g, "").slice(0, 20)}`, FIRST_PHONE, now());
       const found = await acl.findFirstLoginUser({ phone: input.phone });
-      if (!found) throw bad();
-      return createSession(found.userId, input, null);
+      if (!found || !phone) throw bad();
+      return createSession(found.userId, input, null, phone);
     },
 
     /** Who is behind this token, or `unauthenticated`. Check `principal.restriction` and `principal.portals` before serving anything. */
@@ -336,8 +367,9 @@ export function createAuthService(db: Db, opts: AuthOptions) {
         if (enabled.length === 0) throw new ServiceError("forbidden", "The setup changed. Start it again.");
         await markSessionVerified(tx, s.id);
         await writeAudit(tx, { actor: s.userId, action: "user.mfa_enabled", entityType: "user", entityId: s.userId });
+        // The counter is cleared in the same transaction: a failure here rolls the enrolment back too, never reports a failure for one that committed.
+        await clear(tx, `code:${s.userId}`);
       });
-      await clear(db, `code:${s.userId}`);
       return { recoveryCodes: codes };
     },
 
@@ -360,10 +392,11 @@ export function createAuthService(db: Db, opts: AuthOptions) {
           await tx.update(userTwoFactor).set({ recoveryHashes: tf.recoveryHashes.filter((h) => h !== hash) }).where(eq(userTwoFactor.userId, s.userId));
         }
         await markSessionVerified(tx, s.id);
+        // Cleared in the same transaction as the code's use: if the clearing fails, the code is not consumed and a retry with it can still finish.
+        await clear(tx, `code:${s.userId}`);
         return true;
       });
       if (!ok) throw new ServiceError("invalid_code", "That code is wrong or expired.");
-      await clear(db, `code:${s.userId}`);
       return (await buildPrincipal(db, { ...s, mfaVerifiedAt: now() }))!;
     },
 

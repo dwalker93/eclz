@@ -21,7 +21,7 @@
     "server-only": "^0.0.1"
   },
   "devDependencies": {
-    "@electric-sql/pglite": "^0.5.16",
+    "@electric-sql/pglite": "^0.6.0",
     "@types/bun": "^1.4.2",
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"

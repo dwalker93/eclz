@@ -19,6 +19,7 @@ import { Button } from "@workspace/ui/components/button"
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
@@ -40,6 +41,7 @@ import {
   SidebarTrigger,
 } from "@workspace/ui/components/sidebar"
 import { Separator } from "@workspace/ui/components/separator"
+import { cn } from "@workspace/ui/lib/utils"
 import {
   BellIcon,
   GraduationCapIcon,
@@ -51,6 +53,7 @@ import {
   type LucideIcon,
 } from "lucide-react"
 
+import { ParentChildSwitcher } from "@/components/parent-child-switcher"
 import { lecturer } from "@/lib/lecturer-portal-data"
 import { lecturerNav } from "@/lib/lecturer-navigation"
 import { parent, parentChildren } from "@/lib/parent-portal-data"
@@ -61,6 +64,7 @@ import { studentNav, type PortalNavGroup } from "@/lib/student-navigation"
 export type PortalRole = "student" | "lecturer" | "parent"
 
 type PortalShellConfig = {
+  role: PortalRole
   roleLabel: string
   homeHref: string
   nav: PortalNavGroup[]
@@ -78,6 +82,7 @@ type PortalShellConfig = {
 
 const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
   student: {
+    role: "student",
     roleLabel: "Student portal",
     homeHref: "/portal/student",
     nav: studentNav,
@@ -93,6 +98,7 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
       "Dashboard, My Courses, Timetable, Attendance, Learning Materials, Exams & Results, Invoices & Payments, Notices, Messages and My Profile are available. Other portal pages are planned for later steps.",
   },
   lecturer: {
+    role: "lecturer",
     roleLabel: "Lecturer portal",
     homeHref: "/portal/lecturer",
     nav: lecturerNav,
@@ -108,6 +114,7 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
       "Dashboard, My Courses, Timetable & Sessions, Attendance, Learning Materials, Exams, Question Bank, Results, Notices, Messages, My Earnings and My Profile are available. Other lecturer pages are planned for later steps.",
   },
   parent: {
+    role: "parent",
     roleLabel: "Parent portal",
     homeHref: "/portal/parent",
     nav: parentNav,
@@ -120,7 +127,7 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
     notificationsHref: "/portal/parent#latest-notice",
     notificationsLabel: "Go to the latest notice",
     footerCopy:
-      "Dashboard and My Children are available. Other parent pages are planned for later steps.",
+      "Dashboard, My Children, Courses, Timetable, Attendance, Exams & Results, Invoices & Payments, Receipts, Notices and Messages are available. Other parent pages are planned for later steps.",
   },
 }
 
@@ -245,9 +252,17 @@ function PortalHeader({ config }: { config: PortalShellConfig }) {
               </BreadcrumbItem>
             </BreadcrumbList>
           </Breadcrumb>
+          {config.role === "parent" ? (
+            <div className="hidden md:block">
+              <ParentChildSwitcher />
+            </div>
+          ) : null}
           <Badge
             variant="outline"
-            className="hidden rounded-full md:inline-flex"
+            className={cn(
+              "hidden rounded-full",
+              config.role === "parent" ? "xl:inline-flex" : "md:inline-flex"
+            )}
           >
             Demo preview
           </Badge>
@@ -297,36 +312,43 @@ function PortalHeader({ config }: { config: PortalShellConfig }) {
               }
             />
             <DropdownMenuContent align="end" className="w-72">
-              <DropdownMenuLabel className="flex items-center gap-3 px-2 py-2 font-normal">
-                <Avatar size="lg">
-                  <AvatarFallback>{config.identity.initials}</AvatarFallback>
-                </Avatar>
-                <div className="flex min-w-0 flex-1 flex-col">
-                  <span className="truncate text-sm font-semibold text-foreground">
-                    {config.identity.fullName}
-                  </span>
-                  <span className="truncate text-xs text-muted-foreground">
-                    {config.identity.meta}
-                  </span>
-                </div>
-              </DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem disabled>
-                My profile
-                <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled>
-                Account settings
-                <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <p className="px-2 py-1.5 text-xs leading-relaxed text-muted-foreground">
-                Local demo session. No sign-in or account access is connected.
-              </p>
+              <DropdownMenuGroup>
+                <DropdownMenuLabel className="flex items-center gap-3 px-2 py-2 font-normal">
+                  <Avatar size="lg">
+                    <AvatarFallback>{config.identity.initials}</AvatarFallback>
+                  </Avatar>
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <span className="truncate text-sm font-semibold text-foreground">
+                      {config.identity.fullName}
+                    </span>
+                    <span className="truncate text-xs text-muted-foreground">
+                      {config.identity.meta}
+                    </span>
+                  </div>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled>
+                  My profile
+                  <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled>
+                  Account settings
+                  <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <p className="px-2 py-1.5 text-xs leading-relaxed text-muted-foreground">
+                  Local demo session. No sign-in or account access is connected.
+                </p>
+              </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       </div>
+      {config.role === "parent" ? (
+        <div className="border-t px-4 py-2 sm:px-6 md:hidden">
+          <ParentChildSwitcher variant="bar" />
+        </div>
+      ) : null}
     </header>
   )
 }

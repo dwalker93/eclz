@@ -386,6 +386,17 @@ describe("Enrolment, recurring and package invoicing", () => {
     const rep = await inv.generateRecurringInvoices({ enrollmentIds: [enr] });
     eq(rep.invoicesCreated[0]!.periodStarts, ["2027-01-01", "2027-02-01"]);
   });
+  test("only a promotion keeps a completed enrolment billable: dropped, transferred and course-ended ones are not billed", async () => {
+    for (const reason of ["dropped", "transferred", "course_ended"]) {
+      const { enr } = await recurring({ rate: 800, start: "2027-01-01" });
+      await q(`UPDATE enrollment SET status = 'completed', end_reason = $2, access_ends_on = '2027-03-01' WHERE id = $1`, [enr, reason]);
+      const rep = await inv.generateRecurringInvoices({ enrollmentIds: [enr] });
+      eq([reason, rep.invoicesCreated.length], [reason, 0]);
+    }
+    const { enr } = await recurring({ rate: 800, start: "2027-01-01" });
+    await q(`UPDATE enrollment SET status = 'completed', end_reason = 'promoted', access_ends_on = '2027-03-01' WHERE id = $1`, [enr]);
+    eq((await inv.generateRecurringInvoices({ enrollmentIds: [enr] })).invoicesCreated[0]!.periodStarts, ["2027-01-01", "2027-02-01"]);
+  });
   test("per-term fees bill the term once, and fail without a term", async () => {
     const term = await id(`INSERT INTO academic_term (name, starts_on, ends_on) VALUES ('T1', '2027-03-01', '2027-06-30')`);
     const c = await mkCourse({ term });
@@ -499,6 +510,30 @@ describe("Fee exceptions (D19 to D21)", () => {
     eq(rep.invoicesCreated.map((x) => x.periodStarts), [["2027-02-01", "2027-03-01"]]);
     eq(rep.alreadyInvoiced, 1);
     eq((await q(`SELECT period_start FROM invoice_item WHERE enrollment_id = $1 AND cancelled_at IS NULL ORDER BY period_start`, [enr])).map((x) => String(x.period_start).slice(0, 10)), ["2027-01-01", "2027-02-01", "2027-03-01"]);
+  });
+  test("an enrolment ended after planning takes its later periods and their discounts out, and the report lists only what was billed", async () => {
+    await onModule();
+    const { enr, s } = await recurring({ rate: 1000, start: "2027-01-01" });
+    await exc.createFeeException({ enrollmentId: enr, kind: "discount", discountType: "fixed", discountValue: "100", effectiveFrom: "2027-01-01", reason: "r", createdBy: staff });
+    // The second transaction of the run is the group insert. Before it starts, a promotion ends the enrolment on March 1, after January to March were planned.
+    let calls = 0;
+    const racing = new Proxy(db, {
+      get(t, k, r) {
+        if (k !== "transaction") return Reflect.get(t, k, r);
+        return async (...a: unknown[]) => {
+          if (++calls === 2) await q(`UPDATE enrollment SET access_ends_on = '2027-03-01' WHERE id = $1`, [enr]);
+          return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+        };
+      },
+    });
+    const rep = await createInvoicingService(racing, { now }).generateRecurringInvoices({ enrollmentIds: [enr] });
+    eq(rep.invoicesCreated.map((x) => x.periodStarts), [["2027-01-01", "2027-02-01"]]);
+    const rows = await q(`SELECT kind, period_start, amount FROM invoice_item WHERE enrollment_id = $1 AND cancelled_at IS NULL ORDER BY kind, period_start NULLS LAST`, [enr]);
+    eq(rows.map((x) => `${x.kind}:${String(x.period_start ?? "").slice(0, 10)}`), ["discount:", "discount:", "recurring_fee:2027-01-01", "recurring_fee:2027-02-01"]);
+    eq((await q(`SELECT total FROM invoice WHERE id = $1`, [rep.invoicesCreated[0]!.invoiceId]))[0]!.total, "1800.00");
+    eq(rep.failures.length, 0);
+    void s;
+    await offModule();
   });
   test("D21: an active exception keeps applying after the module is switched off", async () => {
     await onModule();

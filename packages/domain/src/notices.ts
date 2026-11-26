@@ -89,12 +89,18 @@ export function createNoticeService(db: Db, opts: { now?: () => Date } = {}) {
     // The organization's local day, from the same clock as `at`, decides which grade and which course access are in effect (as access.ts does).
     const today = await todayFor(db, at);
     const [branches, courses, levels] = await Promise.all([
-      db.select({ s: studentBranch.studentId, b: studentBranch.branchId }).from(studentBranch).where(inArray(studentBranch.studentId, studentIds)),
-      // A course notice reaches an enrolment whose access has started and not ended; a confirmed move starts its new enrolment on a later day.
+      // A branch counts from its joined day: promotion writes the destination branch at confirmation with the effective day as `joinedOn`, so its branch-scoped
+      // notices must not reach the student while the old grade and class are still in effect.
+      db
+        .select({ s: studentBranch.studentId, b: studentBranch.branchId })
+        .from(studentBranch)
+        .where(and(inArray(studentBranch.studentId, studentIds), lte(studentBranch.joinedOn, today))),
+      // A course notice reaches an enrolment whose access has started and not ended, as accessState decides (status active or completed). A confirmed move completes
+      // the old enrolment at once but keeps its access open until the effective day, when the new one starts, so the old class's notices must stay visible until then.
       db
         .select({ s: enrollment.studentId, c: enrollment.courseId })
         .from(enrollment)
-        .where(and(inArray(enrollment.studentId, studentIds), eq(enrollment.status, "active"), lte(enrollment.accessStartsOn, today), or(isNull(enrollment.accessEndsOn), gt(enrollment.accessEndsOn, today)))),
+        .where(and(inArray(enrollment.studentId, studentIds), inArray(enrollment.status, ["active", "completed"]), lte(enrollment.accessStartsOn, today), or(isNull(enrollment.accessEndsOn), gt(enrollment.accessEndsOn, today)))),
       // The grade in effect today: a promotion confirmed in March for 1 April closes the old grade on 1 April, so the new row must not count yet.
       db
         .select({ s: studentLevel.studentId, g: studentLevel.gradeLevelId })

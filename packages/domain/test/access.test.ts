@@ -2,6 +2,9 @@
  * Effective access and the overdue job: restrict, restore, notifications (C8, C9, J rules).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import { sql } from "drizzle-orm";
+import * as schema from "@workspace/db/schema";
 import {
   createAccessService,
   createEnrollmentService,
@@ -13,7 +16,7 @@ import {
 import { eq } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -259,5 +262,40 @@ describe("Notifications", () => {
     const sc = await owing("2027-02-01");
     await access.runOverdueJob();
     eq([await invStatus(sc.invoiceId), await accessStatus(sc.enrolment)], ["overdue", "restricted"]);
+  });
+});
+
+describe("lock order for callers that change an invoice", () => {
+  test("changeThenRecheck locks the student before the caller's invoice change, then reconciles", async () => {
+    await setAction("notify_and_restrict");
+    const sc = await owing("2027-02-01");
+    const log: string[] = [];
+    const logged = drizzle(pg, { schema, logger: { logQuery: (t: string) => void log.push(t) } }) as unknown as typeof db;
+    const svc = createAccessService(logged, { now });
+    const out = await logged.transaction((tx) =>
+      svc.changeThenRecheck(tx, { studentId: sc.student, actor: staff }, async () => {
+        await tx.execute(sql`UPDATE invoice SET issued_on = issued_on WHERE id = ${sc.invoiceId}`);
+        return "changed";
+      }),
+    );
+    eq(out.result, "changed", "the change's result is returned");
+    eq(out.summary.markedOverdue.length, 1, "the student was reconciled after the change");
+    eq(await invStatus(sc.invoiceId), "overdue", "status follows the rules");
+    const lock = log.findIndex((t) => /from "student" where/.test(t) && /for no key update/.test(t));
+    const change = log.findIndex((t) => /UPDATE invoice SET issued_on/.test(t));
+    eq(lock >= 0 && change > lock, true, "the student lock comes before the invoice change");
+    eq(log.slice(0, change).some((t) => /from "invoice"|update "invoice"/i.test(t)), false, "no invoice was touched before the student was locked");
+  });
+
+  test("lockStudent is available to callers that need the lock before their first invoice read", async () => {
+    const sc = await owing("2027-02-01");
+    const log: string[] = [];
+    const logged = drizzle(pg, { schema, logger: { logQuery: (t: string) => void log.push(t) } }) as unknown as typeof db;
+    const svc = createAccessService(logged, { now });
+    await logged.transaction(async (tx) => {
+      await svc.lockStudent(tx, sc.student);
+      await svc.recheckStudent(tx, sc.student, staff);
+    });
+    eq(/from "student" where/.test(log[0]!) && /for no key update/.test(log[0]!), true, "the first statement is the student lock");
   });
 });
