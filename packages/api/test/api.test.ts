@@ -4,7 +4,7 @@
 import { afterAll, describe, test } from "bun:test";
 import { createApi, withPeerAddress } from "../src";
 import { createAuthService, hashPassword, totp } from "@workspace/auth";
-import { createAccessControlService, createContentService, createAttendanceService, createEnrollmentService, createExamService, createFeeExceptionService, createCommissionRuleService, createGuardianService, createNoticeService, createPayoutService, createReportService, createPromotionService, createPaymentService, createStudentService, hmacSigner } from "@workspace/domain";
+import { createAccessService, createNotificationService, createAccessControlService, createContentService, createAttendanceService, createEnrollmentService, createExamService, createFeeExceptionService, createCommissionRuleService, createGuardianService, createNoticeService, createPayoutService, createReportService, createPromotionService, createPaymentService, createStudentService, hmacSigner } from "@workspace/domain";
 import { eq } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -1109,6 +1109,54 @@ const deps = { db, auth, acl, payments, content, notices, reports, guardians, co
 const appWith = (config: Record<string, unknown>, over: Record<string, unknown> = {}) => createApi({ ...deps, ...over, config: { trustedOrigins: [ORIGIN], secureCookie: true, ...config } } as Parameters<typeof createApi>[0]);
 const signInWrong = (a: ReturnType<typeof appWith>, headers: Record<string, string> = {}, env?: unknown) =>
   a.request("/auth/sign-in", { method: "POST", headers: { origin: ORIGIN, "content-type": "application/json", ...headers }, body: JSON.stringify({ identifier: "nobody@example.com", password: "wrong password!!" }) }, env);
+describe("scheduled job routes", () => {
+  const jobSecret = "j".repeat(40);
+  const jobs = { ...createAccessService(db, { now }), ...createNotificationService(db, { now }) };
+  const jobApp = () => appWith({ jobSecret }, { jobs });
+  const hit = (a: ReturnType<typeof appWith>, path: string, headers: Record<string, string> = {}) =>
+    a.request(`/internal/jobs${path}`, { method: "POST", headers });
+
+  test("the routes do not exist unless jobs and a secret are both configured", async () => {
+    eq((await hit(app, "/dispatch", { authorization: `Bearer ${jobSecret}` })).status, 404);
+    let err: unknown;
+    try {
+      appWith({}, { jobs });
+    } catch (e) {
+      err = e;
+    }
+    eq(String(err).includes("both"), true, "jobs without a secret");
+    err = undefined;
+    try {
+      appWith({ jobSecret });
+    } catch (e) {
+      err = e;
+    }
+    eq(String(err).includes("both"), true, "a secret without jobs");
+  });
+
+  test("with the secret the real services run: dispatch reports counts and the daily run answers with today's date", async () => {
+    const a = jobApp();
+    const none = await hit(a, "/dispatch");
+    eq(none.status, 401);
+    eq(((await none.json()) as any).error.code, "unauthenticated");
+    const d = await hit(a, "/dispatch", { authorization: `Bearer ${jobSecret}` });
+    eq(d.status, 200);
+    const dj = (await d.json()) as any;
+    eq(dj.ok, true);
+    eq(Object.keys(dj.dispatch).sort(), ["attempted", "expired", "failed", "lost", "sent", "unconfirmed"], "dispatch counts");
+    const day = await hit(a, "/daily", { authorization: `Bearer ${jobSecret}` });
+    const dayJson = (await day.json()) as any;
+    eq([day.status, dayJson.ok, dayJson.overdue.ok, dayJson.dueSoon.ok, dayJson.overdue.date], [200, true, true, true, "2027-03-10"]);
+  });
+
+  test("a session cookie does not open the routes, and a browser origin that is not ours is still refused", async () => {
+    const a = jobApp();
+    eq((await hit(a, "/daily", { cookie: "sms_session=anything", origin: ORIGIN })).status, 401, "a cookie is not the secret");
+    const wrong = await hit(a, "/daily", { authorization: `Bearer ${jobSecret}`, origin: "https://evil.example" });
+    eq(wrong.status, 403, "the CSRF guard still runs first");
+  });
+});
+
 const ipKeys = async () => (await q(`SELECT key FROM auth_rate_limit WHERE key LIKE 'signin:ip:%' ORDER BY key`)).map((r) => String(r.key));
 
 describe("unmatched routes", () => {

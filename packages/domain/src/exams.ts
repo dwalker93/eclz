@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import {
   attemptAnswer,
   course,
@@ -137,11 +137,26 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
    * exam changes still run one at a time. Only FOR UPDATE also conflicts with FOR KEY SHARE, which an insert of any row that references the exam
    * (an attempt, a result) holds on it.
    */
-  async function loadExam(tx: Tx, examId: string, lock: boolean | "no_key_update" = false): Promise<ExamRow> {
+  async function loadExam(tx: Tx, examId: string, lock: boolean | "no_key_update" | "share" = false): Promise<ExamRow> {
     const q = tx.select().from(exam).where(eq(exam.id, examId));
-    const [e] = await (lock === "no_key_update" ? q.for("no key update") : lock ? q.for("update") : q);
+    const [e] = await (lock === "share" ? q.for("share") : lock === "no_key_update" ? q.for("no key update") : lock ? q.for("update") : q);
     if (!e) throw new ServiceError("not_found", "Exam not found.");
     return e;
+  }
+
+  /**
+   * Lock order for everything that can write an exam result: the exam row first, then the attempt row. closeExam locks the exam (FOR NO KEY UPDATE) and
+   * then its running attempts, and `exam_result_guard` takes FOR SHARE on the exam whenever a result is written; a path that held the attempt and only then
+   * reached for the exam (to insert the result) could wait for a close that is waiting for that attempt. So the student paths take the exam FOR SHARE (it does
+   * not stop other students' saves, but it excludes close, start and the other exam changes while a result may be written) before the attempt FOR UPDATE.
+   * The attempt's exam never changes, so it is read unlocked just to know which exam to lock. Returns null when no such attempt exists for this student.
+   */
+  async function lockExamThenAttempt(tx: Tx, where: SQL | undefined) {
+    const [peek] = await tx.select({ examId: examAttempt.examId }).from(examAttempt).where(where);
+    if (!peek) return null;
+    const ex = await loadExam(tx, peek.examId, "share");
+    const [a] = await tx.select().from(examAttempt).where(where).for("update");
+    return a ? { a, ex } : null;
   }
 
   async function snapshots(tx: Tx, examId: string) {
@@ -194,13 +209,9 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
    */
   async function finalizeLate(attemptId: string, studentId?: string) {
     await db.transaction(async (tx) => {
-      const [a] = await tx
-        .select()
-        .from(examAttempt)
-        .where(studentId === undefined ? eq(examAttempt.id, attemptId) : and(eq(examAttempt.id, attemptId), eq(examAttempt.studentId, studentId)))
-        .for("update");
-      if (!a || a.status !== "in_progress") return;
-      const ex = await loadExam(tx, a.examId);
+      const locked = await lockExamThenAttempt(tx, studentId === undefined ? eq(examAttempt.id, attemptId) : and(eq(examAttempt.id, attemptId), eq(examAttempt.studentId, studentId)));
+      if (!locked || locked.a.status !== "in_progress") return;
+      const { a, ex } = locked;
       const endedAt = endOf(a, ex);
       if (endedAt) await finish(tx, a, ex, endedAt, "expired");
     });
@@ -501,10 +512,10 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
     async saveAnswers(input: { attemptId: string; studentId: string; answers: { examQuestionId: string; selectedOptionKey: string | null }[] }) {
       await finalizeLate(input.attemptId, input.studentId);
       const saved = await db.transaction(async (tx) => {
-        const [a] = await tx.select().from(examAttempt).where(and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId))).for("update");
-        if (!a) throw new ServiceError("not_found", "Attempt not found.");
+        const locked = await lockExamThenAttempt(tx, and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId)));
+        if (!locked) throw new ServiceError("not_found", "Attempt not found.");
+        const { a, ex } = locked;
         if (a.status !== "in_progress") throw new ServiceError(a.status === "expired" ? "attempt_time_over" : "attempt_not_running", "This attempt has ended.");
-        const ex = await loadExam(tx, a.examId);
         // G6 again, now that this transaction holds the attempt's lock: the deadline may have passed since the check above. The expiry is
         // committed with this transaction and the refusal is thrown after it, so a retry sees the finished attempt.
         const endedAt = endOf(a, ex);
@@ -544,9 +555,9 @@ function buildExamService(db: Db, opts: { now?: () => Date } = {}) {
     async submitAttempt(input: { attemptId: string; studentId: string }): Promise<{ status: string; score: string | null; alreadyFinished: boolean }> {
       await finalizeLate(input.attemptId, input.studentId);
       return db.transaction(async (tx) => {
-        const [a] = await tx.select().from(examAttempt).where(and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId))).for("update");
-        if (!a) throw new ServiceError("not_found", "Attempt not found.");
-        const ex = await loadExam(tx, a.examId);
+        const locked = await lockExamThenAttempt(tx, and(eq(examAttempt.id, input.attemptId), eq(examAttempt.studentId, input.studentId)));
+        if (!locked) throw new ServiceError("not_found", "Attempt not found.");
+        const { a, ex } = locked;
         // The score is returned on the same terms as the exam result (G9): null while an after_release or manual result is unreleased.
         const shown = async (score: string | null) => ((await scoreVisible(tx, ex, a.studentId)) ? score : null);
         if (a.status !== "in_progress") return { status: a.status, score: await shown(a.score), alreadyFinished: true };

@@ -2,6 +2,8 @@
  * Authorization: permissions with branch scope (A6), lecturer ownership (A5), portals (A3, A4), last root admin (A7), audit (J3), module switches (K).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@workspace/db/schema";
 import {
   authorize,
   authorizeAnywhere,
@@ -14,6 +16,7 @@ import {
   createAccessControlService,
   createContentService,
   createExamService,
+  firstLoginStillValidIn,
   requireModule,
   requirePermission,
   resolveIdentity,
@@ -21,7 +24,7 @@ import {
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -311,6 +314,19 @@ describe("parent first login by phone, then set a password", () => {
     await q(`INSERT INTO lecturer (full_name, user_id) VALUES ('Late Lec', $1)`, [l]);
     await fails("forbidden", () => acl.setInitialPassword({ userId: l, passwordHash: "x" }));
     eq(await hash(l), null, "lecturer: nothing stored");
+  });
+
+  test("firstLoginStillValidIn reads the organisation's modules under FOR SHARE, before the user checks, and is false when parent_portal is off", async () => {
+    const u = await id(`INSERT INTO "user" (username, phone) VALUES ('parent-94771110070', '94771110070')`);
+    await q(`INSERT INTO guardian (full_name, phone, user_id, portal_enabled) VALUES ('Locked', '94771110070', $1, true)`, [u]);
+    const log: string[] = [];
+    const logged = drizzle(pg, { schema, logger: { logQuery: (t: string) => void log.push(t) } }) as unknown as typeof db;
+    eq(await logged.transaction((tx) => firstLoginStillValidIn(tx, u, "94771110070")), true, "module on");
+    const orgRead = log.findIndex((t) => /from "organization"/.test(t));
+    eq(orgRead === 0 && /for share/.test(log[orgRead]!), true, "the first statement reads the organisation row FOR SHARE");
+    await setModules({ lecturer_portal: true });
+    eq(await db.transaction((tx) => firstLoginStillValidIn(tx, u, "94771110070")), false, "module off");
+    await setModules({ lecturer_portal: true, parent_portal: true });
   });
 
   test("nothing is found for a wrong number, a disabled user, a portal that is off, or the module off", async () => {

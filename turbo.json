@@ -18,7 +18,7 @@
       "dependsOn": ["^typecheck"]
     },
     "db:generate": { "cache": false },
-    "db:migrate": { "cache": false, "passThroughEnv": ["DATABASE_URL_DIRECT"] },
+    "db:migrate": { "cache": false, "passThroughEnv": ["DATABASE_URL", "DATABASE_URL_DIRECT"] },
     "dev": {
       "cache": false,
       "persistent": true

@@ -218,7 +218,23 @@ export function createTextLkSms(opts: { apiToken: string; senderId: string; fetc
       body: JSON.stringify({ recipient: to, sender_id: opts.senderId, type: "plain", message: body }),
       signal: AbortSignal.timeout(opts.timeoutMs ?? PROVIDER_TIMEOUT_MS),
     });
-    const json = (await res.json().catch(() => null)) as { status?: string; message?: string } | null;
+    // The request reached text.lk, so a failure while reading the answer does not say whether the message was accepted: it is an unknown outcome (the row
+    // becomes `unconfirmed`), not a failure, and it is worded apart from a refusal. A timeout or abort while reading is already recognised as such.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (e) {
+      if (isUnknownOutcome(e)) throw e;
+      throw new ProviderOutcomeUnknown(`text.lk: the answer could not be read (HTTP ${res.status}): ${shortError(e)}`);
+    }
+    let json: { status?: string; message?: string } | null = null;
+    try {
+      json = JSON.parse(text) as { status?: string; message?: string } | null;
+    } catch {
+      json = null;
+    }
+    // An unreadable answer to a request that returned success is ambiguous too; an unreadable error answer is a plain refusal by its HTTP status.
+    if (res.ok && json === null) throw new ProviderOutcomeUnknown(`text.lk: HTTP ${res.status} with an answer that is not JSON; the message may have been accepted`);
     if (!res.ok || json?.status !== "success") throw new Error(`text.lk: ${json?.message ?? `HTTP ${res.status}`}`);
   };
 }
@@ -263,6 +279,11 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     }
   }
 
+  /** Before a provider call: refuses to start one that could still be running when the lease ends (the call is skipped, so nothing was sent). Push checks the same before each device. */
+  function assertLeaseLeft(deadline: number) {
+    if (now().getTime() + timeoutMs >= deadline) throw new Error("lease nearly over; message not sent");
+  }
+
   async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number): Promise<void> {
     const ext = EXTERNAL.find((e) => e.channel === row.channel);
     if (!ext) throw new Error("not an external channel");
@@ -277,11 +298,13 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     if (row.channel === "email") {
       if (!u.email) throw new Error("no email address");
       if (!providers.email) throw new Error("no email provider configured");
+      assertLeaseLeft(deadline);
       await withTimeout(providers.email({ to: u.email, subject: msg.subject, body: msg.body }, { idempotencyKey: row.id }));
     } else if (row.channel === "sms") {
       const to = u.phone ? normalizeSriLankaPhone(u.phone) : null;
       if (!to) throw new Error(u.phone ? "invalid phone number" : "no phone number");
       if (!providers.sms) throw new Error("no sms provider configured");
+      assertLeaseLeft(deadline);
       await withTimeout(providers.sms({ to, body: msg.body }, { idempotencyKey: row.id }));
     } else {
       const subs = await tx.select().from(pushSubscription).where(eq(pushSubscription.userId, row.userId)).orderBy(asc(pushSubscription.id));
@@ -362,7 +385,9 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
         }
         const set =
           outcome === "sent" ? { status: "sent", sentAt: now(), error: null, claimedUntil: null } : { status: outcome, error, claimedUntil: null };
-        const done = await db.update(notification).set(set).where(and(eq(notification.id, claimed.id), eq(notification.status, "sending"))).returning({ id: notification.id });
+        const done = await db.update(notification).set(set).where(and(eq(notification.id, claimed.id), eq(notification.status, "sending"), eq(notification.claimedUntil, claimed.claimedUntil!))).returning({ id: notification.id });
+        // The claim itself must still be the active one: if the lease expired and the row was reclaimed since (a new lease timestamp), this run's answer matches
+        // nothing and the row counts as lost, like one that was already marked unconfirmed.
         if (done.length === 0) result.lost++;
         else result[outcome]++;
       }

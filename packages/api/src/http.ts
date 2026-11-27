@@ -70,7 +70,7 @@ function queryFailure(err: unknown): { name: string; code?: string; constraint?:
  * email; a guardian's contact details) and its `cause` the raw database error with the same data, so for those only the error name, the SQLSTATE,
  * the constraint name and the request are logged: never the message, the parameters, the `detail` or the cause. Other errors are logged whole.
  */
-function describeUnexpected(err: unknown, c: Context): unknown {
+export function describeUnexpected(err: unknown, c: Context): unknown {
   const q = queryFailure(err);
   if (!q) return err;
   return { kind: "database_error", ...q, method: c.req.method, path: c.req.path };

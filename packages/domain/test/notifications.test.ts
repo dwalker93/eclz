@@ -2,12 +2,15 @@
  * Notification queue, dispatcher and "due soon" reminders (J1, J2).
  */
 import { afterAll, describe, test } from "bun:test";
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@workspace/db/schema";
 import {
   composeMessage,
   createNotificationService,
   createTextLkSms,
   normalizeSriLankaPhone,
   renderTemplate,
+  ProviderOutcomeUnknown,
   type EmailMessage,
   type PushMessage,
   type SmsMessage,
@@ -15,7 +18,7 @@ import {
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
-const { db, q, id, close } = await createScenarioDb({ dateOnly: true });
+const { pg, db, q, id, close } = await createScenarioDb({ dateOnly: true });
 afterAll(async () => {
   await close();
 });
@@ -113,6 +116,24 @@ describe("pure helpers", () => {
     await ok({ to: "1", body: "x" });
     eq(signal instanceof AbortSignal, true, "signal passed");
     eq(signal!.aborted, false, "not aborted by a prompt answer");
+  });
+  test("text.lk: a failure while reading the answer is an unknown outcome, an unreadable success answer is too, and a plain refusal stays an ordinary failure", async () => {
+    const sms = (mk: () => Response) => createTextLkSms({ apiToken: "t", senderId: "I", fetch: (async () => mk()) as unknown as typeof fetch });
+    const broken = () =>
+      new Response(new ReadableStream({ start: (c) => c.error(new TypeError("terminated")) }), { status: 200 });
+    const caught = async (send: () => Promise<void>) => send().then(() => null, (e: Error) => e);
+    const cut = await caught(() => sms(broken)({ to: "1", body: "x" }));
+    eq([cut instanceof ProviderOutcomeUnknown, /answer could not be read \(HTTP 200\)/.test(cut?.message ?? "")], [true, true], "body read failure after HTTP 200");
+    const cutError = await caught(() => sms(() => new Response(new ReadableStream({ start: (c) => c.error(new TypeError("terminated")) }), { status: 502 }))({ to: "1", body: "x" }));
+    eq(cutError instanceof ProviderOutcomeUnknown, true, "the answer could not be read, whatever the status: the request had reached the provider");
+    const garbage = await caught(() => sms(() => new Response("<html>ok</html>", { status: 200 }))({ to: "1", body: "x" }));
+    eq(garbage instanceof ProviderOutcomeUnknown, true, "a 200 whose body is not JSON");
+    const refused = await caught(() => sms(() => new Response(JSON.stringify({ status: "error", message: "Invalid token" }), { status: 401 }))({ to: "1", body: "x" }));
+    eq([refused instanceof ProviderOutcomeUnknown, refused?.message], [false, "text.lk: Invalid token"], "explicit refusal");
+    const gateway = await caught(() => sms(() => new Response("Bad gateway", { status: 502 }))({ to: "1", body: "x" }));
+    eq([gateway instanceof ProviderOutcomeUnknown, gateway?.message], [false, "text.lk: HTTP 502"], "an HTTP error with a non-JSON body");
+    const declined = await caught(() => sms(() => new Response(JSON.stringify({ status: "error", message: "No balance" }), { status: 200 }))({ to: "1", body: "x" }));
+    eq([declined instanceof ProviderOutcomeUnknown, declined?.message], [false, "text.lk: No balance"], "a 200 that says error");
   });
   test("text.lk: a request that never answers is aborted when the deadline expires, and the failure is a timeout (an unknown outcome)", async () => {
     let aborted = false;
@@ -529,6 +550,50 @@ describe("dispatcher", () => {
       const r = await swept.dispatchQueued();
       eq([r.sent, r.failed, r.unconfirmed, r.lost], [0, 0, 0, 1], "counted as lost");
       eq((await row(p.userId)).status, "unconfirmed", "the other run's state stands");
+    });
+
+    test("the completion update must match this run's own claim: a row reclaimed with a new lease is not overwritten by the older run", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const p = await person();
+      await queued(p, "2027-03-11");
+      const stale = createNotificationService(db, {
+        now,
+        providers: {
+          email: async () => {
+            // another run took the row over: still `sending`, but under a lease of its own
+            await q(`UPDATE notification SET claimed_until = '2027-03-10T10:05:00Z' WHERE user_id = $1 AND channel = 'email'`, [p.userId]);
+          },
+        },
+      });
+      const r = await stale.dispatchQueued();
+      eq([r.sent, r.failed, r.unconfirmed, r.lost], [0, 0, 0, 1], "counted as lost");
+      const after = await row(p.userId);
+      eq([after.status, after.claimed_until], ["sending", "2027-03-10T10:05:00"], "the newer claim's row is untouched");
+    });
+
+    test("email and sms calls are skipped when the lease could end before they finish, like push devices", async () => {
+      await drain();
+      await setModules({ email: true, sms: true });
+      await setChannel("email", true);
+      await setChannel("sms", true);
+      const p = await person({ phone: "077 555 0101" });
+      await queued(p, "2027-03-11");
+      let clock = new Date("2027-03-10T10:00:00Z");
+      const calls: string[] = [];
+      // The user lookup runs after the claim and before the provider call; time passes there, so the lease is nearly over when the call would start.
+      const logged = drizzle(pg, { schema, logger: { logQuery: (t: string) => { if (/from "user" where/.test(t)) clock = new Date(clock.getTime() + 59_000); } } }) as unknown as typeof db;
+      const late = createNotificationService(logged, {
+        now: () => clock,
+        providerTimeoutMs: 5_000,
+        providers: { email: async () => void calls.push("email"), sms: async () => void calls.push("sms") },
+      });
+      const r = await late.dispatchQueued();
+      eq(calls, [], "no provider was called");
+      eq([r.attempted, r.sent, r.failed, r.unconfirmed], [2, 0, 2, 0], "both rows are failed (not sent), so retryFailed may send them");
+      const errs = (await q(`SELECT error FROM notification WHERE user_id = $1 AND channel IN ('email','sms') ORDER BY channel`, [p.userId])).map((x) => String(x.error));
+      eq(errs.every((e) => /lease nearly over/.test(e)), true, "reason recorded");
     });
 
     test("a row that fails or times out also loses its lease", async () => {

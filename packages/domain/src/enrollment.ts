@@ -65,8 +65,11 @@ export async function resolveFeeStructure(
 export async function ensureStudentBranch(tx: Tx, studentId: string, branchId: string, joinedOn: string) {
   await lockStudent(tx, studentId);
   const [anyBranch] = await tx.select({ b: studentBranch.branchId }).from(studentBranch).where(eq(studentBranch.studentId, studentId));
+  // An existing membership stays, but its joined day moves back to this earlier day when needed: promotion writes the destination branch with the future
+  // effective day, and an enrolment there today must not leave the student outside the branch (the notices filter hides a branch before its joined day).
+  // It never moves forward and is_primary is left alone.
   await tx.insert(studentBranch).values({ studentId, branchId, isPrimary: !anyBranch, joinedOn })
-    .onConflictDoNothing({ target: [studentBranch.studentId, studentBranch.branchId] });
+    .onConflictDoUpdate({ target: [studentBranch.studentId, studentBranch.branchId], set: { joinedOn: sql`LEAST(${studentBranch.joinedOn}, excluded."joined_on")` } });
 }
 
 export function createEnrollmentService(db: Db, opts: { now?: () => Date } = {}) {

@@ -376,10 +376,14 @@ export async function setInitialPasswordIn(tx: Tx, input: { userId: string; pass
  * The first-login conditions (A1), checked again inside the caller's transaction after it has locked the user row. `findFirstLoginUser` reads outside
  * any transaction, so a phone change, a password, a disabled portal, a switched-off module or a new staff or lecturer assignment can commit between that
  * lookup and the session being issued. True only if the account still has this normalized phone, is active with no password, has a guardian record with
- * the portal on, the parent_portal module is on, and it has no staff assignment and no lecturer record.
+ * the portal on, the parent_portal module is on (read under a share lock held to the end of the transaction), and it has no staff assignment and no lecturer record.
  */
 export async function firstLoginStillValidIn(tx: Tx, userId: string, phone: string): Promise<boolean> {
-  if (!(await isModuleOn(tx, "parent_portal"))) return false;
+  // The module switch is read under a share lock on the organisation row, and the lock lasts as long as the caller's transaction (the whole first-login
+  // session issue): a concurrent update of `enabled_modules` takes a conflicting row lock, so it waits for this transaction instead of switching the
+  // portal off between this check and the session insert. A plain read would leave that window open.
+  const [org] = await tx.select({ m: organization.enabledModules }).from(organization).for("share");
+  if (!moduleEnabled(org?.m, "parent_portal")) return false;
   const [row] = await tx
     .select({ id: user.id })
     .from(user)
@@ -467,7 +471,7 @@ export function createAccessControlService(db: Db) {
         }
         const [row] = await tx.update(user).set({ status: input.status }).where(eq(user.id, u.id)).returning();
         // Every status change ends every session: disabling ends them for good, and enabling clears any that survived from before sessions were
-        // deleted on disable (migration 0031 clears those of accounts still disabled). Re-enabling must need a new sign-in, never revive an old token.
+        // deleted on disable. Re-enabling must need a new sign-in, never revive an old token.
         await tx.delete(authSession).where(eq(authSession.userId, u.id));
         await writeAudit(tx, { actor: input.actor, action: input.status === "disabled" ? "user.disable" : "user.enable", entityType: "user", entityId: u.id, before: { status: u.status }, after: { status: input.status }, reason: input.reason });
         return row!;
