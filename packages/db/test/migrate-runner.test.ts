@@ -62,7 +62,7 @@ describe("migrateEachInOwnTransaction", () => {
     const pg = new PGlite({ extensions: { btree_gist: (await import("@electric-sql/pglite/contrib/btree_gist")).btree_gist } });
     dbs.push(pg);
     const applied = await migrateEachInOwnTransaction(connection(pg), resolve(import.meta.dir, "../drizzle"));
-    expect(applied).toBeGreaterThan(20);
+    expect(applied).toBe(1);
     const rows = (await pg.query<{ convalidated: boolean }>(`SELECT convalidated FROM pg_constraint WHERE conname IN ('invoice_item_exception_enrollment_fk', 'message_thread_id_message_thread_id_fk')`)).rows;
     expect(rows.length).toBe(2);
     expect(rows.every((r) => r.convalidated)).toBe(true);
