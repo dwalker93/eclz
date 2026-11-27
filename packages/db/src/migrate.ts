@@ -18,7 +18,7 @@ const LOCK_NAME = "workspace-db-migrate";
  *
  * `drizzle-kit migrate` (and drizzle-orm's `migrate`) put every pending migration in ONE transaction, so a `NOT VALID` constraint and the
  * `VALIDATE CONSTRAINT` in a later file all run before anything commits, and the validation scan runs under the lock the addition took.
- * Here each file commits before the next one starts, which is the boundary the validation migrations (0017, 0021, 0023, 0025, 0026, 0027) rely on.
+ * Here each file commits before the next one starts, which is the boundary a `NOT VALID` addition and its later `VALIDATE CONSTRAINT` migration rely on.
  * The price: a run that stops part way leaves the earlier migrations applied (and recorded), so fix the failing one and run again; it carries on from there.
  * The history table is the same one drizzle uses, so the two runners can follow each other.
  */

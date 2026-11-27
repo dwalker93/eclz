@@ -1,1 +1,0 @@
-ALTER TABLE "exam" ADD COLUMN "lock_answers" boolean DEFAULT false NOT NULL;
