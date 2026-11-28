@@ -5,7 +5,7 @@ import { describeUnexpected, HttpError, jsonBody, onError } from "./http";
 
 /** The scheduled work, as the services expose it. */
 export interface JobServices {
-  dispatchQueued(input: { limit?: number }): Promise<unknown>;
+  dispatchQueued(input: { limit?: number; budgetMs?: number }): Promise<unknown>;
   runOverdueJob(): Promise<unknown>;
   runDueSoonJob(): Promise<unknown>;
 }
@@ -14,6 +14,12 @@ export const MIN_JOB_SECRET_LENGTH = 32;
 /** The most rows one dispatch call may try, so a single invocation stays inside a serverless time limit. */
 export const MAX_DISPATCH_LIMIT = 500;
 export const DEFAULT_DISPATCH_LIMIT = 100;
+/**
+ * Time one dispatch call may spend, below the admin route's 60 s `maxDuration` and the cron Worker's request timeout (`DISPATCH_TIMEOUT_MS`, 55 s). Sends are serial and a
+ * provider call can take 15 s, so the dispatcher takes no new row once a send could end after this budget: the platform never cuts a send between acceptance
+ * and the recording of its result, and the Worker never gives up on a call that is still working. Rows not reached stay queued for the next minute.
+ */
+export const DISPATCH_BUDGET_MS = 45_000;
 
 const digest = (s: string) => createHash("sha256").update(s).digest();
 
@@ -52,7 +58,7 @@ export function createJobRoutes(deps: { jobs: JobServices; secret: string }) {
 
   app.post("/dispatch", async (c) => {
     const b = await jsonBody(c, z.object({ limit: z.number().int().min(1).max(MAX_DISPATCH_LIMIT).optional() }).strict());
-    const result = await deps.jobs.dispatchQueued({ limit: b.limit ?? DEFAULT_DISPATCH_LIMIT });
+    const result = await deps.jobs.dispatchQueued({ limit: b.limit ?? DEFAULT_DISPATCH_LIMIT, budgetMs: DISPATCH_BUDGET_MS });
     return c.json({ ok: true, dispatch: summarize(result) });
   });
 

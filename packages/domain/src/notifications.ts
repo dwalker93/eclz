@@ -255,6 +255,8 @@ export interface DispatchResult {
 
 /** How long a dispatcher owns a row it is sending. It must outlast the slowest send: one provider timeout for email and sms, and for push every device that is still tried. */
 export const DISPATCH_LEASE_MS = 60_000;
+/** Room kept after a send's provider timeout, within a `budgetMs`, for writing its result (and the claim before it). */
+export const DISPATCH_SETTLE_MS = 3_000;
 
 const shortError = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 300) || "send failed";
 
@@ -342,9 +344,12 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
      * A row left `sending` past its lease (the dispatcher stopped mid-send) is moved to `unconfirmed` at the start of the next run, never back to `queued`,
      * for the same reason. Safe to run on a timer.
      */
-    async dispatchQueued(input: { limit?: number } = {}): Promise<DispatchResult> {
+    async dispatchQueued(input: { limit?: number; budgetMs?: number } = {}): Promise<DispatchResult> {
       const limit = input.limit ?? 100;
       if (!Number.isInteger(limit) || limit < 1) throw new ServiceError("invalid_input", "limit must be a positive whole number.");
+      const budgetMs = input.budgetMs;
+      if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs < 1)) throw new ServiceError("invalid_input", "budgetMs must be a positive number.");
+      const stopClaimingAt = budgetMs === undefined ? Infinity : now().getTime() + budgetMs - timeoutMs - DISPATCH_SETTLE_MS;
       const result: DispatchResult = { attempted: 0, sent: 0, failed: 0, unconfirmed: 0, lost: 0, expired: 0 };
 
       const expired = await db
@@ -355,6 +360,9 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       result.expired = expired.length;
 
       for (let n = 0; n < limit; n++) {
+        // Serial sends: with a time budget (a request with a hard limit), take no new row once a send that starts now could, at its slowest (one provider
+        // timeout) plus the time to record the answer, run past the end. Rows left queued go out in the next run, so the caller's limit is never hit mid-send.
+        if (now().getTime() > stopClaimingAt) break;
         // Claim one row at a time so its lease starts when its send starts, not when a batch was picked.
         const claimed = await db.transaction(async (tx) => {
           const [next] = await tx

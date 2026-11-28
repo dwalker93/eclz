@@ -9,7 +9,7 @@ const SECRET = "s".repeat(32);
 function setup(over: Partial<JobServices> = {}) {
   const calls: string[] = [];
   const jobs: JobServices = {
-    dispatchQueued: async (i) => (calls.push(`dispatch:${i.limit}`), { attempted: 3, sent: 2, failed: 1, unconfirmed: 0, lost: 0, expired: 0 }),
+    dispatchQueued: async (i) => (calls.push(`dispatch:${i.limit}:${i.budgetMs}`), { attempted: 3, sent: 2, failed: 1, unconfirmed: 0, lost: 0, expired: 0 }),
     runOverdueJob: async () => (calls.push("overdue"), { date: "2027-03-10", students: 4, markedOverdue: 1, errors: [] }),
     runDueSoonJob: async () => (calls.push("dueSoon"), { created: 5, note: "free text is dropped" }),
     ...over,
@@ -56,7 +56,7 @@ describe("job routes: dispatch", () => {
     eq([a.status, a.json], [200, { ok: true, dispatch: { attempted: 3, sent: 2, failed: 1, unconfirmed: 0, lost: 0, expired: 0 } }], "default");
     await post("/dispatch", { body: { limit: 7 } });
     await post("/dispatch", { body: { limit: 500 } });
-    eq(calls, ["dispatch:100", "dispatch:7", "dispatch:500"], "limits");
+    eq(calls, ["dispatch:100:45000", "dispatch:7:45000", "dispatch:500:45000"], "limits, each with the 45 s budget");
   });
 
   test("a limit that is not a whole number from 1 to 500, or an unknown field, is 400 and runs nothing", async () => {

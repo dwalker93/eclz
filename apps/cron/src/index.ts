@@ -23,6 +23,8 @@ export type JobName = (typeof SCHEDULES)[keyof typeof SCHEDULES];
 export const JOB_PATH = "/api/internal/jobs";
 const ATTEMPTS = 3;
 const TIMEOUT_MS = 25_000;
+/** Longer for dispatch: the admin app works for up to 45 s (its dispatch budget), and abandoning the call earlier could cut a send between the provider's acceptance and the recording of its result. */
+const TIMEOUT_BY_JOB: Record<JobName, number> = { dispatch: 55_000, daily: TIMEOUT_MS };
 const RETRY_DELAYS_MS = [1000, 3000];
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -63,7 +65,7 @@ export async function runJob(job: JobName, env: Env, opts: { fetch?: typeof fetc
         body: "{}",
         // Cloudflare Workers do not implement "error"; "manual" hands back the 3xx answer itself, which the status check below rejects (never followed, so the secret is not forwarded).
         redirect: "manual",
-        signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_MS),
+        signal: AbortSignal.timeout(opts.timeoutMs ?? TIMEOUT_BY_JOB[job]),
       });
       if (res.ok) return;
       lastError = `answered ${res.status}`;

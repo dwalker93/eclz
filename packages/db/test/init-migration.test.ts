@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cpSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -10,7 +10,19 @@ const connection = (pg: PGlite): MigrationConnection => ({
   run: async (statement, params) => (await pg.query<Record<string, unknown>>(statement, params ?? [])).rows,
   transaction: async (fn) => void (await pg.transaction(async (tx) => fn(async (statement, params) => (await tx.query<Record<string, unknown>>(statement, params ?? [])).rows))),
 });
-const drizzleFolder = resolve(import.meta.dir, "../drizzle");
+const realFolder = resolve(import.meta.dir, "../drizzle");
+/** A folder holding only 0000_init, so these tests judge where the init lands and stay right when later migrations are added to the repository. */
+function initOnlyFolder(edit: (sql: string) => string = (sql) => sql) {
+  const dir = mkdtempSync(join(tmpdir(), "init-only-"));
+  mkdirSync(join(dir, "meta"));
+  const journal = JSON.parse(readFileSync(join(realFolder, "meta/_journal.json"), "utf8")) as { entries: { tag: string }[] };
+  const first = journal.entries[0]!;
+  expect(first.tag).toBe("0000_init");
+  writeFileSync(join(dir, "meta/_journal.json"), JSON.stringify({ version: "7", dialect: "postgresql", entries: [first] }));
+  writeFileSync(join(dir, "0000_init.sql"), edit(readFileSync(join(realFolder, "0000_init.sql"), "utf8")));
+  return dir;
+}
+const drizzleFolder = initOnlyFolder();
 
 describe("0000_init lands in schema public whatever the search_path says", () => {
   const dbs: PGlite[] = [];
@@ -52,12 +64,9 @@ describe("0000_init lands in schema public whatever the search_path says", () =>
   });
 
   test("the closing check fails the migration when the objects landed elsewhere, even if the pin were missing", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "init-nopin-"));
-    cpSync(drizzleFolder, dir, { recursive: true });
-    const file = join(dir, "0000_init.sql");
-    const sql = readFileSync(file, "utf8");
+    const sql = readFileSync(join(realFolder, "0000_init.sql"), "utf8");
     expect(sql).toContain("SET search_path = public;");
-    writeFileSync(file, sql.replace("SET search_path = public;", "SELECT 1;"));
+    const dir = initOnlyFolder((text) => text.replace("SET search_path = public;", "SELECT 1;"));
     const pg = fresh();
     await pg.exec(`CREATE SCHEMA tenant_x; SET search_path = tenant_x`);
     await expect(migrateEachInOwnTransaction(connection(pg), dir)).rejects.toThrow(/not created in schema public/);

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import worker, { JOB_PATH, SCHEDULES, jobFor, jobUrl, runJob, type Env } from "../src";
 
 const env: Env = { API_URL: "https://admin.example.com", JOB_SECRET: "k".repeat(40) };
@@ -112,6 +112,23 @@ describe("runJob", () => {
     }) as unknown as typeof fetch;
     expect(await fail(runJob("dispatch", env, { fetch: hang, sleep: noWait, timeoutMs: 20 }))).toMatch(/failed after 3 attempts/);
     expect(calls).toBe(3);
+  });
+
+  test("dispatch waits longer than the daily job, and longer than the admin app's 45 s dispatch budget", async () => {
+    const seen: Record<string, number> = {};
+    const real = AbortSignal.timeout.bind(AbortSignal);
+    const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms: number) => ((seen[current] = ms), real(ms)));
+    let current = "";
+    try {
+      for (const job of ["dispatch", "daily"] as const) {
+        current = job;
+        await runJob(job, env, { fetch: (async () => new Response("{}")) as unknown as typeof fetch, sleep: noWait });
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    expect(seen.dispatch).toBeGreaterThan(45_000);
+    expect(seen.daily).toBe(25_000);
   });
 
   test("the error never contains the secret", async () => {

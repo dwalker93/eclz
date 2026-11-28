@@ -510,6 +510,33 @@ describe("dispatcher", () => {
       eq(leases, ["2027-03-10T10:01:00", "2027-03-10T10:01:10"], "second lease starts ten seconds later");
     });
 
+    test("with a time budget, no row is claimed once a send could end after it; the rest stay queued", async () => {
+      await drain();
+      await setModules({ email: true });
+      await setChannel("email", true);
+      const people = [await person(), await person(), await person(), await person()];
+      for (const p of people) await queued(p, "2027-03-11");
+      let clock = new Date("2027-03-10T10:00:00Z");
+      let sends = 0;
+      // Provider timeout 15 s + 3 s settle = 18 s kept back: with a 45 s budget a row may be claimed up to 27 s in. Each send takes 10 s: starts at 0, 10, 20; 30 is too late.
+      const timed = createNotificationService(db, {
+        now: () => clock,
+        providers: { email: async () => void (sends++, (clock = new Date(clock.getTime() + 10_000))) },
+      });
+      const r = await timed.dispatchQueued({ budgetMs: 45_000 });
+      eq([r.attempted, r.sent, sends], [3, 3, 3], "three sends fit");
+      const left = await q(`SELECT count(*)::int AS n FROM notification WHERE status = 'queued' AND channel = 'email' AND user_id = ANY($1)`, [people.map((p) => p.userId)]);
+      eq(left[0]!.n, 1, "one row still queued, not marked anything");
+      eq((await timed.dispatchQueued()).attempted, 1, "without a budget the next run takes it");
+    });
+
+    test("a budget must be a positive number", async () => {
+      for (const budgetMs of [0, -5, Number.NaN]) {
+        const e = await svc.dispatchQueued({ budgetMs }).catch((x: unknown) => x);
+        eq((e as { code?: string }).code, "invalid_input", `budget ${budgetMs}`);
+      }
+    });
+
     test("a row left `sending` past its lease becomes unconfirmed, is not sent again, and one with a live lease is left alone", async () => {
       await drain();
       await setModules({ email: true });
