@@ -724,4 +724,89 @@ describe("review fixes: marks spelling and the close lock", () => {
     await svc.closeExam({ examId: p.exam.id });
     eq(examLocks(sql), ["no key update"], "close");
   });
+  test("every path that writes an attempt's result locks the exam row before the attempt row (saves, submits and the late-attempt job), so none can wait on a close that waits on it", async () => {
+    const sql: string[] = [];
+    // The PGlite driver does not log begin and commit, so the transaction calls are wrapped to add those markers to the captured statements.
+    const marked = new Proxy(pg, {
+      get(target, key) {
+        if (key === "transaction") {
+          return async (fn: (tx: unknown) => Promise<unknown>) => {
+            sql.push("begin");
+            try {
+              return await target.transaction(fn as never);
+            } finally {
+              sql.push("commit");
+            }
+          };
+        }
+        const v = Reflect.get(target, key, target);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    const logged = drizzle(marked as typeof pg, { schema, logger: { logQuery: (query: string) => void sql.push(query) } }) as unknown as Db;
+    const svc = createExamService(logged, { now: () => clock });
+    const p = await publishedExam();
+    /** The captured statements cut at `begin` and `commit` (or `rollback`), so each transaction is judged on its own statements. */
+    const transactions = (stmts: string[]) => {
+      const out: string[][] = [];
+      let cur: string[] | null = null;
+      for (const t of stmts) {
+        if (/^begin\b/i.test(t)) cur = [];
+        else if (/^(commit|rollback)\b/i.test(t)) {
+          if (cur) out.push(cur);
+          cur = null;
+        } else if (cur) cur.push(t);
+      }
+      return out;
+    };
+    const ordered = (label: string, stmts: string[], expectResult: boolean) => {
+      const txs = transactions(stmts);
+      const idx = (tx: string[], re: RegExp, lock: RegExp) => tx.findIndex((t) => re.test(t) && lock.test(t));
+      let locking = 0;
+      let writing = 0;
+      for (const [n, tx] of txs.entries()) {
+        const attempt = idx(tx, /from "exam_attempt" where/, /for update/);
+        const exam = idx(tx, /from "exam" where/, /for share/);
+        const result = tx.findIndex((t) => /"exam_result"/.test(t) && /^(insert|update)/i.test(t));
+        if (attempt >= 0) {
+          locking++;
+          eq(exam >= 0 && exam < attempt, true, `${label}, transaction ${n}: the exam FOR SHARE comes before the attempt FOR UPDATE, in the same transaction`);
+        }
+        if (result >= 0) {
+          writing++;
+          eq(exam >= 0 && attempt >= 0 && result > exam && result > attempt, true, `${label}, transaction ${n}: the result is written after both locks, taken in that same transaction`);
+        }
+      }
+      eq(locking > 0, true, `${label}: some transaction locks an attempt`);
+      if (expectResult) eq(writing > 0, true, `${label}: some transaction writes a result`);
+    };
+
+    // submit
+    const s1 = await newStudent(p.courses);
+    at("10:00");
+    const a1 = await svc.startAttempt({ examId: p.exam.id, studentId: s1.studentId });
+    sql.length = 0;
+    await svc.saveAnswers({ attemptId: a1.paper.attemptId, studentId: s1.studentId, answers: [{ examQuestionId: a1.paper.questions[0]!.examQuestionId, selectedOptionKey: "A" }] });
+    ordered("save", sql, false);
+    sql.length = 0;
+    await svc.submitAttempt({ attemptId: a1.paper.attemptId, studentId: s1.studentId });
+    ordered("submit", sql, true);
+
+    // a save and a late-attempt job that find the attempt past its deadline
+    const s2 = await newStudent(p.courses);
+    at("10:05");
+    const a2 = await svc.startAttempt({ examId: p.exam.id, studentId: s2.studentId });
+    at("23:00");
+    sql.length = 0;
+    await svc.finalizeExpiredAttempts();
+    ordered("finalizeExpiredAttempts", sql, true);
+    const s3 = await newStudent(p.courses);
+    at("10:10");
+    const a3 = await svc.startAttempt({ examId: p.exam.id, studentId: s3.studentId });
+    at("23:30");
+    sql.length = 0;
+    await fails("attempt_time_over", () => svc.saveAnswers({ attemptId: a3.paper.attemptId, studentId: s3.studentId, answers: [] }));
+    ordered("save after the deadline", sql, true);
+    eq(a2.paper.attemptId.length > 0, true);
+  });
 });

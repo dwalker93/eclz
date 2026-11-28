@@ -1,6 +1,6 @@
 /** Notices: who may write them (branch scope), who sees them (audience, branch, time), audit. */
 import { afterAll, describe, test } from "bun:test";
-import { createAccessControlService, createNoticeService } from "../src";
+import { createAccessControlService, createEnrollmentService, createNoticeService } from "../src";
 import { eq, fails } from "./helpers";
 import { createScenarioDb } from "./setup";
 
@@ -310,5 +310,27 @@ describe("who sees a notice on the day it takes effect", () => {
     };
     eq(await seen("2027-03-31T10:00:00Z"), ["Current branch notice"], "before the effective day");
     eq(await seen("2027-04-01T10:00:00Z"), ["Current branch notice", "Destination branch notice"], "from the effective day");
+  });
+  test("an enrolment in another course of the destination branch moves a future promotion join date back to the enrolment day", async () => {
+    const s = await mkStudent(b1, grade6);
+    await q(`INSERT INTO student_branch (student_id, branch_id, is_primary, joined_on) VALUES ($1,$2,false,'2027-04-01')`, [s, b2]);
+    await notices.create({ actor: root, branchId: b2, title: "Kandy branch notice", body: "b", targets: [{ type: "all" }] });
+    const other = await mkCourse(b2);
+    const enrol = createEnrollmentService(db, { now: () => new Date("2027-03-20T10:00:00Z") });
+    await enrol.enrollStudent({ studentId: s, courseId: other });
+    const row = (await q(`SELECT joined_on, is_primary FROM student_branch WHERE student_id = $1 AND branch_id = $2`, [s, b2]))[0]!;
+    eq([row.joined_on, row.is_primary], ["2027-03-20", false], "joined on the enrolment day, still not primary");
+    let out: string[] = [];
+    await withClock("2027-03-21T10:00:00Z", async () => void (out = titles((await notices.listForStudent(s)).filter((x) => x.title === "Kandy branch notice"))));
+    eq(out, ["Kandy branch notice"], "the branch notice reaches the student now");
+    // a later enrolment never pushes the day forward
+    const third = await mkCourse(b2);
+    await createEnrollmentService(db, { now: () => new Date("2027-05-01T10:00:00Z") }).enrollStudent({ studentId: s, courseId: third });
+    eq((await q(`SELECT joined_on FROM student_branch WHERE student_id = $1 AND branch_id = $2`, [s, b2]))[0]!.joined_on, "2027-03-20");
+    // and a membership still in the future stays hidden while only the promotion exists
+    const t = await mkStudent(b1, grade6);
+    await q(`INSERT INTO student_branch (student_id, branch_id, is_primary, joined_on) VALUES ($1,$2,false,'2027-04-01')`, [t, b2]);
+    await withClock("2027-03-21T10:00:00Z", async () => void (out = titles((await notices.listForStudent(t)).filter((x) => x.title === "Kandy branch notice"))));
+    eq(out, [], "future-only membership stays hidden");
   });
 });

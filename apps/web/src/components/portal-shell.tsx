@@ -23,7 +23,6 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@workspace/ui/components/dropdown-menu"
 import {
@@ -47,8 +46,10 @@ import {
   GraduationCapIcon,
   MoonIcon,
   PresentationIcon,
+  SettingsIcon,
   SparklesIcon,
   SunIcon,
+  UserRoundIcon,
   UsersRoundIcon,
   type LucideIcon,
 } from "lucide-react"
@@ -77,6 +78,10 @@ type PortalShellConfig = {
   }
   notificationsHref: string
   notificationsLabel: string
+  /** Role-specific My Profile page. */
+  profileHref: string
+  /** Shared account settings page, carrying the active role. */
+  settingsHref: string
   footerCopy: string
 }
 
@@ -94,6 +99,8 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
     },
     notificationsHref: "/portal/student#recent-notifications",
     notificationsLabel: "Go to recent notifications",
+    profileHref: "/portal/student/profile",
+    settingsHref: "/portal/account/settings?role=student",
     footerCopy:
       "Dashboard, My Courses, Timetable, Attendance, Learning Materials, Exams & Results, Invoices & Payments, Notices, Messages and My Profile are available. Other portal pages are planned for later steps.",
   },
@@ -110,6 +117,8 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
     },
     notificationsHref: "/portal/lecturer#recent-notices",
     notificationsLabel: "Go to recent notices",
+    profileHref: "/portal/lecturer/profile",
+    settingsHref: "/portal/account/settings?role=lecturer",
     footerCopy:
       "Dashboard, My Courses, Timetable & Sessions, Attendance, Learning Materials, Exams, Question Bank, Results, Notices, Messages, My Earnings and My Profile are available. Other lecturer pages are planned for later steps.",
   },
@@ -126,8 +135,10 @@ const portalShellConfigs: Record<PortalRole, PortalShellConfig> = {
     },
     notificationsHref: "/portal/parent#latest-notice",
     notificationsLabel: "Go to the latest notice",
+    profileHref: "/portal/parent/profile",
+    settingsHref: "/portal/account/settings?role=parent",
     footerCopy:
-      "Dashboard, My Children, Courses, Timetable, Attendance, Exams & Results, Invoices & Payments, Receipts, Notices and Messages are available. Other parent pages are planned for later steps.",
+      "Dashboard, My Children, Courses, Timetable, Attendance, Exams & Results, Invoices & Payments, Receipts, Notices, Messages, Notifications and My Profile are available.",
   },
 }
 
@@ -327,13 +338,13 @@ function PortalHeader({ config }: { config: PortalShellConfig }) {
                   </div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem disabled>
+                <DropdownMenuItem render={<Link href={config.profileHref} />}>
+                  <UserRoundIcon aria-hidden="true" />
                   My profile
-                  <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
                 </DropdownMenuItem>
-                <DropdownMenuItem disabled>
+                <DropdownMenuItem render={<Link href={config.settingsHref} />}>
+                  <SettingsIcon aria-hidden="true" />
                   Account settings
-                  <DropdownMenuShortcut>Soon</DropdownMenuShortcut>
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <p className="px-2 py-1.5 text-xs leading-relaxed text-muted-foreground">

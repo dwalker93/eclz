@@ -1,0 +1,14 @@
+{
+  // Deploy with `bunx wrangler deploy`, then set the two secrets (they are not stored in this file):
+  //   bunx wrangler secret put API_URL     e.g. https://admin.example.com
+  //   bunx wrangler secret put JOB_SECRET  the same value as JOB_SECRET in the admin app (32 characters or more)
+  "name": "eclz-cron",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "triggers": {
+    // Keep these two strings identical to SCHEDULES in src/index.ts: the Worker picks the job by the cron string that fired.
+    // Every minute: send queued notifications. 00:30 UTC (06:00 in Sri Lanka): overdue job and due-soon reminders.
+    "crons": ["* * * * *", "30 0 * * *"]
+  },
+  "observability": { "enabled": true }
+}

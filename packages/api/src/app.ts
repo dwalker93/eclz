@@ -6,6 +6,7 @@ import { createAuthRoutes } from "./auth-routes";
 import { createContentRoutes } from "./content-routes";
 import { createExamRoutes } from "./exam-routes";
 import { onError } from "./http";
+import { createJobRoutes, type JobServices } from "./jobs";
 import { requireTrustedOrigin, trustedCors } from "./origin";
 import { createPortalRoutes } from "./portal";
 import type { SessionConfig } from "./session";
@@ -13,6 +14,8 @@ import type { SessionConfig } from "./session";
 export interface ApiConfig extends Partial<SessionConfig> {
   /** Origins of our own web apps: the CSRF guard allows their writes and CORS answers their credentialed requests. At least one. */
   trustedOrigins: string[];
+  /** Bearer secret (32 characters or more) for `/internal/jobs`. Needed with `deps.jobs`; without both, those routes do not exist. */
+  jobSecret?: string;
 }
 
 export interface ApiDeps {
@@ -32,6 +35,8 @@ export interface ApiDeps {
   feeExceptions: FeeExceptionService;
   promotion: PromotionService;
   payouts: PayoutService;
+  /** The scheduled jobs for `/internal/jobs` (see `createJobRoutes`). */
+  jobs?: JobServices;
   config: ApiConfig;
 }
 
@@ -46,6 +51,10 @@ export function createApi(deps: ApiDeps) {
   app.use("*", trustedCors(deps.config.trustedOrigins));
   app.use("*", requireTrustedOrigin(deps.config.trustedOrigins, { cookieName: session.cookieName }));
   app.get("/health", (c) => c.json({ ok: true }));
+  if (deps.jobs || deps.config.jobSecret) {
+    if (!deps.jobs || !deps.config.jobSecret) throw new Error("scheduled jobs need both `jobs` and `config.jobSecret`");
+    app.route("/internal/jobs", createJobRoutes({ jobs: deps.jobs, secret: deps.config.jobSecret }));
+  }
   app.route("/auth", createAuthRoutes(deps.auth, session));
   app.route("/admin", createAdminRoutes({ ...deps, session }));
   app.route("/lecturer/content", createContentRoutes({ db: deps.db, auth: deps.auth, content: deps.content, session }, "lecturer"));

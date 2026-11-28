@@ -535,6 +535,32 @@ describe("Fee exceptions (D19 to D21)", () => {
     void s;
     await offModule();
   });
+  test("an enrolment dropped after planning is not billed at all, and one promoted after planning keeps only the periods before its access end", async () => {
+    const mkRacing = (change: () => Promise<unknown>) => {
+      let calls = 0;
+      return new Proxy(db, {
+        get(t, k, r) {
+          if (k !== "transaction") return Reflect.get(t, k, r);
+          return async (...a: unknown[]) => {
+            if (++calls === 2) await change();
+            return (t.transaction as (...x: unknown[]) => unknown).apply(t, a);
+          };
+        },
+      });
+    };
+    const dropped = await recurring({ rate: 1000, start: "2027-01-01" });
+    const repDropped = await createInvoicingService(
+      mkRacing(() => q(`UPDATE enrollment SET status = 'completed', end_reason = 'dropped', access_ends_on = '2027-06-01' WHERE id = $1`, [dropped.enr])),
+      { now },
+    ).generateRecurringInvoices({ enrollmentIds: [dropped.enr] });
+    eq([repDropped.invoicesCreated.length, (await q(`SELECT 1 FROM invoice_item WHERE enrollment_id = $1`, [dropped.enr])).length], [0, 0], "nothing billed, no empty invoice");
+    const promoted = await recurring({ rate: 1000, start: "2027-01-01" });
+    const repPromoted = await createInvoicingService(
+      mkRacing(() => q(`UPDATE enrollment SET status = 'completed', end_reason = 'promoted', access_ends_on = '2027-03-01' WHERE id = $1`, [promoted.enr])),
+      { now },
+    ).generateRecurringInvoices({ enrollmentIds: [promoted.enr] });
+    eq(repPromoted.invoicesCreated.map((x) => x.periodStarts), [["2027-01-01", "2027-02-01"]]);
+  });
   test("D21: an active exception keeps applying after the module is switched off", async () => {
     await onModule();
     const { enr } = await recurring({ rate: 1000, start: "2027-03-01" });

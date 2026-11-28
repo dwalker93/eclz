@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
@@ -61,8 +61,11 @@ describe("migrateEachInOwnTransaction", () => {
   test("the repository's own migrations apply through it and leave the exception and thread constraints validated", async () => {
     const pg = new PGlite({ extensions: { btree_gist: (await import("@electric-sql/pglite/contrib/btree_gist")).btree_gist } });
     dbs.push(pg);
-    const applied = await migrateEachInOwnTransaction(connection(pg), resolve(import.meta.dir, "../drizzle"));
-    expect(applied).toBe(1);
+    const dir = resolve(import.meta.dir, "../drizzle");
+    const journalLength = (JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: unknown[] }).entries.length;
+    const applied = await migrateEachInOwnTransaction(connection(pg), dir);
+    expect(applied).toBe(journalLength);
+    expect(await recorded(pg)).toBe(journalLength);
     const rows = (await pg.query<{ convalidated: boolean }>(`SELECT convalidated FROM pg_constraint WHERE conname IN ('invoice_item_exception_enrollment_fk', 'message_thread_id_message_thread_id_fk')`)).rows;
     expect(rows.length).toBe(2);
     expect(rows.every((r) => r.convalidated)).toBe(true);
@@ -95,6 +98,28 @@ describe("migrateEachInOwnTransaction: lock order", () => {
     } finally {
       await pg.close();
     }
+  });
+});
+
+describe("the repository's migration journal", () => {
+  const dir = resolve(import.meta.dir, "../drizzle");
+  const journal = JSON.parse(readFileSync(join(dir, "meta/_journal.json"), "utf8")) as { entries: { idx: number; when: number; tag: string }[] };
+
+  test("is numbered 0, 1, 2 ... with a file for each tag, and its times strictly increase", () => {
+    // The runner skips every migration that is not newer than the last one applied, so a time that does not increase would be skipped without a word.
+    journal.entries.forEach((e, n) => {
+      expect(e.idx).toBe(n);
+      expect(e.tag.startsWith(String(n).padStart(4, "0") + "_")).toBe(true);
+      expect(readFileSync(join(dir, `${e.tag}.sql`), "utf8").length).toBeGreaterThan(0);
+      if (n > 0) expect(e.when).toBeGreaterThan(journal.entries[n - 1]!.when);
+    });
+  });
+
+  test("0000_init is dated just after the head of the history it replaced, and not in the future", () => {
+    // 1795161269844 was the last migration time of the 37-migration chain. Later generated migrations carry the clock time of their own generation, so they sort after it.
+    expect(journal.entries[0]!.tag).toBe("0000_init");
+    expect(journal.entries[0]!.when).toBe(1795161269845);
+    expect(journal.entries[0]!.when).toBeLessThan(Date.now());
   });
 });
 

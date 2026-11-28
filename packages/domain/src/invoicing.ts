@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import {
   academicTerm,
   contentPurchase,
@@ -107,6 +107,28 @@ export async function insertInvoice(
   return { invoice: inv!, itemIds: ids };
 }
 
+/** The enrolments recurring invoices may be generated for: active, or completed by a promotion. */
+function billableEnrollment() {
+  return or(eq(enrollment.status, "active"), and(eq(enrollment.status, "completed"), eq(enrollment.endReason, "promoted")))!;
+}
+
+/**
+ * Removes the planned fee lines that are no longer billable and, with each, the discount line linked to it, then renumbers the links between lines.
+ * `drop` is asked about fee lines only.
+ */
+function pruneDraft(items: DraftItem[], drop: (fee: DraftItem) => boolean): DraftItem[] {
+  const keepFee = items.map((i) => i.kind !== "recurring_fee" || !drop(i));
+  const keep = items.map((i, k) => (i.appliesToIndex !== undefined ? keepFee[i.appliesToIndex]! : keepFee[k]!));
+  const newIndex = new Map<number, number>();
+  const next: DraftItem[] = [];
+  items.forEach((i, k) => {
+    if (!keep[k]) return;
+    newIndex.set(k, next.length);
+    next.push({ ...i, appliesToIndex: i.appliesToIndex === undefined ? undefined : newIndex.get(i.appliesToIndex) });
+  });
+  return next;
+}
+
 export interface GenerateOptions {
   branchId?: string;
   enrollmentIds?: string[];
@@ -160,7 +182,9 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
       const { today, groups } = await db.transaction(async (tx) => {
         const today = await todayFor(tx, now());
         const upTo = addDays(today, lead);
-        const conds = [eq(enrollment.status, "active"), sql`${enrollment.feeStructureId} IS NOT NULL`, eq(feeStructure.billingType, "recurring")];
+        // Active enrolments, and completed ones only when the completion was a promotion (the old class is billed up to its access end). Dropped, transferred and
+        // course-ended enrolments are never billed here, whatever their access end says.
+        const conds = [billableEnrollment(), sql`${enrollment.feeStructureId} IS NOT NULL`, eq(feeStructure.billingType, "recurring")];
         if (g.branchId) conds.push(eq(course.branchId, g.branchId));
         if (g.enrollmentIds) {
           if (g.enrollmentIds.length === 0) return { today, groups: new Map<string, DraftGroup>() };
@@ -257,14 +281,28 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
         // billed (counting them as already invoiced) and insert the rest, instead of treating the whole group as billed.
         for (let attempt = 0; ; attempt++) {
           try {
-            const created = await db.transaction((tx) =>
-              insertInvoice(tx, { studentId: grp.studentId, branchId: grp.branchId, issuedOn: today, dueDate: grp.dueDate, items }),
-            );
+            const done = await db.transaction(async (tx) => {
+              // The plan was made in an earlier transaction. An enrolment may have ended since (a promotion confirmed, a drop, a new access end), so each
+              // planned period is checked against the enrolment as it is now, and its rows are locked FOR SHARE so they cannot change before the insert commits.
+              const ids = [...new Set(items.filter((i) => i.kind === "recurring_fee").map((i) => i.enrollmentId!))].sort();
+              const current = new Map(
+                (await tx.select().from(enrollment).where(and(inArray(enrollment.id, ids), billableEnrollment())).orderBy(asc(enrollment.id)).for("share")).map((e) => [e.id, e]),
+              );
+              // Rows of enrolments that are no longer billable are not in `current`, and the lock above does not cover them: they stay excluded either way.
+              const live = pruneDraft(items, (fee) => {
+                const e = current.get(fee.enrollmentId!);
+                return !e || (e.accessEndsOn !== null && fee.periodStart! >= e.accessEndsOn);
+              });
+              if (live.length === 0) return null;
+              const created = await insertInvoice(tx, { studentId: grp.studentId, branchId: grp.branchId, issuedOn: today, dueDate: grp.dueDate, items: live });
+              return { created, live };
+            });
+            if (!done) break;
             invoicesCreated.push({
-              invoiceId: created.invoice.id,
+              invoiceId: done.created.invoice.id,
               studentId: grp.studentId,
               branchId: grp.branchId,
-              periodStarts: items.filter((i) => i.kind === "recurring_fee").map((i) => i.periodStart!),
+              periodStarts: done.live.filter((i) => i.kind === "recurring_fee").map((i) => i.periodStart!),
             });
             break;
           } catch (err) {
@@ -280,19 +318,11 @@ export function createInvoicingService(db: Db, opts: { now?: () => Date } = {}) 
                 ),
               );
             const billedKeys = new Set(billed.map((b) => `${b.enrollmentId}|${b.periodStart}`));
-            const keep = items.map((i) => i.kind !== "recurring_fee" || !billedKeys.has(`${i.enrollmentId}|${i.periodStart}`));
-            const dropped = items.filter((i, k) => i.kind === "recurring_fee" && !keep[k]).length;
+            const dropped = items.filter((i) => i.kind === "recurring_fee" && billedKeys.has(`${i.enrollmentId}|${i.periodStart}`)).length;
             if (dropped === 0) throw err; // nothing explains the conflict: do not loop
             alreadyInvoiced += dropped;
             // A discount goes with its fee line, and the links between lines are renumbered.
-            const keepAll = items.map((i, k) => (i.appliesToIndex !== undefined ? keep[i.appliesToIndex]! : keep[k]!));
-            const newIndex = new Map<number, number>();
-            const next: DraftItem[] = [];
-            items.forEach((i, k) => {
-              if (!keepAll[k]) return;
-              newIndex.set(k, next.length);
-              next.push({ ...i, appliesToIndex: i.appliesToIndex === undefined ? undefined : newIndex.get(i.appliesToIndex) });
-            });
+            const next = pruneDraft(items, (fee) => billedKeys.has(`${fee.enrollmentId}|${fee.periodStart}`));
             if (next.length === 0) break;
             items = next;
           }

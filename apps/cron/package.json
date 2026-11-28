@@ -1,0 +1,17 @@
+{
+  "name": "cron",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "description": "Cloudflare Worker whose Cron Triggers call the protected job endpoints of the admin app.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --timeout 60000",
+    "deploy": "bunx wrangler deploy"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@workspace/typescript-config": "workspace:*",
+    "typescript": "^7.0.2"
+  }
+}

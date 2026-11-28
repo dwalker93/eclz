@@ -218,7 +218,23 @@ export function createTextLkSms(opts: { apiToken: string; senderId: string; fetc
       body: JSON.stringify({ recipient: to, sender_id: opts.senderId, type: "plain", message: body }),
       signal: AbortSignal.timeout(opts.timeoutMs ?? PROVIDER_TIMEOUT_MS),
     });
-    const json = (await res.json().catch(() => null)) as { status?: string; message?: string } | null;
+    // The request reached text.lk, so a failure while reading the answer does not say whether the message was accepted: it is an unknown outcome (the row
+    // becomes `unconfirmed`), not a failure, and it is worded apart from a refusal. A timeout or abort while reading is already recognised as such.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (e) {
+      if (isUnknownOutcome(e)) throw e;
+      throw new ProviderOutcomeUnknown(`text.lk: the answer could not be read (HTTP ${res.status}): ${shortError(e)}`);
+    }
+    let json: { status?: string; message?: string } | null = null;
+    try {
+      json = JSON.parse(text) as { status?: string; message?: string } | null;
+    } catch {
+      json = null;
+    }
+    // An unreadable answer to a request that returned success is ambiguous too; an unreadable error answer is a plain refusal by its HTTP status.
+    if (res.ok && json === null) throw new ProviderOutcomeUnknown(`text.lk: HTTP ${res.status} with an answer that is not JSON; the message may have been accepted`);
     if (!res.ok || json?.status !== "success") throw new Error(`text.lk: ${json?.message ?? `HTTP ${res.status}`}`);
   };
 }
@@ -239,6 +255,8 @@ export interface DispatchResult {
 
 /** How long a dispatcher owns a row it is sending. It must outlast the slowest send: one provider timeout for email and sms, and for push every device that is still tried. */
 export const DISPATCH_LEASE_MS = 60_000;
+/** Room kept after a send's provider timeout, within a `budgetMs`, for writing its result (and the claim before it). */
+export const DISPATCH_SETTLE_MS = 3_000;
 
 const shortError = (e: unknown) => String((e as Error)?.message ?? e).slice(0, 300) || "send failed";
 
@@ -263,7 +281,12 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     }
   }
 
-  async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number): Promise<void> {
+  /** Before a provider call: refuses to start one that could still be running when the lease ends (the call is skipped, so nothing was sent). Push checks the same before each device. */
+  function assertLeaseLeft(deadline: number) {
+    if (now().getTime() + timeoutMs >= deadline) throw new Error("lease nearly over; message not sent");
+  }
+
+  async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number, budgetEnd = Infinity): Promise<void> {
     const ext = EXTERNAL.find((e) => e.channel === row.channel);
     if (!ext) throw new Error("not an external channel");
     // J1: a channel switched off after queueing is not attempted.
@@ -277,11 +300,13 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     if (row.channel === "email") {
       if (!u.email) throw new Error("no email address");
       if (!providers.email) throw new Error("no email provider configured");
+      assertLeaseLeft(deadline);
       await withTimeout(providers.email({ to: u.email, subject: msg.subject, body: msg.body }, { idempotencyKey: row.id }));
     } else if (row.channel === "sms") {
       const to = u.phone ? normalizeSriLankaPhone(u.phone) : null;
       if (!to) throw new Error(u.phone ? "invalid phone number" : "no phone number");
       if (!providers.sms) throw new Error("no sms provider configured");
+      assertLeaseLeft(deadline);
       await withTimeout(providers.sms({ to, body: msg.body }, { idempotencyKey: row.id }));
     } else {
       const subs = await tx.select().from(pushSubscription).where(eq(pushSubscription.userId, row.userId)).orderBy(asc(pushSubscription.id));
@@ -290,12 +315,20 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       let delivered = 0;
       let last: unknown = "";
       let unknown = false;
+      let tried = 0;
       for (const s of subs) {
         // Stop while a further call could still end after the lease: a device not tried is not a device that may have received it.
         if (now().getTime() + timeoutMs >= deadline) {
           last = new Error("lease nearly over; remaining devices not tried");
           break;
         }
+        // Likewise for the dispatch call's time budget (one row with several devices must not run past it). The first device is always tried: the row was
+        // claimed while a send still fitted, and refusing it here would fail a message that was never attempted.
+        if (tried > 0 && now().getTime() + timeoutMs + DISPATCH_SETTLE_MS > budgetEnd) {
+          last = new Error("dispatch time budget nearly over; remaining devices not tried");
+          break;
+        }
+        tried++;
         try {
           await withTimeout(providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body }, { idempotencyKey: `${row.id}:${s.id}` }));
           delivered++;
@@ -319,9 +352,13 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
      * A row left `sending` past its lease (the dispatcher stopped mid-send) is moved to `unconfirmed` at the start of the next run, never back to `queued`,
      * for the same reason. Safe to run on a timer.
      */
-    async dispatchQueued(input: { limit?: number } = {}): Promise<DispatchResult> {
+    async dispatchQueued(input: { limit?: number; budgetMs?: number } = {}): Promise<DispatchResult> {
       const limit = input.limit ?? 100;
       if (!Number.isInteger(limit) || limit < 1) throw new ServiceError("invalid_input", "limit must be a positive whole number.");
+      const budgetMs = input.budgetMs;
+      if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs < 1)) throw new ServiceError("invalid_input", "budgetMs must be a positive number.");
+      const budgetEnd = budgetMs === undefined ? Infinity : now().getTime() + budgetMs;
+      const stopClaimingAt = budgetEnd - timeoutMs - DISPATCH_SETTLE_MS;
       const result: DispatchResult = { attempted: 0, sent: 0, failed: 0, unconfirmed: 0, lost: 0, expired: 0 };
 
       const expired = await db
@@ -332,6 +369,9 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       result.expired = expired.length;
 
       for (let n = 0; n < limit; n++) {
+        // Serial sends: with a time budget (a request with a hard limit), take no new row once a send that starts now could, at its slowest (one provider
+        // timeout) plus the time to record the answer, run past the end. Rows left queued go out in the next run, so the caller's limit is never hit mid-send.
+        if (now().getTime() > stopClaimingAt) break;
         // Claim one row at a time so its lease starts when its send starts, not when a batch was picked.
         const claimed = await db.transaction(async (tx) => {
           const [next] = await tx
@@ -354,7 +394,7 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
         let error: string | null = null;
         try {
           const org = await loadOrganization(db);
-          await sendOne(db, claimed, org, claimed.claimedUntil!.getTime());
+          await sendOne(db, claimed, org, claimed.claimedUntil!.getTime(), budgetEnd);
           outcome = "sent";
         } catch (e) {
           outcome = isUnknownOutcome(e) ? "unconfirmed" : "failed";
@@ -362,7 +402,9 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
         }
         const set =
           outcome === "sent" ? { status: "sent", sentAt: now(), error: null, claimedUntil: null } : { status: outcome, error, claimedUntil: null };
-        const done = await db.update(notification).set(set).where(and(eq(notification.id, claimed.id), eq(notification.status, "sending"))).returning({ id: notification.id });
+        const done = await db.update(notification).set(set).where(and(eq(notification.id, claimed.id), eq(notification.status, "sending"), eq(notification.claimedUntil, claimed.claimedUntil!))).returning({ id: notification.id });
+        // The claim itself must still be the active one: if the lease expired and the row was reclaimed since (a new lease timestamp), this run's answer matches
+        // nothing and the row counts as lost, like one that was already marked unconfirmed.
         if (done.length === 0) result.lost++;
         else result[outcome]++;
       }

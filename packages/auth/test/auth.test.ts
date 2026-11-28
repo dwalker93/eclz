@@ -101,7 +101,8 @@ describe("rate limits", () => {
     for (let i = 0; i < 60; i++) await fails("invalid_credentials", () => auth.signIn({ identifier: `x${i}@example.com`, password: GOOD, ip: "10.0.0.9" }));
     await fails("rate_limited", () => auth.signIn({ identifier: "x@example.com", password: GOOD, ip: "10.0.0.9" }));
     await fails("invalid_credentials", () => auth.signIn({ identifier: "x@example.com", password: GOOD, ip: "10.0.0.10" }));
-  });
+    // 62 argon2id checks, about 0.1 s each: more than bun's default 5 s, so the limit is set here and does not depend on the `--timeout` flag.
+  }, 60_000);
 });
 
 describe("sessions", () => {

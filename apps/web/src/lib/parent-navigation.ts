@@ -16,11 +16,9 @@ import {
 import type { PortalNavGroup } from "@/lib/student-navigation"
 
 /**
- * Planned parent portal destinations from the public portal guide. The
- * dashboard, My Children, Courses, Timetable, Attendance, Exams & Results,
- * Invoices & Payments, Receipts, Notices and Messages pages are implemented;
- * every other item is an intentionally disabled placeholder. Parent pages only
- * ever show children linked to this guardian.
+ * Parent portal destinations from the public portal guide. Every parent page is
+ * implemented; items are kept as data so the sidebar and footer stay in sync.
+ * Parent pages only ever show children linked to this guardian.
  */
 export const parentNav: PortalNavGroup[] = [
   {
@@ -80,11 +78,21 @@ export const parentNav: PortalNavGroup[] = [
         icon: MessagesSquareIcon,
         url: "/portal/parent/messages",
       },
-      { title: "Notifications", icon: BellIcon, disabled: true },
+      {
+        title: "Notifications",
+        icon: BellIcon,
+        url: "/portal/parent/notifications",
+      },
     ],
   },
   {
     label: "Account",
-    items: [{ title: "My Profile", icon: UserRoundIcon, disabled: true }],
+    items: [
+      {
+        title: "My Profile",
+        icon: UserRoundIcon,
+        url: "/portal/parent/profile",
+      },
+    ],
   },
 ]

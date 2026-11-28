@@ -17,6 +17,8 @@ import {
   type ExamMode,
   type ExamResultState,
   type MessageParticipant,
+  type NotificationChannel,
+  type NotificationStatus,
   type StudentCourseStatus,
   type StudentInvoice,
   type StudentPayment,
@@ -31,7 +33,10 @@ export const parent = {
   initials: "NP",
   contactEmail: "nimal.perera@example.com",
   contactPhone: "+94 71 234 5678",
+  address: "24/3, Temple Road, Nugegoda",
+  nic: "197812345678",
   portalEnabled: true,
+  memberSince: "2024-01-15",
 } as const
 
 export type ParentChildNextClass = {
@@ -2374,3 +2379,167 @@ export function getParentThreadUnreadCount(
       message.senderId !== PARENT_MESSAGE_SENDER_ID && message.sentAt > readAt
   ).length
 }
+
+/* --------------------------------------------------------------------------
+ * Communication: notifications for the guardian user
+ *
+ * Local demo fixtures only. Every row belongs to this guardian. Rows carry the
+ * event, channel, delivery status, time and — where a notification is about a
+ * specific child — that child (`childId`). `read` mirrors the schema's read_at
+ * as local UI state; nothing is persisted. No provider error text is modelled,
+ * and disabled external channels (see the portal module switches) produce no
+ * rows, matching the schema.
+ * ----------------------------------------------------------------------- */
+
+export type ParentNotificationEvent =
+  | "payment_submitted"
+  | "payment_verified"
+  | "payment_rejected"
+  | "receipt_issued"
+  | "installment_due"
+  | "installment_overdue"
+  | "attendance_marked"
+  | "class_reminder"
+  | "exam_published"
+  | "notice"
+
+export const PARENT_NOTIFICATION_EVENT_LABELS: Record<
+  ParentNotificationEvent,
+  string
+> = {
+  payment_submitted: "Payment submitted",
+  payment_verified: "Payment verified",
+  payment_rejected: "Payment not verified",
+  receipt_issued: "Receipt issued",
+  installment_due: "Installment due",
+  installment_overdue: "Installment overdue",
+  attendance_marked: "Attendance marked",
+  class_reminder: "Class reminder",
+  exam_published: "Exam published",
+  notice: "Notice",
+}
+
+export type ParentNotification = {
+  id: string
+  event: ParentNotificationEvent
+  channel: NotificationChannel
+  status: NotificationStatus
+  createdAt: string
+  title: string
+  body: string
+  /** Linked child this notification is about, when there is one. */
+  childId?: string
+  read: boolean
+}
+
+export const parentNotifications: ParentNotification[] = [
+  {
+    id: "parent-notification-payment-verified",
+    event: "payment_verified",
+    channel: "in_app",
+    status: "sent",
+    createdAt: "2026-11-15T14:20:00+05:30",
+    title: "Payment verified",
+    body: "Your LKR 4,000 bank transfer for Dinuka's November invoice has been verified and your balance has been updated.",
+    childId: dinukaChildId,
+    read: false,
+  },
+  {
+    id: "parent-notification-attendance",
+    event: "attendance_marked",
+    channel: "in_app",
+    status: "sent",
+    createdAt: "2026-11-14T11:45:00+05:30",
+    title: "Attendance recorded",
+    body: "Sachini was marked present for Grade 6 Mathematics on Tuesday 11 November.",
+    childId: sachiniChildId,
+    read: false,
+  },
+  {
+    id: "parent-notification-exam-published",
+    event: "exam_published",
+    channel: "in_app",
+    status: "sent",
+    createdAt: "2026-11-13T16:10:00+05:30",
+    title: "Grade 8 term test scheduled",
+    body: "The Grade 8 Mathematics term test has been added to Dinuka's exam schedule for Saturday 21 November.",
+    childId: dinukaChildId,
+    read: true,
+  },
+  {
+    id: "parent-notification-installment-due",
+    event: "installment_due",
+    channel: "email",
+    status: "sent",
+    createdAt: "2026-11-12T08:00:00+05:30",
+    title: "Fee reminder",
+    body: "LKR 4,500 remains on Sachini's invoice INV-2026-1048, due on 30 November 2026.",
+    childId: sachiniChildId,
+    read: false,
+  },
+  {
+    id: "parent-notification-receipt-issued",
+    event: "receipt_issued",
+    channel: "email",
+    status: "sent",
+    createdAt: "2026-11-11T10:30:00+05:30",
+    title: "Receipt issued",
+    body: "A receipt has been issued for your verified payment for Dinuka. You can view it under Receipts.",
+    childId: dinukaChildId,
+    read: true,
+  },
+  {
+    id: "parent-notification-class-reminder",
+    event: "class_reminder",
+    channel: "push",
+    status: "queued",
+    createdAt: "2026-11-10T18:00:00+05:30",
+    title: "Class reminder",
+    body: "Grade 6 Science Explorers has a session for Sachini this Saturday at 9:00 AM.",
+    childId: sachiniChildId,
+    read: true,
+  },
+  {
+    id: "parent-notification-notice",
+    event: "notice",
+    channel: "in_app",
+    status: "sent",
+    createdAt: "2026-11-09T09:00:00+05:30",
+    title: "New notice published",
+    body: "A notice about extended library hours has been published for the Colombo branch.",
+    read: true,
+  },
+  {
+    id: "parent-notification-payment-submitted",
+    event: "payment_submitted",
+    channel: "in_app",
+    status: "sent",
+    createdAt: "2026-11-08T12:05:00+05:30",
+    title: "Payment submitted",
+    body: "You submitted a bank transfer of LKR 7,500 for Dinuka's November tuition. It stays pending until the finance team verifies it.",
+    childId: dinukaChildId,
+    read: true,
+  },
+  {
+    id: "parent-notification-installment-overdue",
+    event: "installment_overdue",
+    channel: "email",
+    status: "sent",
+    createdAt: "2026-11-07T08:00:00+05:30",
+    title: "Payment overdue",
+    body: "An installment for Sachini is overdue. Please review the invoice under Invoices & Payments.",
+    childId: sachiniChildId,
+    read: true,
+  },
+  {
+    id: "parent-notification-payment-rejected",
+    event: "payment_rejected",
+    channel: "push",
+    status: "sent",
+    createdAt: "2026-11-06T15:40:00+05:30",
+    title: "Payment not verified",
+    body: "We could not match a bank transfer reference for Sachini. Please check the reference and submit the payment again.",
+    childId: sachiniChildId,
+    read: true,
+  },
+]
