@@ -286,7 +286,7 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
     if (now().getTime() + timeoutMs >= deadline) throw new Error("lease nearly over; message not sent");
   }
 
-  async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number): Promise<void> {
+  async function sendOne(tx: Tx | Db, row: typeof notification.$inferSelect, org: OrgRow, deadline: number, budgetEnd = Infinity): Promise<void> {
     const ext = EXTERNAL.find((e) => e.channel === row.channel);
     if (!ext) throw new Error("not an external channel");
     // J1: a channel switched off after queueing is not attempted.
@@ -315,12 +315,20 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       let delivered = 0;
       let last: unknown = "";
       let unknown = false;
+      let tried = 0;
       for (const s of subs) {
         // Stop while a further call could still end after the lease: a device not tried is not a device that may have received it.
         if (now().getTime() + timeoutMs >= deadline) {
           last = new Error("lease nearly over; remaining devices not tried");
           break;
         }
+        // Likewise for the dispatch call's time budget (one row with several devices must not run past it). The first device is always tried: the row was
+        // claimed while a send still fitted, and refusing it here would fail a message that was never attempted.
+        if (tried > 0 && now().getTime() + timeoutMs + DISPATCH_SETTLE_MS > budgetEnd) {
+          last = new Error("dispatch time budget nearly over; remaining devices not tried");
+          break;
+        }
+        tried++;
         try {
           await withTimeout(providers.push({ subscription: { endpoint: s.endpoint, p256dhKey: s.p256dhKey, authKey: s.authKey }, title: msg.subject, body: msg.body }, { idempotencyKey: `${row.id}:${s.id}` }));
           delivered++;
@@ -349,7 +357,8 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
       if (!Number.isInteger(limit) || limit < 1) throw new ServiceError("invalid_input", "limit must be a positive whole number.");
       const budgetMs = input.budgetMs;
       if (budgetMs !== undefined && (!Number.isFinite(budgetMs) || budgetMs < 1)) throw new ServiceError("invalid_input", "budgetMs must be a positive number.");
-      const stopClaimingAt = budgetMs === undefined ? Infinity : now().getTime() + budgetMs - timeoutMs - DISPATCH_SETTLE_MS;
+      const budgetEnd = budgetMs === undefined ? Infinity : now().getTime() + budgetMs;
+      const stopClaimingAt = budgetEnd - timeoutMs - DISPATCH_SETTLE_MS;
       const result: DispatchResult = { attempted: 0, sent: 0, failed: 0, unconfirmed: 0, lost: 0, expired: 0 };
 
       const expired = await db
@@ -385,7 +394,7 @@ export function createNotificationService(db: Db, opts: { now?: () => Date; prov
         let error: string | null = null;
         try {
           const org = await loadOrganization(db);
-          await sendOne(db, claimed, org, claimed.claimedUntil!.getTime());
+          await sendOne(db, claimed, org, claimed.claimedUntil!.getTime(), budgetEnd);
           outcome = "sent";
         } catch (e) {
           outcome = isUnknownOutcome(e) ? "unconfirmed" : "failed";

@@ -566,3 +566,9 @@ These were recorded as judgment calls during the reviews and are accepted for de
 - `dispatchQueued({ budgetMs })` takes no new row once `now + provider timeout + 3 s` passes the end of the budget. The jobs route always passes `DISPATCH_BUDGET_MS` (45 s). The Worker waits 55 s for `dispatch` and keeps 25 s for `daily`. Unreached rows stay `queued` for the next minute.
 - Not bounded: `daily` has no budget (the overdue job's scale is already an owed item), and a slow database could still push a send past the limit; the lease then turns that row `unconfirmed` as before.
 - Tests: domain budget stop (3 of 4 rows at 10 s per send) and invalid budgets; api passes the budget; cron timeouts per job. Mutation checks: removing the stop, removing the provider-timeout margin, dropping the budget in the route and using 25 s for dispatch were each caught.
+
+### 2026-11-28 — Review round 5 (triage)
+- Fixed: `compare-schema.sh` now writes each dump to a file and stops with status 2 if either `pg_dump` fails (before, a failed dump in the pipe left an empty file and two failed dumps compared as IDENTICAL); the strict comparison keeps trailing spaces, and only the second pass ignores them, so a whitespace-only difference shows as FORMATTING ONLY with its diff.
+- Fixed: the dispatch time budget now also bounds a push row's devices: after the first device (always tried), no further device is tried once its timeout plus the 3 s settle time would pass the budget. Devices not tried are reported as such; the delivery rules for the ones that were tried are unchanged.
+- Deferred (owed, same item as the overdue job's scale): `/daily` restarts the overdue job from the earliest students on every run, so a run that is cut short never reaches the later ones. This needs a cursor or a per-run bound plus matching Worker timeout and retry rules; with no data and no users yet it is not worth building now. Measure first; do it before launch.
+

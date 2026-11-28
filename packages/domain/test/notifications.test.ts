@@ -530,6 +530,25 @@ describe("dispatcher", () => {
       eq((await timed.dispatchQueued()).attempted, 1, "without a budget the next run takes it");
     });
 
+    test("with a time budget, a row's remaining push devices are not tried once another call could end after it", async () => {
+      await drain();
+      await setModules({ web_push: true });
+      await setChannel("push", true);
+      const p = await person();
+      await q(`INSERT INTO push_subscription (user_id, endpoint, p256dh_key, auth_key) VALUES ($1,$2,'k','a'), ($1,$3,'k','a'), ($1,$4,'k','a')`, [p.userId, `https://push/${p.userId}/1`, `https://push/${p.userId}/2`, `https://push/${p.userId}/3`]);
+      await queued(p, "2027-03-11");
+      let clock = new Date("2027-03-10T10:00:00Z");
+      const tried: string[] = [];
+      const timed = createNotificationService(db, {
+        now: () => clock,
+        providers: { push: async (m) => void (tried.push(m.subscription.endpoint.slice(-1)), (clock = new Date(clock.getTime() + 10_000))) },
+      });
+      // 35 s budget, 18 s kept back per call: the first device at 0 s, the second at 10 s (10 + 18 <= 35), a third at 20 s would end past it (20 + 18 > 35).
+      await timed.dispatchQueued({ budgetMs: 35_000 });
+      eq(tried.length, 2, "only two of the three devices are tried (their order is by id)");
+      eq((await row(p.userId, "push")).status, "sent", "the devices that got it make it sent");
+    });
+
     test("a budget must be a positive number", async () => {
       for (const budgetMs of [0, -5, Number.NaN]) {
         const e = await svc.dispatchQueued({ budgetMs }).catch((x: unknown) => x);
